@@ -97,6 +97,22 @@ impl Vst3Plugin {
         }
     }
 
+    /// Number of audio input channels the plugin's main bus expects, as
+    /// negotiated during `initialize`. 0 for pure instrument plugins with no
+    /// audio input bus. Only meaningful after a successful `initialize` call.
+    #[must_use]
+    pub fn input_channels(&self) -> usize {
+        self.input_channels
+    }
+
+    /// Number of audio output channels the plugin's main bus produces, as
+    /// negotiated during `initialize`. Only meaningful after a successful
+    /// `initialize` call.
+    #[must_use]
+    pub fn output_channels(&self) -> usize {
+        self.output_channels
+    }
+
     /// Initialise the plugin and restore `state` via `IComponent::setState`
     /// while in "Setup" state (after `setupProcessing`, before `setActive`).
     ///
