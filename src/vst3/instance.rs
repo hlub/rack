@@ -240,6 +240,66 @@ impl Vst3Plugin {
             Ok(out_plain)
         }
     }
+
+    /// Parse a display-style string (as a user might type it, or as
+    /// [`Vst3Plugin::parameter_value_string`] would render it) into a
+    /// normalized parameter value (VST3 `IEditController::getParamValueByString`,
+    /// the inverse of `parameter_value_string`).
+    ///
+    /// Whether the plugin accepts a bare number, a number with a unit
+    /// suffix, or only its own exact display format is plugin-defined; not
+    /// every plugin implements this meaningfully, in which case this
+    /// returns an error rather than a guessed value.
+    pub fn parameter_value_by_string(&self, index: usize, string: &str) -> Result<f32> {
+        if !self.is_initialized() {
+            return Err(Error::NotInitialized);
+        }
+
+        let c_string = CString::new(string)
+            .map_err(|error| Error::Other(format!("Invalid parameter string: {error}")))?;
+
+        unsafe {
+            let mut out_normalized = 0.0f32;
+            let result = ffi::rack_vst3_plugin_parameter_value_by_string(
+                self.inner.as_ptr(),
+                index as u32,
+                c_string.as_ptr(),
+                &mut out_normalized,
+            );
+
+            if result != ffi::RACK_VST3_OK {
+                return Err(map_error(result));
+            }
+
+            Ok(out_normalized)
+        }
+    }
+
+    /// Convert a plain (native/real-world unit) parameter value, e.g. actual
+    /// milliseconds or Hz, to its normalized (0.0-1.0) form (VST3
+    /// `IEditController::plainParamToNormalized`, the inverse of
+    /// [`Vst3Plugin::parameter_plain_value`]).
+    pub fn parameter_normalized_from_plain(&self, index: usize, plain_value: f64) -> Result<f32> {
+        if !self.is_initialized() {
+            return Err(Error::NotInitialized);
+        }
+
+        unsafe {
+            let mut out_normalized = 0.0f32;
+            let result = ffi::rack_vst3_plugin_parameter_normalized_from_plain(
+                self.inner.as_ptr(),
+                index as u32,
+                plain_value,
+                &mut out_normalized,
+            );
+
+            if result != ffi::RACK_VST3_OK {
+                return Err(map_error(result));
+            }
+
+            Ok(out_normalized)
+        }
+    }
 }
 
 impl Drop for Vst3Plugin {

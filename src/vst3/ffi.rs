@@ -411,6 +411,39 @@ extern "C" {
         out_plain: *mut f64,
     ) -> c_int;
 
+    /// Parse a display-style string into a normalized parameter value
+    /// (VST3 `getParamValueByString`, the inverse of
+    /// `rack_vst3_plugin_parameter_string_by_value`).
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    /// - `index` must be less than parameter count
+    /// - `string` must be a valid, null-terminated UTF-8 C string
+    /// - `out_normalized` must point to a valid `f32`
+    pub fn rack_vst3_plugin_parameter_value_by_string(
+        plugin: *mut RackVST3Plugin,
+        index: u32,
+        string: *const c_char,
+        out_normalized: *mut f32,
+    ) -> c_int;
+
+    /// Convert a plain (native/real-world unit) parameter value to its
+    /// normalized form (VST3 `plainParamToNormalized`, the inverse of
+    /// `rack_vst3_plugin_parameter_plain_value`).
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    /// - `index` must be less than parameter count
+    /// - `out_normalized` must point to a valid `f32`
+    pub fn rack_vst3_plugin_parameter_normalized_from_plain(
+        plugin: *mut RackVST3Plugin,
+        index: u32,
+        plain_value: f64,
+        out_normalized: *mut f32,
+    ) -> c_int;
+
     // ============================================================================
     // Preset Management API
     // ============================================================================

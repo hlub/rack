@@ -223,6 +223,36 @@ int rack_vst3_plugin_parameter_plain_value(
     double* out_plain
 );
 
+// Parse a display-style string (as a user might type it, or as
+// rack_vst3_plugin_parameter_string_by_value would render it) into a
+// normalized parameter value. This is the VST3
+// IEditController::getParamValueByString call -- the inverse of
+// rack_vst3_plugin_parameter_string_by_value. Whether the plugin accepts a
+// bare number, a number with a unit suffix, or only its own exact display
+// format is plugin-defined; not every plugin implements this meaningfully.
+//
+// Returns 0 on success, negative error code on failure (including when the
+// plugin cannot parse the given string).
+int rack_vst3_plugin_parameter_value_by_string(
+    RackVST3Plugin* plugin,
+    uint32_t index,
+    const char* string,
+    float* out_normalized
+);
+
+// Convert a plain (native/real-world unit) parameter value, e.g. actual
+// milliseconds or Hz, to its normalized (0.0-1.0) form. This is the VST3
+// IEditController::plainParamToNormalized call -- the inverse of
+// rack_vst3_plugin_parameter_plain_value.
+//
+// Returns 0 on success, negative error code on failure
+int rack_vst3_plugin_parameter_normalized_from_plain(
+    RackVST3Plugin* plugin,
+    uint32_t index,
+    double plain_value,
+    float* out_normalized
+);
+
 // ============================================================================
 // Preset Management API
 // ============================================================================

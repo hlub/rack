@@ -122,6 +122,77 @@ static std::string utf16_to_utf8(const char16* utf16_str) {
     return result;
 }
 
+// Helper: Convert UTF-8 to UTF-16, into a fixed-size char16 buffer
+// (String128-sized: 128 code units including the null terminator).
+// VST3's getParamValueByString takes a String128 input buffer.
+// Handles multi-byte sequences and surrogate pairs for codepoints above
+// U+FFFF; malformed input is replaced with U+FFFD rather than propagated,
+// matching utf16_to_utf8's error-handling convention above.
+static void utf8_to_utf16(const char* utf8_str, char16* out, size_t out_capacity) {
+    if (!utf8_str || out_capacity == 0) {
+        if (out_capacity > 0) {
+            out[0] = 0;
+        }
+        return;
+    }
+
+    size_t written = 0;
+    const unsigned char* input = reinterpret_cast<const unsigned char*>(utf8_str);
+
+    while (*input && written + 1 < out_capacity) {
+        uint32_t codepoint = 0;
+        int extra_bytes = 0;
+
+        if (*input < 0x80) {
+            codepoint = *input;
+            extra_bytes = 0;
+        } else if ((*input & 0xE0) == 0xC0) {
+            codepoint = *input & 0x1F;
+            extra_bytes = 1;
+        } else if ((*input & 0xF0) == 0xE0) {
+            codepoint = *input & 0x0F;
+            extra_bytes = 2;
+        } else if ((*input & 0xF8) == 0xF0) {
+            codepoint = *input & 0x07;
+            extra_bytes = 3;
+        } else {
+            // Malformed leading byte
+            out[written++] = 0xFFFD;
+            input++;
+            continue;
+        }
+        input++;
+
+        bool valid = true;
+        for (int index = 0; index < extra_bytes; index++) {
+            if ((*input & 0xC0) != 0x80) {
+                valid = false;
+                break;
+            }
+            codepoint = (codepoint << 6) | (*input & 0x3F);
+            input++;
+        }
+
+        if (!valid) {
+            out[written++] = 0xFFFD;
+            continue;
+        }
+
+        if (codepoint <= 0xFFFF) {
+            out[written++] = static_cast<char16>(codepoint);
+        } else if (written + 2 < out_capacity) {
+            // Encode as a UTF-16 surrogate pair
+            uint32_t adjusted = codepoint - 0x10000;
+            out[written++] = static_cast<char16>(0xD800 + (adjusted >> 10));
+            out[written++] = static_cast<char16>(0xDC00 + (adjusted & 0x3FF));
+        } else {
+            break;
+        }
+    }
+
+    out[written] = 0;
+}
+
 // Helper: Convert hex string to UID
 static bool string_to_uid(const char* str, VST3::UID& uid) {
     if (!str) {
@@ -995,6 +1066,61 @@ int rack_vst3_plugin_parameter_plain_value(
     // plain-value mapping is implemented, which is itself informative.
     *out_plain = plugin->controller->normalizedParamToPlain(
         param_info.id, static_cast<ParamValue>(normalized_value));
+
+    return RACK_VST3_OK;
+}
+
+int rack_vst3_plugin_parameter_value_by_string(
+    RackVST3Plugin* plugin,
+    uint32_t index,
+    const char* string,
+    float* out_normalized)
+{
+    if (!plugin || !plugin->controller || !string || !out_normalized) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+
+    if (index >= plugin->parameters.size()) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+
+    const auto& param_info = plugin->parameters[index];
+
+    String128 utf16_string;
+    utf8_to_utf16(string, utf16_string, 128);
+
+    ParamValue normalized = 0.0;
+    tresult result = plugin->controller->getParamValueByString(
+        param_info.id, utf16_string, normalized);
+    if (result != kResultOk) {
+        return RACK_VST3_ERROR_GENERIC;
+    }
+
+    *out_normalized = static_cast<float>(normalized);
+    return RACK_VST3_OK;
+}
+
+int rack_vst3_plugin_parameter_normalized_from_plain(
+    RackVST3Plugin* plugin,
+    uint32_t index,
+    double plain_value,
+    float* out_normalized)
+{
+    if (!plugin || !plugin->controller || !out_normalized) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+
+    if (index >= plugin->parameters.size()) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+
+    const auto& param_info = plugin->parameters[index];
+
+    // plainParamToNormalized has no documented failure return in the VST3
+    // SDK (same as its inverse, normalizedParamToPlain above) -- it always
+    // returns a ParamValue.
+    *out_normalized = static_cast<float>(plugin->controller->plainParamToNormalized(
+        param_info.id, static_cast<ParamValue>(plain_value)));
 
     return RACK_VST3_OK;
 }
