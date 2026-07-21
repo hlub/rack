@@ -37,6 +37,21 @@ struct RackVST3Scanner {
 static std::vector<std::string> scan_directory_for_vst3(const std::string& dir_path) {
     std::vector<std::string> vst3_paths;
 
+    // If dir_path is itself a .vst3 bundle (not a container directory to
+    // search inside), return it directly. A bundle's own contents don't
+    // contain nested *.vst3 entries, so without this the directory-search
+    // loop below would silently find nothing for a caller who passed a
+    // specific bundle path (e.g. Vst3Instrument::load(path)).
+#if !defined(_WIN32)
+    if (dir_path.length() > 5 && dir_path.substr(dir_path.length() - 5) == ".vst3") {
+        struct stat bundle_st;
+        if (stat(dir_path.c_str(), &bundle_st) == 0 && S_ISDIR(bundle_st.st_mode)) {
+            vst3_paths.push_back(dir_path);
+            return vst3_paths;
+        }
+    }
+#endif
+
 #if defined(_WIN32)
     // Windows implementation
     std::string search_path = dir_path + "\\*.vst3";
