@@ -92,8 +92,17 @@ RackVST3Plugin* rack_vst3_plugin_new(const char* path, const char* uid);
 void rack_vst3_plugin_free(RackVST3Plugin* plugin);
 
 // Initialize plugin
+//
+// If initial_state is non-NULL, it is applied via IComponent::setState in
+// "Setup" state (after setupProcessing, before setActive), which is the
+// correct VST3 lifecycle window for state restoration.  Pass NULL / 0 for
+// a normal initialization with the plugin's default state.
+//
+// State blob format: [uint32_t component_size | component bytes | controller bytes]
+//
 // Returns 0 on success, negative error code on failure
-int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint32_t max_block_size);
+int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint32_t max_block_size,
+                                const uint8_t* initial_state, size_t initial_state_size);
 
 // Check if plugin is initialized
 int rack_vst3_plugin_is_initialized(RackVST3Plugin* plugin);
@@ -161,12 +170,16 @@ int rack_vst3_plugin_get_parameter(RackVST3Plugin* plugin, uint32_t index, float
 // must not be accessed concurrently.
 // Note: Calling during audio processing may cause clicks/pops.
 int rack_vst3_plugin_set_parameter(RackVST3Plugin* plugin, uint32_t index, float value);
+int rack_vst3_plugin_set_parameter_by_id(RackVST3Plugin* plugin, uint32_t param_id, float value);
+uint32_t rack_vst3_plugin_get_midi_pc_param_id(RackVST3Plugin* plugin, int channel);
 
 // Get parameter info
 // name: output buffer for parameter name (allocated by caller)
 // name_size: size of name buffer
 // unit: output buffer for parameter unit string (allocated by caller, can be NULL)
 // unit_size: size of unit buffer (ignored if unit is NULL)
+// step_count: number of discrete steps (0 = continuous), or NULL to skip
+// flags: raw VST3 ParameterInfo::ParameterFlags bitmask, or NULL to skip
 // Returns 0 on success, negative error code on failure
 int rack_vst3_plugin_parameter_info(
     RackVST3Plugin* plugin,
@@ -177,7 +190,37 @@ int rack_vst3_plugin_parameter_info(
     float* max,
     float* default_value,
     char* unit,
-    size_t unit_size
+    size_t unit_size,
+    int32_t* step_count,
+    int32_t* flags
+);
+
+// Get the display string for a normalized parameter value, as the plugin
+// itself would render it (e.g. an amp-type step's model name). This is the
+// VST3 IEditController::getParamStringByValue call.
+//
+// out_size: size of out buffer; out will be null-terminated
+// Returns 0 on success, negative error code on failure
+int rack_vst3_plugin_parameter_string_by_value(
+    RackVST3Plugin* plugin,
+    uint32_t index,
+    float normalized_value,
+    char* out,
+    size_t out_size
+);
+
+// Convert a normalized parameter value (0.0-1.0) to the plugin's "plain"
+// (native/real-world unit) value, e.g. actual milliseconds or Hz. This is
+// the VST3 IEditController::normalizedParamToPlain call. Combine with
+// ParameterInfo::unit for the unit label. Some plugins return the
+// normalized value unchanged when no real plain-value mapping exists.
+//
+// Returns 0 on success, negative error code on failure
+int rack_vst3_plugin_parameter_plain_value(
+    RackVST3Plugin* plugin,
+    uint32_t index,
+    float normalized_value,
+    double* out_plain
 );
 
 // ============================================================================

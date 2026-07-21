@@ -12,12 +12,22 @@
 #include "pluginterfaces/vst/ivstunits.h"
 #include "pluginterfaces/base/ibstream.h"
 #include "pluginterfaces/vst/ivsthostapplication.h"
+#include "pluginterfaces/vst/ivstmidicontrollers.h"
 
 #include <vector>
 #include <string>
 #include <cstring>
 #include <mutex>
 #include <algorithm>
+
+#if defined(__APPLE__)
+#include <CoreFoundation/CoreFoundation.h>
+static void pump_runloop(double seconds) {
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, seconds, false);
+}
+#else
+static void pump_runloop(double) {}
+#endif
 
 using namespace VST3;
 using namespace Steinberg;
@@ -125,11 +135,18 @@ static bool string_to_uid(const char* str, VST3::UID& uid) {
     return true;
 }
 
-// Memory stream implementation for state serialization
+// Memory stream implementation for state serialization.
+//
+// DECLARE_FUNKNOWN_METHODS injects a field __funknownRefCount which
+// IMPLEMENT_REFCOUNT uses for addRef/release.  FUNKNOWN_CTOR initialises it
+// to 1 and must be called in every constructor.  The ref_count_ field that
+// was here before was a dead field (never touched by the refcount machinery);
+// it has been removed.
 class MemoryStream : public IBStream {
 public:
-    MemoryStream() : ref_count_(1), position_(0) {}
-    MemoryStream(const uint8_t* data, size_t size) : ref_count_(1), position_(0) {
+    MemoryStream() : position_(0) { FUNKNOWN_CTOR }
+    MemoryStream(const uint8_t* data, size_t size) : position_(0) {
+        FUNKNOWN_CTOR
         buffer_.assign(data, data + size);
     }
 
@@ -156,7 +173,18 @@ public:
             *numBytesRead = to_read;
         }
 
-        return to_read == numBytes ? kResultOk : kResultFalse;
+        // A short read (to_read < numBytes, e.g. hitting end-of-stream) is
+        // not a failure per the IBStream contract -- the official SDK's own
+        // MemoryStream::read() always returns success and lets the caller
+        // check numBytesRead. Returning kResultFalse here for a short read
+        // was wrong: a caller doing a conventional buffered-read loop (read
+        // a fixed chunk size repeatedly until none remain) would see this
+        // as an error on the final read and could abort parsing early,
+        // silently leaving later fields at their pre-restore values.
+        // Confirmed as the root cause of AD2 state restore silently not
+        // applying individually-automated parameter values while kit
+        // selection (parsed earlier in the stream) restored correctly.
+        return kResultOk;
     }
 
     tresult PLUGIN_API write(void* buffer, int32 numBytes, int32* numBytesWritten) override {
@@ -230,7 +258,6 @@ public:
     void clear() { buffer_.clear(); position_ = 0; }
 
 private:
-    uint32 ref_count_;  // Non-atomic - IMPLEMENT_REFCOUNT macro handles thread-safety
     std::vector<uint8_t> buffer_;
     int32 position_;
 };
@@ -244,6 +271,34 @@ tresult PLUGIN_API MemoryStream::queryInterface(const TUID _iid, void** obj) {
     return kNoInterface;
 }
 
+// Minimal IComponentHandler. The VST3 spec requires the host to provide one
+// via IEditController::setComponentHandler before relying on the controller
+// -- some plugins' internal parameter-cache synchronization (e.g. inside
+// setComponentState) may depend on a handler being present, even though we
+// don't need to act on beginEdit/performEdit/endEdit/restartComponent
+// ourselves in a headless host.
+class ComponentHandler : public IComponentHandler {
+public:
+    ComponentHandler() { FUNKNOWN_CTOR }
+    virtual ~ComponentHandler() = default;
+
+    DECLARE_FUNKNOWN_METHODS
+
+    tresult PLUGIN_API beginEdit(ParamID) override { return kResultOk; }
+    tresult PLUGIN_API performEdit(ParamID, ParamValue) override { return kResultOk; }
+    tresult PLUGIN_API endEdit(ParamID) override { return kResultOk; }
+    tresult PLUGIN_API restartComponent(int32) override { return kResultOk; }
+};
+
+IMPLEMENT_REFCOUNT(ComponentHandler)
+
+tresult PLUGIN_API ComponentHandler::queryInterface(const TUID _iid, void** obj) {
+    QUERY_INTERFACE(_iid, obj, FUnknown::iid, IComponentHandler)
+    QUERY_INTERFACE(_iid, obj, IComponentHandler::iid, IComponentHandler)
+    *obj = nullptr;
+    return kNoInterface;
+}
+
 // Internal plugin state
 struct RackVST3Plugin {
     // Module and factory
@@ -253,6 +308,11 @@ struct RackVST3Plugin {
     IPtr<IComponent> component;
     IPtr<IAudioProcessor> processor;
     IPtr<IEditController> controller;
+
+    // Host-provided IComponentHandler, required by the VST3 spec. Kept
+    // alive for the plugin's lifetime; the controller only holds a raw
+    // pointer to it (set via setComponentHandler), not a counted reference.
+    IPtr<IComponentHandler> component_handler;
 
     // Connection proxy (if component != controller)
     IPtr<IConnectionPoint> component_cp;
@@ -278,7 +338,14 @@ struct RackVST3Plugin {
     EventList input_events;
     EventList output_events;
 
-    // Audio buffers (for pointer arrays)
+    // Process context (tells plugin it is playing at 120 BPM)
+    ProcessContext process_context;
+    int64 sample_position = 0;
+
+    // Audio buffers for pointer arrays.
+    // dummy_buf: a silent buffer shared across all aux output buses that we
+    // don't capture. The plugin may write to these; we ignore the contents.
+    std::vector<float> dummy_buf;
     std::vector<float*> input_ptrs;
     std::vector<float*> output_ptrs;
 
@@ -290,6 +357,8 @@ struct RackVST3Plugin {
         ParamValue min_value;
         ParamValue max_value;
         ParamValue default_value;
+        int32 flags = 0;
+        int32 step_count = 0;
     };
     std::vector<ParameterInfo> parameters;
 
@@ -385,6 +454,16 @@ RackVST3Plugin* rack_vst3_plugin_new(const char* path, const char* uid) {
         plugin->controller = U::cast<IEditController>(plugin->component);
     }
 
+    // The VST3 spec requires the host to provide an IComponentHandler to
+    // the controller. Some plugins' internal parameter-cache
+    // synchronization (e.g. within setComponentState) may depend on one
+    // being present even for a headless host that never acts on its
+    // beginEdit/performEdit/endEdit/restartComponent callbacks.
+    if (plugin->controller) {
+        plugin->component_handler = IPtr<IComponentHandler>(new ComponentHandler(), false);
+        plugin->controller->setComponentHandler(plugin->component_handler);
+    }
+
     // Set up connection points if controller is separate
     if (plugin->controller && reinterpret_cast<void*>(plugin->controller.get()) != reinterpret_cast<void*>(plugin->component.get())) {
         plugin->component_cp = U::cast<IConnectionPoint>(plugin->component);
@@ -435,7 +514,8 @@ void rack_vst3_plugin_free(RackVST3Plugin* plugin) {
     delete plugin;
 }
 
-int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint32_t max_block_size) {
+int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint32_t max_block_size,
+                                const uint8_t* initial_state, size_t initial_state_size) {
     if (!plugin || !plugin->component || !plugin->processor) {
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
@@ -477,9 +557,50 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
         }
     }
 
+    // Activate MIDI/event input bus so the plugin receives note events.
+    int32 numEventInputBuses = plugin->component->getBusCount(kEvent, kInput);
+    for (int32 i = 0; i < numEventInputBuses; ++i) {
+        plugin->component->activateBus(kEvent, kInput, i, true);
+    }
+
     // Activate component
     if (plugin->component->setActive(true) != kResultOk) {
         return RACK_VST3_ERROR_GENERIC;
+    }
+
+    // Apply initial state after setActive but before setProcessing.
+    //
+    // AD2's setState spawns a background sample-loading thread.  That thread
+    // needs the plugin to be in "Active" state so its audio system is ready to
+    // receive the loaded samples.  Calling setState before setActive causes the
+    // thread to crash.  Calling it in "Active" state (here) is safe.
+    // We pump the Cocoa run loop for 5 s to let the async load finish before
+    // setProcessing(true) starts the audio callback.
+    if (initial_state && initial_state_size > sizeof(uint32_t)) {
+        uint32_t component_state_size = 0;
+        memcpy(&component_state_size, initial_state, sizeof(component_state_size));
+
+        if (sizeof(component_state_size) + component_state_size <= initial_state_size) {
+            const uint8_t* comp_data = initial_state + sizeof(component_state_size);
+            IPtr<MemoryStream> comp_stream(new MemoryStream(comp_data, component_state_size), false);
+            plugin->component->setState(comp_stream);
+
+            if (plugin->controller) {
+                void* comp_ptr = reinterpret_cast<void*>(plugin->component.get());
+                void* ctrl_ptr = reinterpret_cast<void*>(plugin->controller.get());
+                if (comp_ptr != ctrl_ptr) {
+                    size_t ctrl_offset = sizeof(component_state_size) + component_state_size;
+                    if (ctrl_offset < initial_state_size) {
+                        const uint8_t* ctrl_data = initial_state + ctrl_offset;
+                        size_t ctrl_size = initial_state_size - ctrl_offset;
+                        IPtr<MemoryStream> ctrl_stream(new MemoryStream(ctrl_data, ctrl_size), false);
+                        plugin->controller->setState(ctrl_stream);
+                    }
+                }
+            }
+        }
+
+        pump_runloop(5.0);
     }
 
     // Start processing
@@ -488,10 +609,39 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
         return RACK_VST3_ERROR_GENERIC;
     }
 
-    // Prepare process_data once during initialization (not in hot path)
-    plugin->process_data.prepare(*plugin->component, max_block_size, kSample32);
+    // Prepare process_data with 0 samples so rack does NOT own the buffer
+    // pointers. We manage our own buffers to avoid heap corruption on cleanup
+    // (if prepare allocates buffers and we replace channelBuffers32 with Rust
+    // pointers, the destructor would try to free our Rust memory).
+    plugin->process_data.prepare(*plugin->component, 0, kSample32);
 
-    // Build parameter cache
+    // Allocate a silent dummy buffer for aux output buses we don't capture.
+    plugin->dummy_buf.assign(max_block_size, 0.0f);
+    float* dummy_ptr = plugin->dummy_buf.data();
+
+    // Point all output buses at the dummy buffer by default.
+    for (int32 b = 0; b < plugin->process_data.numOutputs; ++b) {
+        AudioBusBuffers& bus = plugin->process_data.outputs[b];
+        for (int32 ch = 0; ch < bus.numChannels; ++ch) {
+            bus.channelBuffers32[ch] = dummy_ptr;
+        }
+    }
+
+    // Set up process context so the plugin knows it is in playback at 120 BPM.
+    memset(&plugin->process_context, 0, sizeof(ProcessContext));
+    plugin->process_context.state =
+        ProcessContext::kPlaying |
+        ProcessContext::kTempoValid |
+        ProcessContext::kTimeSigValid |
+        ProcessContext::kSmpteValid |
+        ProcessContext::kClockValid;
+    plugin->process_context.sampleRate = sample_rate;
+    plugin->process_context.tempo = 120.0;
+    plugin->process_context.timeSigNumerator = 4;
+    plugin->process_context.timeSigDenominator = 4;
+    plugin->process_data.processContext = &plugin->process_context;
+
+    // Build parameter cache; log any program-change-flagged parameters.
     if (plugin->controller) {
         int32 param_count = plugin->controller->getParameterCount();
         plugin->parameters.clear();
@@ -511,10 +661,14 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
                 info.min_value = 0.0;
                 info.max_value = 1.0;
                 info.default_value = vst3_param_info.defaultNormalizedValue;
+                info.flags = vst3_param_info.flags;
+                info.step_count = vst3_param_info.stepCount;
 
                 plugin->parameters.push_back(info);
             }
         }
+
+        // Query IMidiMapping to find which parameter handles MIDI Program Change.
     }
 
     // Enumerate factory presets if available
@@ -621,18 +775,26 @@ int rack_vst3_plugin_process(
     // Update dynamic fields only (prepare() was called during initialization)
     plugin->process_data.numSamples = frames;
 
-    // Set input buffers
-    if (num_input_channels > 0) {
+    // Advance the timeline position so the plugin sees a moving clock.
+    plugin->process_context.projectTimeSamples = plugin->sample_position;
+    plugin->sample_position += frames;
+
+    // Set input buffers — write pointers INTO the prepare()-allocated float**
+    // array rather than replacing the array pointer. This avoids freeing
+    // Rust-owned memory in HostProcessData::destroyBuffers().
+    if (num_input_channels > 0 && inputs) {
         AudioBusBuffers& bus = plugin->process_data.inputs[0];
-        bus.numChannels = num_input_channels;
-        bus.channelBuffers32 = const_cast<float**>(inputs);
+        for (uint32_t ch = 0; ch < num_input_channels && ch < (uint32_t)bus.numChannels; ++ch) {
+            bus.channelBuffers32[ch] = const_cast<float*>(inputs[ch]);
+        }
     }
 
-    // Set output buffers
-    if (num_output_channels > 0) {
+    // Set output buffers the same way.
+    if (num_output_channels > 0 && outputs) {
         AudioBusBuffers& bus = plugin->process_data.outputs[0];
-        bus.numChannels = num_output_channels;
-        bus.channelBuffers32 = const_cast<float**>(outputs);
+        for (uint32_t ch = 0; ch < num_output_channels && ch < (uint32_t)bus.numChannels; ++ch) {
+            bus.channelBuffers32[ch] = outputs[ch];
+        }
     }
 
     // Set parameter and event interfaces
@@ -713,6 +875,29 @@ int rack_vst3_plugin_set_parameter(RackVST3Plugin* plugin, uint32_t index, float
     return RACK_VST3_OK;
 }
 
+int rack_vst3_plugin_set_parameter_by_id(RackVST3Plugin* plugin, uint32_t param_id, float value) {
+    if (!plugin || !plugin->controller) return RACK_VST3_ERROR_INVALID_PARAM;
+    if (value < 0.0f) value = 0.0f;
+    if (value > 1.0f) value = 1.0f;
+    plugin->controller->setParamNormalized(param_id, value);
+    int32 queue_index = 0;
+    IParamValueQueue* queue = plugin->input_param_changes.addParameterData(param_id, queue_index);
+    if (queue) {
+        int32 point_index = 0;
+        queue->addPoint(0, value, point_index);
+    }
+    return RACK_VST3_OK;
+}
+
+uint32_t rack_vst3_plugin_get_midi_pc_param_id(RackVST3Plugin* plugin, int channel) {
+    if (!plugin || !plugin->controller) return kNoParamId;
+    IPtr<IMidiMapping> midiMapping = U::cast<IMidiMapping>(plugin->controller);
+    if (!midiMapping) return kNoParamId;
+    ParamID pid = kNoParamId;
+    midiMapping->getMidiControllerAssignment(0, channel, kCtrlProgramChange, pid);
+    return pid;
+}
+
 int rack_vst3_plugin_parameter_info(
     RackVST3Plugin* plugin,
     uint32_t index,
@@ -722,7 +907,9 @@ int rack_vst3_plugin_parameter_info(
     float* max,
     float* default_value,
     char* unit,
-    size_t unit_size)
+    size_t unit_size,
+    int32_t* step_count,
+    int32_t* flags)
 {
     if (!plugin || !plugin->controller || !name || name_size == 0) {
         return RACK_VST3_ERROR_INVALID_PARAM;
@@ -748,6 +935,66 @@ int rack_vst3_plugin_parameter_info(
         strncpy(unit, param_info.units.c_str(), unit_size - 1);
         unit[unit_size - 1] = '\0';
     }
+
+    if (step_count) *step_count = param_info.step_count;
+    if (flags) *flags = param_info.flags;
+
+    return RACK_VST3_OK;
+}
+
+int rack_vst3_plugin_parameter_string_by_value(
+    RackVST3Plugin* plugin,
+    uint32_t index,
+    float normalized_value,
+    char* out,
+    size_t out_size)
+{
+    if (!plugin || !plugin->controller || !out || out_size == 0) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+
+    if (index >= plugin->parameters.size()) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+
+    const auto& param_info = plugin->parameters[index];
+
+    String128 display;
+    tresult result = plugin->controller->getParamStringByValue(
+        param_info.id, static_cast<ParamValue>(normalized_value), display);
+    if (result != kResultOk) {
+        return RACK_VST3_ERROR_GENERIC;
+    }
+
+    std::string display_utf8 = utf16_to_utf8(display);
+    strncpy(out, display_utf8.c_str(), out_size - 1);
+    out[out_size - 1] = '\0';
+
+    return RACK_VST3_OK;
+}
+
+int rack_vst3_plugin_parameter_plain_value(
+    RackVST3Plugin* plugin,
+    uint32_t index,
+    float normalized_value,
+    double* out_plain)
+{
+    if (!plugin || !plugin->controller || !out_plain) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+
+    if (index >= plugin->parameters.size()) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+
+    const auto& param_info = plugin->parameters[index];
+
+    // normalizedParamToPlain has no documented failure return in the VST3
+    // SDK (unlike getParamStringByValue); it always returns a ParamValue.
+    // Some plugins return the normalized value unchanged when no real
+    // plain-value mapping is implemented, which is itself informative.
+    *out_plain = plugin->controller->normalizedParamToPlain(
+        param_info.id, static_cast<ParamValue>(normalized_value));
 
     return RACK_VST3_OK;
 }
@@ -950,49 +1197,44 @@ int rack_vst3_plugin_load_preset(RackVST3Plugin* plugin, int32_t preset_number) 
     return RACK_VST3_ERROR_NOT_SUPPORTED;
 }
 
+// ============================================================================
+// State helpers
+// ============================================================================
+
+// The VST3 spec forbids calling getState/setState while the plugin is in
+// "Processing" state (i.e. after setProcessing(true)).  suspend_for_state /
+// resume_after_state bracket every state operation so we always enter from
+// the "Active" level.  The Rust layer holds the plugin mutex during state
+// operations, so the audio callback is already blocked (it uses try_lock and
+// emits silence when the mutex is taken).  No process() calls occur between
+// suspend and resume; only the plugin's internal VST3 state machine changes.
+static void suspend_for_state(RackVST3Plugin* plugin) {
+    if (!plugin->initialized) return;
+    plugin->processor->setProcessing(false);
+    plugin->component->setActive(false);
+}
+
+static void resume_after_state(RackVST3Plugin* plugin, double post_activate_pump_seconds = 0.0) {
+    if (!plugin->initialized) return;
+    plugin->component->setActive(true);
+    if (post_activate_pump_seconds > 0.0) {
+        // Let any async work triggered by setActive (e.g. JUCE prepareToPlay) complete
+        // before starting processing.  Only used in set_state, not get_state.
+        pump_runloop(post_activate_pump_seconds);
+    }
+    plugin->processor->setProcessing(true);
+}
+
 int rack_vst3_plugin_get_state_size(RackVST3Plugin* plugin) {
     if (!plugin || !plugin->component) {
         return 0;
     }
-
-    // VST3 doesn't provide a query method for state size
-    // We need to actually serialize the state to determine the size
-    // This is done once for buffer allocation - worth the cost for accuracy
-
-    // Create temporary memory stream for size calculation
-    IPtr<MemoryStream> stream(new MemoryStream(), false);
-
-    // Reserve space for component state size marker
-    uint32_t size_marker_placeholder = 0;
-    stream->write(&size_marker_placeholder, sizeof(size_marker_placeholder), nullptr);
-
-    // Record position before component state
-    int64 component_start_pos = 0;
-    stream->tell(&component_start_pos);
-
-    // Get component state
-    tresult result = plugin->component->getState(stream);
-    if (result != kResultOk) {
-        // State serialization failed - return a safe default
-        return 1024 * 1024;  // 1MB fallback
-    }
-
-    // Record position after component state
-    int64 component_end_pos = 0;
-    stream->tell(&component_end_pos);
-
-    // Get controller state if separate controller
-    if (plugin->controller && reinterpret_cast<void*>(plugin->controller.get()) != reinterpret_cast<void*>(plugin->component.get())) {
-        result = plugin->controller->getState(stream);
-        if (result != kResultOk) {
-            // Controller state failed - return component state size only
-            return static_cast<int>(stream->getSize());
-        }
-    }
-
-    // Return actual state size
-    // This avoids the retry pattern - user gets correct size on first call
-    return static_cast<int>(stream->getSize());
+    // Return a generous upper bound so the caller can allocate a buffer and
+    // call rack_vst3_plugin_get_state once.  Doing a real getState call here
+    // just to measure the size would mean two full suspend/resume cycles back
+    // to back, which causes crashes in some JUCE plugins (AD2 included).
+    // rack_vst3_plugin_get_state updates *size to the actual number of bytes.
+    return 4 * 1024 * 1024;  // 4 MB — well above any observed AD2 state size
 }
 
 int rack_vst3_plugin_get_state(RackVST3Plugin* plugin, uint8_t* data, size_t* size) {
@@ -1004,58 +1246,55 @@ int rack_vst3_plugin_get_state(RackVST3Plugin* plugin, uint8_t* data, size_t* si
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
-    // Create memory stream for state serialization
-    // IPtr ensures automatic cleanup on ALL code paths (success, error, buffer size check failure)
+    // Suspend processing: getState is only valid outside Processing state.
+    suspend_for_state(plugin);
+
     IPtr<MemoryStream> stream(new MemoryStream(), false);
 
-    // Reserve space for component state size marker (write it later)
+    // 4-byte header: component state size (filled after serialization).
     uint32_t size_marker_placeholder = 0;
     stream->write(&size_marker_placeholder, sizeof(size_marker_placeholder), nullptr);
 
-    // Record position before component state
     int64 component_start_pos = 0;
     stream->tell(&component_start_pos);
 
-    // Get component state
     tresult result = plugin->component->getState(stream);
     if (result != kResultOk) {
+        fprintf(stderr, "[rack] IComponent::getState failed: tresult=0x%08x\n",
+                static_cast<unsigned>(result));
+        resume_after_state(plugin);
         return RACK_VST3_ERROR_GENERIC;
     }
 
-    // Record position after component state (= size of component state)
     int64 component_end_pos = 0;
     stream->tell(&component_end_pos);
     uint32_t component_state_size = static_cast<uint32_t>(component_end_pos - component_start_pos);
 
-    // Write component state size marker at the beginning
+    // Write the component state size into the 4-byte header.
     stream->seek(0, IBStream::kIBSeekSet, nullptr);
     stream->write(&component_state_size, sizeof(component_state_size), nullptr);
 
-    // Seek back to end to append controller state
+    // Seek to end of component state to append controller state.
     stream->seek(component_end_pos, IBStream::kIBSeekSet, nullptr);
 
-    // Get controller state if separate controller
-    if (plugin->controller && reinterpret_cast<void*>(plugin->controller.get()) != reinterpret_cast<void*>(plugin->component.get())) {
-        result = plugin->controller->getState(stream);
-        if (result != kResultOk) {
-            return RACK_VST3_ERROR_GENERIC;
-        }
+    if (plugin->controller &&
+        reinterpret_cast<void*>(plugin->controller.get()) !=
+        reinterpret_cast<void*>(plugin->component.get())) {
+        // Non-OK from getState means the controller has no separate state
+        // (common for JUCE plugins); the component state alone is used.
+        plugin->controller->getState(stream);
     }
 
-    // Copy to output buffer
-    // Note: MemoryStream grows dynamically - no fixed limit, can't overflow
-    // get_state_size() returns the actual size, so this should match
-    // However, we still check in case the state changed between calls
+    resume_after_state(plugin);
+
     size_t state_size = stream->getSize();
     if (state_size > *size) {
-        *size = state_size;  // Return required size for caller to retry
+        *size = state_size;
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
     memcpy(data, stream->getData().data(), state_size);
     *size = state_size;
-    // IPtr automatically releases stream on scope exit
-
     return RACK_VST3_OK;
 }
 
@@ -1064,35 +1303,87 @@ int rack_vst3_plugin_set_state(RackVST3Plugin* plugin, const uint8_t* data, size
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
-    // Create memory stream from data (IPtr provides RAII cleanup)
-    IPtr<MemoryStream> stream(new MemoryStream(data, size), false);
+    if (size < sizeof(uint32_t)) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
 
-    // Read component state size marker first (written at position 0 during serialization)
     uint32_t component_state_size = 0;
-    int32 bytes_read = 0;
-    tresult result = stream->read(&component_state_size, sizeof(component_state_size), &bytes_read);
+    memcpy(&component_state_size, data, sizeof(component_state_size));
 
-    if (result != kResultOk || bytes_read != sizeof(component_state_size)) {
-        return RACK_VST3_ERROR_GENERIC;
+    if (static_cast<size_t>(sizeof(component_state_size)) + component_state_size > size) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
-    // Set component state (reads from current position, right after size marker)
-    result = plugin->component->setState(stream);
+    // VST3 host state-restore pattern (adapted from SDK basewrapper.cpp),
+    // matching the pattern already proven safe in initialize_with_state:
+    // setState must be called while the component is ACTIVE (only
+    // processing needs to be stopped), not while deactivated. Deactivating
+    // first causes component->setState to return kResultOk without
+    // actually updating parameter values later visible via
+    // getParamNormalized -- confirmed by direct testing on AD2, where a
+    // round-tripped mixer parameter silently failed to restore under the
+    // old deactivate-first sequence.
+    //
+    //   setProcessing(false)                 — already-initialized plugins
+    //   setActive(true)                      — not-yet-initialized plugins
+    //   component->setState(comp_stream)
+    //   pump CFRunLoop                       — let async sample loading finish
+    //   controller->setComponentState(sync)  — separate controller objects only
+    //   setProcessing(true)                  — already-initialized plugins
+    //
+    // The Rust caller holds the plugin mutex throughout, so the audio callback
+    // is blocked (try_lock returns Err, emits silence).
+
+    if (plugin->initialized) {
+        plugin->processor->setProcessing(false);
+    } else {
+        plugin->component->setActive(true);
+    }
+
+    const uint8_t* comp_data = data + sizeof(component_state_size);
+    // IPtr(ptr, false): FUNKNOWN_CTOR initialised __funknownRefCount to 1,
+    // and IPtr takes ownership of that reference without an extra addRef.
+    // The plugin calls addRef/release symmetrically during setState, so the
+    // count returns to 1 when setState returns, and the IPtr destructor at
+    // end of scope drops it to 0 and frees the stream.
+    IPtr<MemoryStream> comp_stream(
+        new MemoryStream(comp_data, component_state_size), false);
+    tresult result = plugin->component->setState(comp_stream);
     if (result != kResultOk) {
+        if (plugin->initialized) {
+            plugin->processor->setProcessing(true);
+        }
         return RACK_VST3_ERROR_GENERIC;
     }
 
-    // Set controller state if separate controller
-    if (plugin->controller && reinterpret_cast<void*>(plugin->controller.get()) != reinterpret_cast<void*>(plugin->component.get())) {
-        // Stream is now positioned right after component state
-        // Controller state follows immediately
-        result = plugin->controller->setState(stream);
-        if (result != kResultOk) {
-            return RACK_VST3_ERROR_GENERIC;
+    // Pump until AD2's async sample-loading thread finishes.
+    pump_runloop(5.0);
+
+    // Sync controller to component state.  Only for plugins where they are
+    // separate objects; for same-object plugins (JUCE), setComponentState
+    // would call setState again and start a second conflicting load.
+    if (plugin->controller) {
+        void* comp_ptr = reinterpret_cast<void*>(plugin->component.get());
+        void* ctrl_ptr = reinterpret_cast<void*>(plugin->controller.get());
+        if (comp_ptr != ctrl_ptr) {
+            IPtr<MemoryStream> sync_stream(
+                new MemoryStream(comp_data, component_state_size), false);
+            plugin->controller->setComponentState(sync_stream);
+
+            size_t ctrl_offset = sizeof(component_state_size) + component_state_size;
+            if (ctrl_offset < size) {
+                const uint8_t* ctrl_data = data + ctrl_offset;
+                size_t ctrl_size = size - ctrl_offset;
+                IPtr<MemoryStream> ctrl_stream(new MemoryStream(ctrl_data, ctrl_size), false);
+                plugin->controller->setState(ctrl_stream);
+            }
         }
     }
 
-    // IPtr automatically releases stream on scope exit
+    if (plugin->initialized) {
+        plugin->processor->setProcessing(true);
+    }
+
     return RACK_VST3_OK;
 }
 

@@ -72,6 +72,158 @@ impl Vst3Plugin {
         }
     }
 
+    /// Set a parameter by its raw VST3 ParamID (not the rack index).
+    /// Used to reach MIDI-mapped parameters like Program Change that are
+    /// not in the indexed parameter list.
+    pub fn set_param_by_id(&mut self, param_id: u32, value: f32) -> Result<()> {
+        unsafe {
+            let result = ffi::rack_vst3_plugin_set_parameter_by_id(
+                self.inner.as_ptr(),
+                param_id,
+                value,
+            );
+            if result != ffi::RACK_VST3_OK {
+                return Err(crate::Error::Other(format!("set_param_by_id failed: {result}")));
+            }
+            Ok(())
+        }
+    }
+
+    /// Get the VST3 ParamID that handles MIDI Program Change on the given channel.
+    /// Returns 0xFFFFFFFF (kNoParamId) if not mapped.
+    pub fn midi_pc_param_id(&self, channel: i32) -> u32 {
+        unsafe {
+            ffi::rack_vst3_plugin_get_midi_pc_param_id(self.inner.as_ptr(), channel)
+        }
+    }
+
+    /// Initialise the plugin and restore `state` via `IComponent::setState`
+    /// while in "Setup" state (after `setupProcessing`, before `setActive`).
+    ///
+    /// This is the correct VST3 lifecycle window for state restoration; it
+    /// guarantees that async sample loading (e.g. AD2) completes before the
+    /// audio callback starts.
+    pub fn initialize_with_state(
+        &mut self,
+        sample_rate: f64,
+        max_block_size: usize,
+        state: &[u8],
+    ) -> Result<()> {
+        self.initialize_impl(sample_rate, max_block_size, state)
+    }
+
+    fn initialize_impl(
+        &mut self,
+        sample_rate: f64,
+        max_block_size: usize,
+        state: &[u8],
+    ) -> Result<()> {
+        unsafe {
+            let (state_ptr, state_len) = if state.is_empty() {
+                (std::ptr::null(), 0)
+            } else {
+                (state.as_ptr(), state.len())
+            };
+
+            let result = ffi::rack_vst3_plugin_initialize(
+                self.inner.as_ptr(),
+                sample_rate,
+                max_block_size as u32,
+                state_ptr,
+                state_len,
+            );
+
+            if result != ffi::RACK_VST3_OK {
+                return Err(map_error(result));
+            }
+
+            let input_channels = ffi::rack_vst3_plugin_get_input_channels(self.inner.as_ptr());
+            let output_channels = ffi::rack_vst3_plugin_get_output_channels(self.inner.as_ptr());
+
+            if input_channels < 0 || output_channels < 0 {
+                return Err(Error::Other("Failed to query channel configuration".to_string()));
+            }
+
+            self.input_channels = input_channels as usize;
+            self.output_channels = output_channels as usize;
+
+            self.input_ptrs = Vec::with_capacity(self.input_channels.max(8));
+            self.output_ptrs = Vec::with_capacity(self.output_channels.max(8));
+            self.input_ptrs.resize(self.input_channels, std::ptr::null());
+            self.output_ptrs.resize(self.output_channels, std::ptr::null_mut());
+
+            Ok(())
+        }
+    }
+
+    // VST3 ParameterInfo::ParameterFlags bit values, from the Steinberg SDK
+    // (pluginterfaces/vst/ivsteditcontroller.h). rack does not depend on the
+    // SDK headers directly, so the bits are mirrored here.
+    const PARAM_FLAG_CAN_AUTOMATE: i32 = 1 << 0;
+    const PARAM_FLAG_IS_READ_ONLY: i32 = 1 << 1;
+    const PARAM_FLAG_IS_LIST: i32 = 1 << 3;
+    const PARAM_FLAG_IS_HIDDEN: i32 = 1 << 4;
+
+    /// Get the display string a plugin would show for a normalized
+    /// parameter value (VST3 `IEditController::getParamStringByValue`).
+    ///
+    /// For a discrete/list parameter (see `ParameterInfo::is_list` and
+    /// `step_count`), this returns the human-readable name of the step the
+    /// value falls on (e.g. an amp model name), not the raw normalized
+    /// number.
+    pub fn parameter_value_string(&self, index: usize, normalized_value: f32) -> Result<String> {
+        if !self.is_initialized() {
+            return Err(Error::NotInitialized);
+        }
+
+        unsafe {
+            let mut out = vec![0i8; 256];
+            let result = ffi::rack_vst3_plugin_parameter_string_by_value(
+                self.inner.as_ptr(),
+                index as u32,
+                normalized_value,
+                out.as_mut_ptr(),
+                out.len(),
+            );
+
+            if result != ffi::RACK_VST3_OK {
+                return Err(map_error(result));
+            }
+
+            let out_cstr = std::ffi::CStr::from_ptr(out.as_ptr());
+            out_cstr
+                .to_str()
+                .map_err(|e| Error::Other(format!("Invalid UTF-8 in parameter value string: {}", e)))
+                .map(str::to_string)
+        }
+    }
+
+    /// Convert a normalized parameter value to the plugin's "plain"
+    /// (native/real-world unit) value, e.g. actual milliseconds or Hz.
+    /// Combine with [`ParameterInfo::unit`] for the unit label. Some
+    /// plugins return the normalized value unchanged when no real
+    /// plain-value mapping is implemented.
+    pub fn parameter_plain_value(&self, index: usize, normalized_value: f32) -> Result<f64> {
+        if !self.is_initialized() {
+            return Err(Error::NotInitialized);
+        }
+
+        unsafe {
+            let mut out_plain = 0.0f64;
+            let result = ffi::rack_vst3_plugin_parameter_plain_value(
+                self.inner.as_ptr(),
+                index as u32,
+                normalized_value,
+                &mut out_plain,
+            );
+
+            if result != ffi::RACK_VST3_OK {
+                return Err(map_error(result));
+            }
+
+            Ok(out_plain)
+        }
+    }
 }
 
 impl Drop for Vst3Plugin {
@@ -84,39 +236,7 @@ impl Drop for Vst3Plugin {
 
 impl PluginInstance for Vst3Plugin {
     fn initialize(&mut self, sample_rate: f64, max_block_size: usize) -> Result<()> {
-        unsafe {
-            let result = ffi::rack_vst3_plugin_initialize(
-                self.inner.as_ptr(),
-                sample_rate,
-                max_block_size as u32,
-            );
-
-            if result != ffi::RACK_VST3_OK {
-                return Err(map_error(result));
-            }
-
-            // Query actual channel configuration
-            let input_channels = ffi::rack_vst3_plugin_get_input_channels(self.inner.as_ptr());
-            let output_channels = ffi::rack_vst3_plugin_get_output_channels(self.inner.as_ptr());
-
-            if input_channels < 0 || output_channels < 0 {
-                return Err(Error::Other("Failed to query channel configuration".to_string()));
-            }
-
-            self.input_channels = input_channels as usize;
-            self.output_channels = output_channels as usize;
-
-            // Pre-allocate pointer arrays for zero-allocation process() calls
-            // Reserve capacity to avoid reallocation even if channel counts are unusual
-            self.input_ptrs = Vec::with_capacity(self.input_channels.max(8));
-            self.output_ptrs = Vec::with_capacity(self.output_channels.max(8));
-
-            // Initialize with null pointers (will be filled in process())
-            self.input_ptrs.resize(self.input_channels, std::ptr::null());
-            self.output_ptrs.resize(self.output_channels, std::ptr::null_mut());
-
-            Ok(())
-        }
+        self.initialize_impl(sample_rate, max_block_size, &[])
     }
 
     fn reset(&mut self) -> Result<()> {
@@ -155,11 +275,10 @@ impl PluginInstance for Vst3Plugin {
             )));
         }
 
-        // Defense-in-depth: Catch initialization bugs where channel counts are zero
-        // This is technically redundant (covered by checks above) but guards against
-        // future bugs in initialize() that could leave channels at zero
-        if inputs.is_empty() || outputs.is_empty() {
-            return Err(Error::Other("Empty input or output channels".to_string()));
+        // Defense-in-depth: outputs must always be present; inputs may be empty
+        // for instrument plugins that have no audio input buses.
+        if outputs.is_empty() {
+            return Err(Error::Other("Empty output channels".to_string()));
         }
 
         // Validate all channels have the same length
@@ -234,6 +353,8 @@ impl PluginInstance for Vst3Plugin {
             let mut min = 0.0f32;
             let mut max = 0.0f32;
             let mut default_value = 0.0f32;
+            let mut step_count = 0i32;
+            let mut flags = 0i32;
 
             let result = ffi::rack_vst3_plugin_parameter_info(
                 self.inner.as_ptr(),
@@ -245,6 +366,8 @@ impl PluginInstance for Vst3Plugin {
                 &mut default_value,
                 unit.as_mut_ptr(),
                 unit.len(),
+                &mut step_count,
+                &mut flags,
             );
 
             if result != ffi::RACK_VST3_OK {
@@ -272,6 +395,11 @@ impl PluginInstance for Vst3Plugin {
                 max,
                 default: default_value,
                 unit: unit_str,
+                step_count,
+                can_automate: flags & Self::PARAM_FLAG_CAN_AUTOMATE != 0,
+                is_read_only: flags & Self::PARAM_FLAG_IS_READ_ONLY != 0,
+                is_list: flags & Self::PARAM_FLAG_IS_LIST != 0,
+                is_hidden: flags & Self::PARAM_FLAG_IS_HIDDEN != 0,
             })
         }
     }

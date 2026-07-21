@@ -254,6 +254,14 @@ impl PluginInstance for AudioUnitPlugin {
                 max,
                 default: default_value,
                 unit: unit_str,
+                // AudioUnit's parameter list does report an indexed/discrete
+                // flag and choice count, but this backend doesn't read it
+                // yet, so these are conservatively unpopulated.
+                step_count: 0,
+                can_automate: false,
+                is_read_only: false,
+                is_list: false,
+                is_hidden: false,
             })
         }
     }

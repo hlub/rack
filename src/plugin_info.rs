@@ -98,10 +98,32 @@ pub struct ParameterInfo {
 
     /// Unit label (e.g., "dB", "Hz", "%")
     pub unit: String,
+
+    /// Number of discrete steps, or 0 if the parameter is continuous.
+    ///
+    /// A VST3 parameter with `step_count == N` has `N + 1` valid states
+    /// (e.g. `step_count == 7` means an 8-way selector such as an amp-type
+    /// list). Always 0 for backends that don't report this (currently
+    /// AudioUnit).
+    pub step_count: i32,
+
+    /// Whether the host can automate this parameter.
+    pub can_automate: bool,
+
+    /// Whether the parameter is read-only (host cannot set it).
+    pub is_read_only: bool,
+
+    /// Whether the parameter represents a list of discrete named values
+    /// rather than a continuous range.
+    pub is_list: bool,
+
+    /// Whether the parameter is hidden from the plugin's own UI.
+    pub is_hidden: bool,
 }
 
 impl ParameterInfo {
     /// Create a new ParameterInfo
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         index: usize,
         name: String,
@@ -109,6 +131,11 @@ impl ParameterInfo {
         max: f32,
         default: f32,
         unit: String,
+        step_count: i32,
+        can_automate: bool,
+        is_read_only: bool,
+        is_list: bool,
+        is_hidden: bool,
     ) -> Self {
         Self {
             index,
@@ -117,6 +144,11 @@ impl ParameterInfo {
             max,
             default,
             unit,
+            step_count,
+            can_automate,
+            is_read_only,
+            is_list,
+            is_hidden,
         }
     }
 }

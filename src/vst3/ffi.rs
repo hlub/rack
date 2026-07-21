@@ -191,6 +191,8 @@ extern "C" {
         plugin: *mut RackVST3Plugin,
         sample_rate: f64,
         max_block_size: u32,
+        initial_state: *const u8,
+        initial_state_size: usize,
     ) -> c_int;
 
     /// Check if plugin is initialized
@@ -335,6 +337,17 @@ extern "C" {
         value: f32,
     ) -> c_int;
 
+    pub fn rack_vst3_plugin_set_parameter_by_id(
+        plugin: *mut RackVST3Plugin,
+        param_id: u32,
+        value: f32,
+    ) -> c_int;
+
+    pub fn rack_vst3_plugin_get_midi_pc_param_id(
+        plugin: *mut RackVST3Plugin,
+        channel: c_int,
+    ) -> u32;
+
     /// Get parameter info (name, min, max, default, unit)
     ///
     /// # Returns
@@ -362,6 +375,40 @@ extern "C" {
         default_value: *mut f32,
         unit: *mut c_char,
         unit_size: usize,
+        step_count: *mut i32,
+        flags: *mut i32,
+    ) -> c_int;
+
+    /// Get the display string for a normalized parameter value, as the
+    /// plugin itself would render it (VST3 `getParamStringByValue`).
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    /// - `index` must be less than parameter count
+    /// - `out` must point to a buffer with at least `out_size` bytes
+    /// - `out` will be null-terminated
+    pub fn rack_vst3_plugin_parameter_string_by_value(
+        plugin: *mut RackVST3Plugin,
+        index: u32,
+        normalized_value: f32,
+        out: *mut c_char,
+        out_size: usize,
+    ) -> c_int;
+
+    /// Convert a normalized parameter value to the plugin's "plain"
+    /// (native/real-world unit) value (VST3 `normalizedParamToPlain`).
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    /// - `index` must be less than parameter count
+    /// - `out_plain` must point to a valid `f64`
+    pub fn rack_vst3_plugin_parameter_plain_value(
+        plugin: *mut RackVST3Plugin,
+        index: u32,
+        normalized_value: f32,
+        out_plain: *mut f64,
     ) -> c_int;
 
     // ============================================================================
