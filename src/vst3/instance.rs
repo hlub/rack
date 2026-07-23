@@ -596,6 +596,7 @@ impl PluginInstance for Vst3Plugin {
 
         unsafe {
             let mut name = vec![0i8; 256];
+            let mut category = vec![0i8; 256];
             let mut preset_number: i32 = 0;
 
             let result = ffi::rack_vst3_plugin_get_preset_info(
@@ -603,6 +604,8 @@ impl PluginInstance for Vst3Plugin {
                 index as u32,
                 name.as_mut_ptr(),
                 name.len(),
+                category.as_mut_ptr(),
+                category.len(),
                 &mut preset_number,
             );
 
@@ -617,10 +620,21 @@ impl PluginInstance for Vst3Plugin {
                 .map_err(|e| Error::Other(format!("Invalid UTF-8 in preset name: {}", e)))?
                 .to_string();
 
+            // Convert category to String; an empty string means "no category"
+            // (the plugin's programs aren't organized into named lists, or
+            // the list itself has no name).
+            let category_cstr = std::ffi::CStr::from_ptr(category.as_ptr());
+            let category_str = category_cstr
+                .to_str()
+                .map_err(|e| Error::Other(format!("Invalid UTF-8 in preset category: {}", e)))?
+                .to_string();
+            let category = if category_str.is_empty() { None } else { Some(category_str) };
+
             Ok(PresetInfo {
                 index,
                 name: name_str,
                 preset_number,
+                category,
             })
         }
     }
@@ -878,5 +892,37 @@ mod tests {
             "f32::NEG_INFINITY should be clamped to 0.0-1.0, got {}",
             value
         );
+    }
+
+    #[test]
+    fn test_preset_info_reports_category() {
+        let (scanner, info) = match get_test_plugin() {
+            Ok(result) => result,
+            Err(_) => {
+                println!("Skipping test - no VST3 plugins found");
+                return;
+            }
+        };
+
+        let mut plugin = scanner.load(&info).expect("Plugin creation should succeed");
+        plugin
+            .initialize(48000.0, 512)
+            .expect("Plugin initialization should succeed");
+
+        let count = plugin.preset_count().expect("preset_count should succeed");
+        if count == 0 {
+            println!("Plugin has no presets, skipping preset category test");
+            return;
+        }
+
+        // Whatever the plugin actually reports (grouped or not), the
+        // category field must round-trip through the C API without
+        // panicking or truncating the name -- an empty program-list name
+        // must come back as `None`, never `Some(String::new())`.
+        let preset = plugin.preset_info(0).expect("preset_info should succeed");
+        assert!(!preset.name.is_empty(), "preset name should not be empty");
+        if let Some(category) = &preset.category {
+            assert!(!category.is_empty(), "category, if present, must not be an empty string");
+        }
     }
 }

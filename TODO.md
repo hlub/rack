@@ -265,6 +265,23 @@
 
 ---
 
+## Known Issues
+
+- **VST3 test suite crashes under default parallel execution**: `cargo test`
+  hits a SIGTRAP (a JUCE assertion) when multiple test threads load real
+  installed VST3 plugins concurrently. `cargo test --lib -- --test-threads=1`
+  passes. Found while verifying the preset-category fix (VST3 `PresetInfo`
+  gaining a `category` field, see the commit adding
+  `vst3::instance::tests::test_preset_info_reports_category`); confirmed via
+  `git stash` to already exist on main before that change, so it's a
+  pre-existing gap, not a regression. AudioUnit already solved the same class
+  of problem for its own lifecycle calls with a global
+  `g_audio_unit_cleanup_mutex` (see Phase 8 above) -- VST3 plugin
+  load/init/dispose likely needs the same treatment.
+- One AudioUnit test also fails even single-threaded:
+  `au::instance::tests::test_reset_clears_state` (a reverb-tail-decay
+  assertion). Unrelated to VST3/presets; also pre-existing.
+
 ## 📋 Future Phases
 
 ### Phase 9: Advanced Features

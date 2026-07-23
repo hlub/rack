@@ -164,15 +164,26 @@ pub struct PresetInfo {
 
     /// Preset number (AudioUnit-specific identifier used for loading)
     pub preset_number: i32,
+
+    /// Name of the group this preset belongs to, if the plugin format has
+    /// such a concept (VST3's `IUnitInfo` program lists, e.g. a plugin
+    /// exposing a separate "Factory Presets" list and a "Drum Kits" list).
+    /// `None` if the format has no grouping concept (AudioUnit) or the
+    /// plugin's presets aren't organized into named groups.
+    pub category: Option<String>,
 }
 
 impl PresetInfo {
-    /// Create a new PresetInfo
+    /// Create a new PresetInfo with no category. Convenience constructor for
+    /// plugin formats with no preset-grouping concept (AudioUnit); VST3's
+    /// own preset enumeration constructs `PresetInfo` directly instead, so it
+    /// can set a real `category`.
     pub fn new(index: usize, name: String, preset_number: i32) -> Self {
         Self {
             index,
             name,
             preset_number,
+            category: None,
         }
     }
 }

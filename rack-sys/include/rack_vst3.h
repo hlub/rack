@@ -272,6 +272,10 @@ int rack_vst3_plugin_get_preset_count(RackVST3Plugin* plugin);
 // index: preset index (0 to preset_count - 1)
 // name: output buffer for preset name (allocated by caller)
 // name_size: size of name buffer
+// category: output buffer for the preset's program-list name (allocated by
+//           caller). Written as an empty string if the plugin's programs
+//           aren't organized into named lists, or the list has no name.
+// category_size: size of category buffer
 // preset_number: output parameter for preset number (used with load_preset)
 // Returns 0 on success, negative error code on failure
 int rack_vst3_plugin_get_preset_info(
@@ -279,6 +283,8 @@ int rack_vst3_plugin_get_preset_info(
     uint32_t index,
     char* name,
     size_t name_size,
+    char* category,
+    size_t category_size,
     int32_t* preset_number
 );
 

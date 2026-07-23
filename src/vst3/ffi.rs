@@ -474,14 +474,17 @@ extern "C" {
     /// - Plugin must be initialized
     /// - `index` must be less than preset count
     /// - `name` must point to a buffer with at least `name_size` bytes
+    /// - `category` must point to a buffer with at least `category_size` bytes
     /// - `preset_number` must be a valid pointer to an i32
-    /// - `name` will be null-terminated
+    /// - `name` and `category` will be null-terminated
     /// - `name_size` should be at least 256 bytes for typical preset names
     pub fn rack_vst3_plugin_get_preset_info(
         plugin: *mut RackVST3Plugin,
         index: u32,
         name: *mut c_char,
         name_size: usize,
+        category: *mut c_char,
+        category_size: usize,
         preset_number: *mut i32,
     ) -> c_int;
 

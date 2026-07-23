@@ -443,6 +443,9 @@ impl PluginInstance for AudioUnitPlugin {
                 index,
                 name: name_str,
                 preset_number,
+                // AudioUnit has no program-list concept, so it never has a
+                // category to report.
+                category: None,
             })
         }
     }

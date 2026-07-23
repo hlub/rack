@@ -438,6 +438,10 @@ struct RackVST3Plugin {
         int32 program_list_id;
         int32 program_index;
         std::string name;
+        // Name of the IUnitInfo program list this preset belongs to (e.g. a
+        // plugin could expose separate "Factory Presets" and "Drum Kits"
+        // lists). Empty if the list itself has no name.
+        std::string category;
     };
     std::vector<PresetInfo> presets;
 };
@@ -749,6 +753,7 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
         for (int32 i = 0; i < program_list_count; ++i) {
             ProgramListInfo list_info;
             if (unit_info->getProgramListInfo(i, list_info) == kResultOk) {
+                std::string list_name = utf16_to_utf8(list_info.name);
                 // Enumerate programs in this list
                 for (int32 j = 0; j < list_info.programCount; ++j) {
                     String128 program_name;
@@ -757,6 +762,7 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
                         preset.program_list_id = list_info.id;
                         preset.program_index = j;
                         preset.name = utf16_to_utf8(program_name);
+                        preset.category = list_name;
                         plugin->presets.push_back(preset);
                     }
                 }
@@ -1141,9 +1147,12 @@ int rack_vst3_plugin_get_preset_info(
     uint32_t index,
     char* name,
     size_t name_size,
+    char* category,
+    size_t category_size,
     int32_t* preset_number)
 {
-    if (!plugin || !plugin->initialized || !name || name_size == 0) {
+    if (!plugin || !plugin->initialized || !name || name_size == 0 ||
+        !category || category_size == 0) {
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
@@ -1156,6 +1165,10 @@ int rack_vst3_plugin_get_preset_info(
     // Copy name
     strncpy(name, preset.name.c_str(), name_size - 1);
     name[name_size - 1] = '\0';
+
+    // Copy category (empty string means "no category")
+    strncpy(category, preset.category.c_str(), category_size - 1);
+    category[category_size - 1] = '\0';
 
     // Preset number is just the index
     if (preset_number) {
