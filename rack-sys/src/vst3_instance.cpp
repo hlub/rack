@@ -816,6 +816,80 @@ int rack_vst3_plugin_get_output_channels(RackVST3Plugin* plugin) {
     return plugin->num_output_channels;
 }
 
+int rack_vst3_plugin_get_output_bus_count(RackVST3Plugin* plugin) {
+    if (!plugin || !plugin->component) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+    return plugin->component->getBusCount(kAudio, kOutput);
+}
+
+int rack_vst3_plugin_get_input_bus_count(RackVST3Plugin* plugin) {
+    if (!plugin || !plugin->component) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+    return plugin->component->getBusCount(kAudio, kInput);
+}
+
+// Shared implementation for rack_vst3_plugin_get_{output,input}_bus_info:
+// looks up BusInfo for `bus_index` on the given direction and copies its
+// channel count / UTF-8 name out to the caller-supplied buffers. Read-only:
+// does not activate the bus.
+static int get_bus_info(
+    RackVST3Plugin* plugin,
+    BusDirection direction,
+    int32_t bus_index,
+    uint32_t* channels_out,
+    char* name_out,
+    size_t name_out_size)
+{
+    if (!plugin || !plugin->component) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+
+    int32 bus_count = plugin->component->getBusCount(kAudio, direction);
+    if (bus_index < 0 || bus_index >= bus_count) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+
+    BusInfo bus_info;
+    if (plugin->component->getBusInfo(kAudio, direction, bus_index, bus_info) != kResultOk) {
+        return RACK_VST3_ERROR_GENERIC;
+    }
+
+    if (channels_out) {
+        *channels_out = static_cast<uint32_t>(bus_info.channelCount);
+    }
+
+    if (name_out && name_out_size > 0) {
+        std::string name_utf8 = utf16_to_utf8(bus_info.name);
+        size_t copy_len = std::min(name_utf8.size(), name_out_size - 1);
+        memcpy(name_out, name_utf8.data(), copy_len);
+        name_out[copy_len] = '\0';
+    }
+
+    return RACK_VST3_OK;
+}
+
+int rack_vst3_plugin_get_output_bus_info(
+    RackVST3Plugin* plugin,
+    int32_t bus_index,
+    uint32_t* channels_out,
+    char* name_out,
+    size_t name_out_size)
+{
+    return get_bus_info(plugin, kOutput, bus_index, channels_out, name_out, name_out_size);
+}
+
+int rack_vst3_plugin_get_input_bus_info(
+    RackVST3Plugin* plugin,
+    int32_t bus_index,
+    uint32_t* channels_out,
+    char* name_out,
+    size_t name_out_size)
+{
+    return get_bus_info(plugin, kInput, bus_index, channels_out, name_out, name_out_size);
+}
+
 int rack_vst3_plugin_process(
     RackVST3Plugin* plugin,
     const float* const* inputs,

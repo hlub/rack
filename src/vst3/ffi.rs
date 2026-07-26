@@ -255,6 +255,84 @@ extern "C" {
     /// - Should be called after `rack_vst3_plugin_initialize`
     pub fn rack_vst3_plugin_get_output_channels(plugin: *mut RackVST3Plugin) -> c_int;
 
+    /// Get the number of audio output buses the plugin declares
+    ///
+    /// Distinct from `rack_vst3_plugin_get_output_channels`, which reports
+    /// only bus 0's channel count. A plugin like AD2 in "individual outs"
+    /// mode may declare several named output buses.
+    ///
+    /// # Returns
+    ///
+    /// - Number of output buses (>= 0)
+    /// - Negative `RACK_VST3_ERROR_*` code on failure
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    pub fn rack_vst3_plugin_get_output_bus_count(plugin: *mut RackVST3Plugin) -> c_int;
+
+    /// Get the number of audio input buses the plugin declares
+    ///
+    /// # Returns
+    ///
+    /// - Number of input buses (>= 0)
+    /// - Negative `RACK_VST3_ERROR_*` code on failure
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    pub fn rack_vst3_plugin_get_input_bus_count(plugin: *mut RackVST3Plugin) -> c_int;
+
+    /// Get channel count and name for a single audio output bus
+    ///
+    /// Read-only query; does not activate the bus.
+    ///
+    /// # Returns
+    ///
+    /// - 0 on success (values written to output pointers)
+    /// - `RACK_VST3_ERROR_INVALID_PARAM` if `bus_index` is out of range
+    /// - Negative error code on other failure
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    /// - `channels_out` can be NULL, or must point to a valid `u32`
+    /// - `name_out` can be NULL, or must point to a buffer with at least
+    ///   `name_out_size` bytes
+    /// - `name_out` (if not NULL) will be null-terminated
+    pub fn rack_vst3_plugin_get_output_bus_info(
+        plugin: *mut RackVST3Plugin,
+        bus_index: i32,
+        channels_out: *mut u32,
+        name_out: *mut c_char,
+        name_out_size: usize,
+    ) -> c_int;
+
+    /// Get channel count and name for a single audio input bus
+    ///
+    /// Read-only query; does not activate the bus.
+    ///
+    /// # Returns
+    ///
+    /// - 0 on success (values written to output pointers)
+    /// - `RACK_VST3_ERROR_INVALID_PARAM` if `bus_index` is out of range
+    /// - Negative error code on other failure
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    /// - `channels_out` can be NULL, or must point to a valid `u32`
+    /// - `name_out` can be NULL, or must point to a buffer with at least
+    ///   `name_out_size` bytes
+    /// - `name_out` (if not NULL) will be null-terminated
+    pub fn rack_vst3_plugin_get_input_bus_info(
+        plugin: *mut RackVST3Plugin,
+        bus_index: i32,
+        channels_out: *mut u32,
+        name_out: *mut c_char,
+        name_out_size: usize,
+    ) -> c_int;
+
     /// Process audio through the plugin (planar format)
     ///
     /// Uses planar (non-interleaved) audio format - one buffer per channel.

@@ -129,6 +129,40 @@ int rack_vst3_plugin_get_input_channels(RackVST3Plugin* plugin);
 // Thread-safety: Should be called after initialize()
 int rack_vst3_plugin_get_output_channels(RackVST3Plugin* plugin);
 
+// Returns the number of audio output buses the plugin declares (>= 0), or a
+// negative RACK_VST3_ERROR_* code on failure. This is the bus COUNT, distinct
+// from rack_vst3_plugin_get_output_channels (which reports only bus 0's
+// channel count).
+int rack_vst3_plugin_get_output_bus_count(RackVST3Plugin* plugin);
+
+// Returns the number of audio input buses the plugin declares (>= 0), or a
+// negative RACK_VST3_ERROR_* code on failure.
+int rack_vst3_plugin_get_input_bus_count(RackVST3Plugin* plugin);
+
+// Fills `channels_out` with the channel count of output bus `bus_index`, and
+// (if `name_out` is non-null) copies up to `name_out_size - 1` bytes of the
+// bus's UTF-8 name into `name_out`, null-terminated. Returns RACK_VST3_OK on
+// success, or a negative RACK_VST3_ERROR_* code (RACK_VST3_ERROR_INVALID_PARAM
+// if bus_index is out of range).
+int rack_vst3_plugin_get_output_bus_info(
+    RackVST3Plugin* plugin,
+    int32_t bus_index,
+    uint32_t* channels_out,
+    char* name_out,
+    size_t name_out_size);
+
+// Fills `channels_out` with the channel count of input bus `bus_index`, and
+// (if `name_out` is non-null) copies up to `name_out_size - 1` bytes of the
+// bus's UTF-8 name into `name_out`, null-terminated. Returns RACK_VST3_OK on
+// success, or a negative RACK_VST3_ERROR_* code (RACK_VST3_ERROR_INVALID_PARAM
+// if bus_index is out of range).
+int rack_vst3_plugin_get_input_bus_info(
+    RackVST3Plugin* plugin,
+    int32_t bus_index,
+    uint32_t* channels_out,
+    char* name_out,
+    size_t name_out_size);
+
 // Process audio (planar format - one buffer per channel)
 // Uses planar (non-interleaved) audio format matching VST3 internal format.
 // This enables zero-copy processing in effect chains.
