@@ -43,6 +43,12 @@ pub struct Vst3Plugin {
     // `output_channels` above; this generalizes it to every bus so
     // `process_multi_bus` callers can size buffers for buses beyond bus 0.
     output_bus_channel_counts: Vec<usize>,
+    // Channel count of every declared input bus (index 0..bus_count),
+    // queried once during initialize, mirroring
+    // `output_bus_channel_counts` above. Index 0 always equals
+    // `input_channels` above; most instrument plugins (e.g. AD2) declare
+    // zero input buses.
+    input_bus_channel_counts: Vec<usize>,
     // Persistent scratch storage for process_multi_bus's zero-allocation hot
     // path: flat, planar channel-pointer storage for every requested extra
     // bus's channels, reserved (during initialize) to the sum of every
@@ -97,6 +103,7 @@ impl Vst3Plugin {
                 input_channels: 0,
                 output_channels: 0,
                 output_bus_channel_counts: Vec::new(),
+                input_bus_channel_counts: Vec::new(),
                 extra_bus_channel_ptrs: Vec::new(),
                 extra_bus_descs: Vec::new(),
                 _not_sync: PhantomData,
@@ -199,6 +206,57 @@ impl Vst3Plugin {
         }
     }
 
+    /// Number of audio input buses the plugin declares (cached from
+    /// `initialize`). Distinct from [`input_channels`](Self::input_channels),
+    /// which reports only bus 0's channel count. Most instrument plugins
+    /// (e.g. Addictive Drums 2) declare zero input buses. Only meaningful
+    /// after a successful `initialize` call.
+    #[must_use]
+    pub fn input_bus_count(&self) -> usize {
+        self.input_bus_channel_counts.len()
+    }
+
+    /// Channel count of input bus `bus_index` (cached from `initialize`),
+    /// or `None` if `bus_index` is out of range.
+    #[must_use]
+    pub fn input_bus_channel_count(&self, bus_index: usize) -> Option<usize> {
+        self.input_bus_channel_counts.get(bus_index).copied()
+    }
+
+    /// Channel count and declared display name of input bus `bus_index`,
+    /// queried live via VST3 `IComponent::getBusInfo`. Read-only; does not
+    /// activate the bus.
+    ///
+    /// Prefer [`input_bus_channel_count`](Self::input_bus_channel_count)
+    /// for just the channel count (already cached from `initialize`, no FFI
+    /// round-trip); this method exists for callers that also want the bus's
+    /// declared name.
+    pub fn input_bus_info(&self, bus_index: i32) -> Result<(usize, String)> {
+        unsafe {
+            let mut channels: u32 = 0;
+            let mut name_buf = vec![0i8; 256];
+            let result = ffi::rack_vst3_plugin_get_input_bus_info(
+                self.inner.as_ptr(),
+                bus_index,
+                &mut channels,
+                name_buf.as_mut_ptr(),
+                name_buf.len(),
+            );
+
+            if result != ffi::RACK_VST3_OK {
+                return Err(map_error(result));
+            }
+
+            let name_cstr = std::ffi::CStr::from_ptr(name_buf.as_ptr());
+            let name = name_cstr
+                .to_str()
+                .map_err(|e| Error::Other(format!("Invalid UTF-8 in input bus name: {}", e)))?
+                .to_string();
+
+            Ok((channels as usize, name))
+        }
+    }
+
     /// Initialise the plugin and restore `state` via `IComponent::setState`
     /// while in "Setup" state (after `setupProcessing`, before `setActive`).
     ///
@@ -277,6 +335,27 @@ impl Vst3Plugin {
                 output_bus_channel_counts.push(channels as usize);
             }
             self.output_bus_channel_counts = output_bus_channel_counts;
+
+            let input_bus_count = ffi::rack_vst3_plugin_get_input_bus_count(self.inner.as_ptr());
+            if input_bus_count < 0 {
+                return Err(Error::Other("Failed to query input bus count".to_string()));
+            }
+            let mut input_bus_channel_counts = Vec::with_capacity(input_bus_count as usize);
+            for bus_index in 0..input_bus_count {
+                let mut channels: u32 = 0;
+                let result = ffi::rack_vst3_plugin_get_input_bus_info(
+                    self.inner.as_ptr(),
+                    bus_index,
+                    &mut channels,
+                    std::ptr::null_mut(),
+                    0,
+                );
+                if result != ffi::RACK_VST3_OK {
+                    return Err(map_error(result));
+                }
+                input_bus_channel_counts.push(channels as usize);
+            }
+            self.input_bus_channel_counts = input_bus_channel_counts;
 
             let extra_bus_capacity: usize =
                 self.output_bus_channel_counts.iter().skip(1).sum();
