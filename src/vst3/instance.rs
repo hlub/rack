@@ -7,6 +7,20 @@ use std::ptr::NonNull;
 use super::ffi;
 use super::util::map_error;
 
+/// One additional (non-main) output bus to capture via
+/// [`Vst3Plugin::process_multi_bus`], and the caller-supplied buffers
+/// (planar: one mutable slice per channel) to route its audio into.
+pub struct ExtraOutputBus<'a> {
+    /// The bus index to capture. Must be >= 1 -- bus 0 is the main bus,
+    /// already handled by `process_multi_bus`'s own `outputs` parameter.
+    pub bus_index: u32,
+    /// One mutable slice per channel. Length must exactly match the bus's
+    /// declared channel count (see
+    /// [`Vst3Plugin::output_bus_channel_count`]); each slice must have
+    /// space for at least `num_frames` samples.
+    pub channels: &'a mut [&'a mut [f32]],
+}
+
 /// An instantiated VST3 plugin
 ///
 /// # Thread Safety
@@ -24,6 +38,21 @@ pub struct Vst3Plugin {
     // Channel configuration (queried from VST3 during initialize)
     input_channels: usize,
     output_channels: usize,
+    // Channel count of every declared output bus (index 0..bus_count),
+    // queried once during initialize. Index 0 always equals
+    // `output_channels` above; this generalizes it to every bus so
+    // `process_multi_bus` callers can size buffers for buses beyond bus 0.
+    output_bus_channel_counts: Vec<usize>,
+    // Persistent scratch storage for process_multi_bus's zero-allocation hot
+    // path: flat, planar channel-pointer storage for every requested extra
+    // bus's channels, reserved (during initialize) to the sum of every
+    // non-main bus's channel count -- a safe upper bound for any subset of
+    // buses a single call might request, so pushing into it during
+    // process_multi_bus never grows the allocation.
+    extra_bus_channel_ptrs: Vec<*mut f32>,
+    // One descriptor per requested extra bus, reserved (during initialize)
+    // to `output_bus_channel_counts.len() - 1` (every bus but bus 0).
+    extra_bus_descs: Vec<ffi::RackVST3ExtraOutputBus>,
     // PhantomData<*const ()> makes this type !Sync while keeping it Send
     _not_sync: PhantomData<*const ()>,
 }
@@ -67,6 +96,9 @@ impl Vst3Plugin {
                 output_ptrs: Vec::new(),
                 input_channels: 0,
                 output_channels: 0,
+                output_bus_channel_counts: Vec::new(),
+                extra_bus_channel_ptrs: Vec::new(),
+                extra_bus_descs: Vec::new(),
                 _not_sync: PhantomData,
             })
         }
@@ -111,6 +143,60 @@ impl Vst3Plugin {
     #[must_use]
     pub fn output_channels(&self) -> usize {
         self.output_channels
+    }
+
+    /// Number of audio output buses the plugin declares (cached from
+    /// `initialize`). Distinct from [`output_channels`](Self::output_channels),
+    /// which reports only bus 0's channel count. A plugin like Addictive
+    /// Drums 2 may declare several named per-instrument output buses beyond
+    /// bus 0; see [`process_multi_bus`](Self::process_multi_bus) to capture
+    /// them. Only meaningful after a successful `initialize` call.
+    #[must_use]
+    pub fn output_bus_count(&self) -> usize {
+        self.output_bus_channel_counts.len()
+    }
+
+    /// Channel count of output bus `bus_index` (cached from `initialize`),
+    /// or `None` if `bus_index` is out of range. Needed to size the buffers
+    /// passed to [`process_multi_bus`](Self::process_multi_bus) for a given
+    /// bus.
+    #[must_use]
+    pub fn output_bus_channel_count(&self, bus_index: usize) -> Option<usize> {
+        self.output_bus_channel_counts.get(bus_index).copied()
+    }
+
+    /// Channel count and declared display name of output bus `bus_index`,
+    /// queried live via VST3 `IComponent::getBusInfo`. Read-only; does not
+    /// activate the bus.
+    ///
+    /// Prefer [`output_bus_channel_count`](Self::output_bus_channel_count)
+    /// for just the channel count (already cached from `initialize`, no FFI
+    /// round-trip); this method exists for callers that also want the bus's
+    /// declared name (e.g. "Kick", "Snare").
+    pub fn output_bus_info(&self, bus_index: i32) -> Result<(usize, String)> {
+        unsafe {
+            let mut channels: u32 = 0;
+            let mut name_buf = vec![0i8; 256];
+            let result = ffi::rack_vst3_plugin_get_output_bus_info(
+                self.inner.as_ptr(),
+                bus_index,
+                &mut channels,
+                name_buf.as_mut_ptr(),
+                name_buf.len(),
+            );
+
+            if result != ffi::RACK_VST3_OK {
+                return Err(map_error(result));
+            }
+
+            let name_cstr = std::ffi::CStr::from_ptr(name_buf.as_ptr());
+            let name = name_cstr
+                .to_str()
+                .map_err(|e| Error::Other(format!("Invalid UTF-8 in output bus name: {}", e)))?
+                .to_string();
+
+            Ok((channels as usize, name))
+        }
     }
 
     /// Initialise the plugin and restore `state` via `IComponent::setState`
@@ -167,6 +253,36 @@ impl Vst3Plugin {
             self.output_ptrs = Vec::with_capacity(self.output_channels.max(8));
             self.input_ptrs.resize(self.input_channels, std::ptr::null());
             self.output_ptrs.resize(self.output_channels, std::ptr::null_mut());
+
+            // Discover every declared output bus's channel count (not just
+            // bus 0) so process_multi_bus's persistent scratch storage can
+            // be reserved once, here, instead of reallocating per call.
+            let output_bus_count = ffi::rack_vst3_plugin_get_output_bus_count(self.inner.as_ptr());
+            if output_bus_count < 0 {
+                return Err(Error::Other("Failed to query output bus count".to_string()));
+            }
+            let mut output_bus_channel_counts = Vec::with_capacity(output_bus_count as usize);
+            for bus_index in 0..output_bus_count {
+                let mut channels: u32 = 0;
+                let result = ffi::rack_vst3_plugin_get_output_bus_info(
+                    self.inner.as_ptr(),
+                    bus_index,
+                    &mut channels,
+                    std::ptr::null_mut(),
+                    0,
+                );
+                if result != ffi::RACK_VST3_OK {
+                    return Err(map_error(result));
+                }
+                output_bus_channel_counts.push(channels as usize);
+            }
+            self.output_bus_channel_counts = output_bus_channel_counts;
+
+            let extra_bus_capacity: usize =
+                self.output_bus_channel_counts.iter().skip(1).sum();
+            let extra_bus_count = self.output_bus_channel_counts.len().saturating_sub(1);
+            self.extra_bus_channel_ptrs = Vec::with_capacity(extra_bus_capacity);
+            self.extra_bus_descs = Vec::with_capacity(extra_bus_count);
 
             Ok(())
         }
@@ -298,6 +414,165 @@ impl Vst3Plugin {
             }
 
             Ok(out_normalized)
+        }
+    }
+
+    /// Process audio, capturing the main output bus (bus 0, identical
+    /// semantics to [`PluginInstance::process`]) plus zero or more
+    /// additional output buses in the same underlying VST3 `process()`
+    /// call.
+    ///
+    /// A VST3 plugin computes every activated output bus in a single
+    /// `process()` call regardless of how many the host actually captures;
+    /// `initialize` activates every bus the plugin declares. This lets a
+    /// caller bind real buffers to buses beyond bus 0 (e.g. a drum plugin's
+    /// per-instrument buses) instead of leaving them pointed at the
+    /// internal silent dummy buffer, as [`PluginInstance::process`] does
+    /// for anything but bus 0.
+    ///
+    /// `extra_outputs` may request buses in any order and any subset of the
+    /// plugin's declared buses (beyond bus 0); each entry's `channels`
+    /// length must exactly match that bus's declared channel count (see
+    /// [`output_bus_channel_count`](Self::output_bus_channel_count)).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the plugin is not initialized, if `inputs`/
+    /// `outputs` channel counts or buffer lengths don't match the plugin's
+    /// main-bus configuration, or if any `extra_outputs` entry's `bus_index`
+    /// is out of range, its channel count doesn't match the bus's declared
+    /// channel count, or any of its channel buffers is shorter than
+    /// `num_frames`.
+    pub fn process_multi_bus(
+        &mut self,
+        inputs: &[&[f32]],
+        outputs: &mut [&mut [f32]],
+        extra_outputs: &mut [ExtraOutputBus<'_>],
+        num_frames: usize,
+    ) -> Result<()> {
+        if !self.is_initialized() {
+            return Err(Error::NotInitialized);
+        }
+
+        // Validate bus-0 (main) channel counts and buffer lengths exactly
+        // as PluginInstance::process does.
+        if inputs.len() != self.input_channels {
+            return Err(Error::Other(format!(
+                "Input channel count mismatch: plugin expects {}, got {}",
+                self.input_channels, inputs.len()
+            )));
+        }
+        if outputs.len() != self.output_channels {
+            return Err(Error::Other(format!(
+                "Output channel count mismatch: plugin expects {}, got {}",
+                self.output_channels, outputs.len()
+            )));
+        }
+        for (index, input) in inputs.iter().enumerate() {
+            if input.len() < num_frames {
+                return Err(Error::Other(format!(
+                    "Input channel {} has {} samples, need at least {}",
+                    index, input.len(), num_frames
+                )));
+            }
+        }
+        for (index, output) in outputs.iter().enumerate() {
+            if output.len() < num_frames {
+                return Err(Error::Other(format!(
+                    "Output channel {} has {} samples, need at least {}",
+                    index, output.len(), num_frames
+                )));
+            }
+        }
+
+        // Validate every requested extra bus against the plugin's declared
+        // bus layout before touching any scratch storage. Bus indices must
+        // be unique: `extra_bus_channel_ptrs`'s capacity (reserved in
+        // `initialize_impl`) is the sum of every *distinct* non-main bus's
+        // channel count, a bound a duplicate request would silently exceed,
+        // forcing a reallocation mid-loop below and leaving an already
+        // FFI-bound pointer dangling.
+        for (position, extra) in extra_outputs.iter().enumerate() {
+            let bus_index = extra.bus_index as usize;
+            if bus_index == 0 {
+                return Err(Error::Other(
+                    "Bus 0 is the main bus; pass it via `outputs`, not `extra_outputs`".to_string(),
+                ));
+            }
+            if extra_outputs[..position]
+                .iter()
+                .any(|other| other.bus_index == extra.bus_index)
+            {
+                return Err(Error::Other(format!(
+                    "Output bus index {bus_index} requested more than once in extra_outputs"
+                )));
+            }
+            let expected_channels = self
+                .output_bus_channel_counts
+                .get(bus_index)
+                .copied()
+                .ok_or_else(|| Error::Other(format!("Output bus index {bus_index} out of range")))?;
+            if extra.channels.len() != expected_channels {
+                return Err(Error::Other(format!(
+                    "Output bus {bus_index} channel count mismatch: plugin declares {expected_channels}, got {}",
+                    extra.channels.len()
+                )));
+            }
+            for (channel_index, channel) in extra.channels.iter().enumerate() {
+                if channel.len() < num_frames {
+                    return Err(Error::Other(format!(
+                        "Output bus {bus_index} channel {channel_index} has {} samples, need at least {num_frames}",
+                        channel.len()
+                    )));
+                }
+            }
+        }
+
+        // Reuse pre-allocated pointer arrays (zero-allocation hot path).
+        for (index, input_ch) in inputs.iter().enumerate() {
+            self.input_ptrs[index] = input_ch.as_ptr();
+        }
+        for (index, output_ch) in outputs.iter_mut().enumerate() {
+            self.output_ptrs[index] = output_ch.as_mut_ptr();
+        }
+
+        // Flatten each extra bus's channel pointers into scratch storage
+        // reserved (in `initialize_impl`) to the sum of every non-main
+        // bus's channel count -- a safe upper bound for any subset of buses
+        // a single call might request, so these pushes never grow the
+        // allocation.
+        self.extra_bus_channel_ptrs.clear();
+        self.extra_bus_descs.clear();
+        for extra in extra_outputs.iter_mut() {
+            let start = self.extra_bus_channel_ptrs.len();
+            for channel in extra.channels.iter_mut() {
+                self.extra_bus_channel_ptrs.push(channel.as_mut_ptr());
+            }
+            let channels_ptr = self.extra_bus_channel_ptrs[start..].as_ptr();
+            self.extra_bus_descs.push(ffi::RackVST3ExtraOutputBus {
+                bus_index: extra.bus_index as i32,
+                channels: channels_ptr,
+                channel_count: extra.channels.len() as u32,
+            });
+        }
+
+        unsafe {
+            let result = ffi::rack_vst3_plugin_process_multi_bus(
+                self.inner.as_ptr(),
+                self.input_ptrs.as_ptr(),
+                inputs.len() as u32,
+                self.output_ptrs.as_ptr(),
+                outputs.len() as u32,
+                num_frames as u32,
+                self.extra_bus_descs.as_ptr(),
+                self.extra_bus_descs.len(),
+            );
+
+            if result != ffi::RACK_VST3_OK {
+                return Err(map_error(result));
+            }
+
+            Ok(())
         }
     }
 }

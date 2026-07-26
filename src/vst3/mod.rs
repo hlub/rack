@@ -4,4 +4,4 @@ mod scanner;
 mod instance;
 
 pub use scanner::Vst3Scanner;
-pub use instance::Vst3Plugin;
+pub use instance::{ExtraOutputBus, Vst3Plugin};

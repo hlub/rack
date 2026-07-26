@@ -402,6 +402,16 @@ struct RackVST3Plugin {
     int32 num_input_channels = 0;
     int32 num_output_channels = 0;
 
+    // Channel count per declared audio bus, indexed by bus index, populated
+    // during initialize() once every declared bus (not just bus 0) is
+    // activated. output_bus_channel_counts[0] always equals
+    // num_output_channels (kept in sync deliberately -- num_output_channels
+    // stays the stable single-bus field existing callers already rely on via
+    // rack_vst3_plugin_get_output_channels; this vector generalizes it to
+    // every bus for rack_vst3_plugin_process_multi_bus's validation).
+    std::vector<int32_t> input_bus_channel_counts;
+    std::vector<int32_t> output_bus_channel_counts;
+
     // Processing structures
     HostProcessData process_data;
     ParameterChanges input_param_changes;
@@ -615,20 +625,47 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
     int32 numInputBuses = plugin->component->getBusCount(kAudio, kInput);
     int32 numOutputBuses = plugin->component->getBusCount(kAudio, kOutput);
 
-    // Activate main audio buses
-    if (numInputBuses > 0) {
-        plugin->component->activateBus(kAudio, kInput, 0, true);
+    // Activate every declared audio bus (not just bus 0/"main"), so a plugin
+    // like AD2's per-instrument output buses actually produce audio when a
+    // caller later binds real buffers to them via
+    // rack_vst3_plugin_process_multi_bus. A plugin declaring zero buses in a
+    // direction (numInputBuses/numOutputBuses == 0) simply runs these loops
+    // zero times -- activateBus is never called and the corresponding
+    // *_bus_channel_counts vector stays empty, same as today's num_input_
+    // channels/num_output_channels staying at their 0 default in that case.
+    // activateBus's return value is intentionally not checked here, matching
+    // this function's existing convention (the event-bus activation loop
+    // below, and the previous single-bus activation this replaces, both
+    // already ignored it) -- getBusInfo is queried unconditionally regardless
+    // of whether activation reports success, so a channel count is still
+    // recorded even if a given bus somehow fails to activate.
+    plugin->input_bus_channel_counts.clear();
+    plugin->input_bus_channel_counts.reserve(numInputBuses);
+    for (int32 b = 0; b < numInputBuses; ++b) {
+        plugin->component->activateBus(kAudio, kInput, b, true);
         BusInfo busInfo;
-        if (plugin->component->getBusInfo(kAudio, kInput, 0, busInfo) == kResultOk) {
-            plugin->num_input_channels = busInfo.channelCount;
+        int32 channelCount = 0;
+        if (plugin->component->getBusInfo(kAudio, kInput, b, busInfo) == kResultOk) {
+            channelCount = busInfo.channelCount;
+        }
+        plugin->input_bus_channel_counts.push_back(channelCount);
+        if (b == 0) {
+            plugin->num_input_channels = channelCount;
         }
     }
 
-    if (numOutputBuses > 0) {
-        plugin->component->activateBus(kAudio, kOutput, 0, true);
+    plugin->output_bus_channel_counts.clear();
+    plugin->output_bus_channel_counts.reserve(numOutputBuses);
+    for (int32 b = 0; b < numOutputBuses; ++b) {
+        plugin->component->activateBus(kAudio, kOutput, b, true);
         BusInfo busInfo;
-        if (plugin->component->getBusInfo(kAudio, kOutput, 0, busInfo) == kResultOk) {
-            plugin->num_output_channels = busInfo.channelCount;
+        int32 channelCount = 0;
+        if (plugin->component->getBusInfo(kAudio, kOutput, b, busInfo) == kResultOk) {
+            channelCount = busInfo.channelCount;
+        }
+        plugin->output_bus_channel_counts.push_back(channelCount);
+        if (b == 0) {
+            plugin->num_output_channels = channelCount;
         }
     }
 
@@ -955,6 +992,116 @@ int rack_vst3_plugin_process(
     plugin->process_data.outputEvents = &plugin->output_events;
 
     // Process
+    tresult result = plugin->processor->process(plugin->process_data);
+
+    // Clear input/output events and parameter changes for next call
+    plugin->input_events.clear();
+    plugin->input_param_changes.clearQueue();
+    plugin->output_events.clear();
+    plugin->output_param_changes.clearQueue();
+
+    return (result == kResultOk) ? RACK_VST3_OK : RACK_VST3_ERROR_GENERIC;
+}
+
+int rack_vst3_plugin_process_multi_bus(
+    RackVST3Plugin* plugin,
+    const float* const* inputs,
+    uint32_t num_input_channels,
+    float* const* outputs,
+    uint32_t num_output_channels,
+    uint32_t frames,
+    const RackVST3ExtraOutputBus* extra_output_buses,
+    size_t num_extra_output_buses)
+{
+    if (!plugin || !plugin->initialized || !plugin->processor) {
+        return RACK_VST3_ERROR_NOT_INITIALIZED;
+    }
+
+    // Validate bus-0 (main) parameters exactly as rack_vst3_plugin_process does.
+    if (num_input_channels != static_cast<uint32_t>(plugin->num_input_channels)) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+    if (num_output_channels != static_cast<uint32_t>(plugin->num_output_channels)) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+    if (frames > plugin->max_block_size) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+    if (num_input_channels > 0 && !inputs) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+    if (num_output_channels > 0 && !outputs) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+
+    // Validate every requested extra output bus up front, before touching any
+    // process_data state, so a bad request never leaves buffer pointers
+    // partially rebound. bus_index == 0 is rejected here -- that bus is
+    // already handled by the outputs/num_output_channels parameters above.
+    if (num_extra_output_buses > 0 && !extra_output_buses) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+    for (size_t i = 0; i < num_extra_output_buses; ++i) {
+        const RackVST3ExtraOutputBus& extra = extra_output_buses[i];
+        if (extra.bus_index <= 0 ||
+            static_cast<size_t>(extra.bus_index) >= plugin->output_bus_channel_counts.size()) {
+            return RACK_VST3_ERROR_INVALID_PARAM;
+        }
+        if (extra.channel_count !=
+            static_cast<uint32_t>(plugin->output_bus_channel_counts[static_cast<size_t>(extra.bus_index)])) {
+            return RACK_VST3_ERROR_INVALID_PARAM;
+        }
+        if (extra.channel_count > 0 && !extra.channels) {
+            return RACK_VST3_ERROR_INVALID_PARAM;
+        }
+    }
+
+    // Update dynamic fields only (prepare() was called during initialization)
+    plugin->process_data.numSamples = frames;
+
+    // Advance the timeline position so the plugin sees a moving clock.
+    plugin->process_context.projectTimeSamples = plugin->sample_position;
+    plugin->sample_position += frames;
+
+    // Set input buffers — write pointers INTO the prepare()-allocated float**
+    // array rather than replacing the array pointer. This avoids freeing
+    // Rust-owned memory in HostProcessData::destroyBuffers().
+    if (num_input_channels > 0 && inputs) {
+        AudioBusBuffers& bus = plugin->process_data.inputs[0];
+        for (uint32_t ch = 0; ch < num_input_channels && ch < (uint32_t)bus.numChannels; ++ch) {
+            bus.channelBuffers32[ch] = const_cast<float*>(inputs[ch]);
+        }
+    }
+
+    // Set bus-0 (main) output buffers the same way.
+    if (num_output_channels > 0 && outputs) {
+        AudioBusBuffers& bus = plugin->process_data.outputs[0];
+        for (uint32_t ch = 0; ch < num_output_channels && ch < (uint32_t)bus.numChannels; ++ch) {
+            bus.channelBuffers32[ch] = outputs[ch];
+        }
+    }
+
+    // Rebind each requested extra output bus's channel pointers -- same
+    // pointer-rebind pattern as bus 0 above, generalized to an arbitrary bus
+    // index. Fixed-size loops over caller-supplied arrays only, no
+    // allocation: real-time-safe.
+    for (size_t i = 0; i < num_extra_output_buses; ++i) {
+        const RackVST3ExtraOutputBus& extra = extra_output_buses[i];
+        AudioBusBuffers& bus = plugin->process_data.outputs[extra.bus_index];
+        for (uint32_t ch = 0; ch < extra.channel_count && ch < (uint32_t)bus.numChannels; ++ch) {
+            bus.channelBuffers32[ch] = extra.channels[ch];
+        }
+    }
+
+    // Set parameter and event interfaces
+    plugin->process_data.inputParameterChanges = &plugin->input_param_changes;
+    plugin->process_data.outputParameterChanges = &plugin->output_param_changes;
+    plugin->process_data.inputEvents = &plugin->input_events;
+    plugin->process_data.outputEvents = &plugin->output_events;
+
+    // Process. A single VST3 process() call computes every activated bus at
+    // once, so this one call produces bus 0's audio plus every extra bus
+    // rebound above.
     tresult result = plugin->processor->process(plugin->process_data);
 
     // Clear input/output events and parameter changes for next call

@@ -188,6 +188,60 @@ int rack_vst3_plugin_process(
     uint32_t frames
 );
 
+// Describes one additional (non-main) output bus to capture in the same
+// process() call as `rack_vst3_plugin_process_multi_bus`. `bus_index` must
+// be >= 1 (bus 0 is the main bus, already covered by that function's own
+// `outputs`/`num_output_channels` parameters). `channels` is a planar
+// (one-pointer-per-channel) array like `outputs` above, with exactly
+// `channel_count` entries; `channel_count` must exactly match the channel
+// count `rack_vst3_plugin_get_output_bus_info` reports for `bus_index`.
+typedef struct {
+    int32_t bus_index;
+    float* const* channels;
+    uint32_t channel_count;
+} RackVST3ExtraOutputBus;
+
+// Process audio, capturing the main output bus (bus 0, same semantics as
+// `rack_vst3_plugin_process`) plus zero or more additional output buses in
+// the same underlying VST3 `process()` call.
+//
+// A VST3 plugin computes every *activated* output bus in a single
+// `process()` call regardless of how many the host actually captures;
+// `rack_vst3_plugin_initialize` now activates every bus the plugin
+// declares. This function lets a caller additionally bind real buffers to
+// buses beyond bus 0 (e.g. a drum plugin's per-instrument buses) instead of
+// letting their audio fall into the internal silent dummy buffer that
+// `rack_vst3_plugin_process` leaves them pointed at.
+//
+// inputs, num_input_channels, outputs, num_output_channels, frames: exactly
+// as `rack_vst3_plugin_process` (bus 0 / main bus semantics, identical
+// validation).
+//
+// extra_output_buses: array of `num_extra_output_buses` requests for
+// additional output buses (bus index >= 1) to capture in this same call.
+// Each entry's `bus_index` must be in range and its `channel_count` must
+// exactly match that bus's declared channel count, or this call fails with
+// RACK_VST3_ERROR_INVALID_PARAM (and no buffer pointers are rebound at
+// all -- validation happens before any process_data mutation). Pass NULL /
+// 0 to behave exactly like `rack_vst3_plugin_process`.
+//
+// Returns 0 on success, negative error code on failure.
+//
+// # Thread-safety
+//
+// Same as `rack_vst3_plugin_process`: real-time-safe (no allocation), must
+// not be called concurrently on the same plugin from multiple threads.
+int rack_vst3_plugin_process_multi_bus(
+    RackVST3Plugin* plugin,
+    const float* const* inputs,
+    uint32_t num_input_channels,
+    float* const* outputs,
+    uint32_t num_output_channels,
+    uint32_t frames,
+    const RackVST3ExtraOutputBus* extra_output_buses,
+    size_t num_extra_output_buses
+);
+
 // Get parameter count
 // Thread-safety: Read-only after initialization. Safe to call from any thread.
 int rack_vst3_plugin_parameter_count(RackVST3Plugin* plugin);
