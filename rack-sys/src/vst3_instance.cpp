@@ -20,6 +20,8 @@
 #include <mutex>
 #include <algorithm>
 
+#include "vst3_lifecycle_mutex.h"
+
 #if defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
 static void pump_runloop(double seconds) {
@@ -32,10 +34,6 @@ static void pump_runloop(double) {}
 using namespace VST3;
 using namespace Steinberg;
 using namespace Steinberg::Vst;
-
-// Global mutex for VST3 lifecycle operations
-// VST3 module loading/unloading is not guaranteed to be thread-safe
-static std::mutex g_vst3_lifecycle_mutex;
 
 // Helper: Convert UTF-16 to UTF-8
 // VST3 uses char16 (UTF-16) for strings
@@ -465,7 +463,7 @@ RackVST3Plugin* rack_vst3_plugin_new(const char* path, const char* uid) {
         return nullptr;
     }
 
-    std::lock_guard<std::mutex> lock(g_vst3_lifecycle_mutex);
+    std::lock_guard<std::mutex> lock(rack_vst3_module_load_mutex());
 
     auto plugin = new(std::nothrow) RackVST3Plugin();
     if (!plugin) {
@@ -568,7 +566,7 @@ void rack_vst3_plugin_free(RackVST3Plugin* plugin) {
         return;
     }
 
-    std::lock_guard<std::mutex> lock(g_vst3_lifecycle_mutex);
+    std::lock_guard<std::mutex> lock(rack_vst3_module_load_mutex());
 
     // Deactivate if active
     if (plugin->initialized && plugin->component) {
@@ -605,7 +603,7 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
-    std::lock_guard<std::mutex> lock(g_vst3_lifecycle_mutex);
+    std::lock_guard<std::mutex> lock(rack_vst3_module_load_mutex());
 
     plugin->sample_rate = sample_rate;
     plugin->max_block_size = max_block_size;
@@ -823,7 +821,7 @@ int rack_vst3_plugin_reset(RackVST3Plugin* plugin) {
 
     // Acquire mutex BEFORE checking state to prevent TOCTOU race condition
     // Without this, another thread could change initialized between check and lock
-    std::lock_guard<std::mutex> lock(g_vst3_lifecycle_mutex);
+    std::lock_guard<std::mutex> lock(rack_vst3_module_load_mutex());
 
     if (!plugin->initialized || !plugin->component) {
         return RACK_VST3_ERROR_NOT_INITIALIZED;

@@ -61,6 +61,11 @@ name = "vst3_processor"
 path = "examples/vst3_processor.rs"
 required-features = ["vst3"]
 
+[[example]]
+name = "multi_bus_capture_smoke"
+path = "examples/multi_bus_capture_smoke.rs"
+required-features = ["cpal"]
+
 [profile.dev]
 opt-level = 2  # Audio needs some optimization even in debug
 

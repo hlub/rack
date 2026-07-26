@@ -8,6 +8,9 @@
 #include <string>
 #include <algorithm>
 #include <cstring>
+#include <mutex>
+
+#include "vst3_lifecycle_mutex.h"
 
 #if defined(__APPLE__)
     #include <CoreFoundation/CoreFoundation.h>
@@ -222,7 +225,16 @@ int rack_vst3_scanner_scan(RackVST3Scanner* scanner, RackVST3PluginInfo* plugins
     std::sort(module_paths.begin(), module_paths.end());
     module_paths.erase(std::unique(module_paths.begin(), module_paths.end()), module_paths.end());
 
-    // Scan all found modules
+    // Scan all found modules.
+    //
+    // Module::create()/module teardown are not thread-safe (see
+    // vst3_lifecycle_mutex.h): hold the same lifecycle mutex
+    // rack_vst3_plugin_new/rack_vst3_plugin_free already use, so a scan
+    // running on one thread can't race a concurrent scan or plugin load
+    // running on another. This is a cold, infrequent path (enumeration, not
+    // audio processing), so serializing the whole loop has no real-time cost.
+    std::lock_guard<std::mutex> lock(rack_vst3_module_load_mutex());
+
     for (const auto& module_path : module_paths) {
         std::string error_description;
         auto module = Hosting::Module::create(module_path, error_description);

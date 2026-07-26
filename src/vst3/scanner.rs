@@ -229,6 +229,36 @@ impl PluginScanner for Vst3Scanner {
 mod tests {
     use super::*;
 
+    // These tests call `scan()`/`scan_path()` against whichever real VST3
+    // plugins happen to be installed system-wide on the machine running the
+    // tests -- there is no metadata-only scan path (most installed plugins
+    // don't ship a `moduleinfo.json`, so `Hosting::Module::create` has to
+    // `dlopen`/`CFBundleLoadExecutableAndReturnError` the real bundle to read
+    // its class info) and no isolated fixture `.vst3` bundle vendored into
+    // this repo to scan instead. `scan_path` cannot be used to sandbox a scan
+    // away from the real system plugins either: the underlying C++ scanner
+    // always additionally walks `Hosting::Module::getModulePaths()`
+    // regardless of what explicit paths were requested (see
+    // `rack-sys/src/vst3_scanner.cpp`; `crates/backline/src/vst3.rs` in the
+    // sibling `drumr` workspace documents and works around the same quirk).
+    //
+    // This used to make these tests flaky in a much worse way than "results
+    // vary by machine": running more than one of them concurrently (cargo
+    // test's default) reliably reproduced a JUCE assertion failure
+    // (`juce_audio_plugin_client_VST3.cpp:4193`) followed by a SIGTRAP that
+    // killed the entire test process, because `Hosting::Module::create`
+    // (and the module teardown that runs when the returned handle is
+    // dropped) is not thread-safe -- concurrent loads/unloads of real
+    // JUCE-based bundles (this machine has several: AD2, Drum Butter, Life,
+    // Life DAW Recorder, RC-20 Retro Color) raced on JUCE's own global
+    // registration state. The identical bundles loaded strictly
+    // sequentially in one thread never crashed. `vst3_instance.cpp` already
+    // serialized its own plugin-instantiation path on a lifecycle mutex for
+    // this exact reason; the scanner's separate `Module::create` calls
+    // (used for metadata enumeration, not instantiation) were the one gap
+    // that mutex didn't cover. Both now share one mutex
+    // (`vst3_lifecycle_mutex.h`), so concurrent scans -- and a concurrent
+    // scan racing a concurrent plugin load -- serialize instead of racing.
     #[test]
     fn test_scanner_creation() {
         let result = Vst3Scanner::new();
@@ -305,5 +335,31 @@ mod tests {
 
         let result = scanner.add_path(path);
         assert!(result.is_ok(), "Adding path should succeed");
+    }
+
+    /// Regression test for the JUCE-assertion/SIGTRAP crash: scanning is
+    /// only reproducibly safe when concurrent `scan()` calls are actually
+    /// exercised, not just when a single scan happens to succeed (a lone
+    /// scan already passed before this bug was fixed -- only running
+    /// several at once, the way cargo test's default runner schedules
+    /// `#[test]` functions on separate threads, raced on
+    /// `Hosting::Module::create`'s non-thread-safe global state). Spawns
+    /// several threads that each build their own scanner and scan
+    /// concurrently, matching that shape directly instead of relying on
+    /// incidental scheduling luck from the other tests in this module.
+    #[test]
+    fn test_concurrent_scans_do_not_crash() {
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let scanner = Vst3Scanner::new().expect("Scanner creation should succeed");
+                    scanner.scan().expect("Concurrent scan should succeed")
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Scanning thread should not panic");
+        }
     }
 }
