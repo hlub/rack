@@ -201,6 +201,20 @@ typedef struct {
     uint32_t channel_count;
 } RackVST3ExtraOutputBus;
 
+// Describes one additional (non-main) input bus to feed in the same
+// process() call as `rack_vst3_plugin_process_multi_bus`. `bus_index` must
+// be >= 1 (bus 0 is the main bus, already covered by that function's own
+// `inputs`/`num_input_channels` parameters). `channels` is a planar
+// (one-pointer-per-channel) array, read-only from the host's perspective,
+// with exactly `channel_count` entries; `channel_count` must exactly match
+// the channel count `rack_vst3_plugin_get_input_bus_info` reports for
+// `bus_index`.
+typedef struct {
+    int32_t bus_index;
+    const float* const* channels;
+    uint32_t channel_count;
+} RackVST3ExtraInputBus;
+
 // Process audio, capturing the main output bus (bus 0, same semantics as
 // `rack_vst3_plugin_process`) plus zero or more additional output buses in
 // the same underlying VST3 `process()` call.
@@ -211,7 +225,10 @@ typedef struct {
 // declares. This function lets a caller additionally bind real buffers to
 // buses beyond bus 0 (e.g. a drum plugin's per-instrument buses) instead of
 // letting their audio fall into the internal silent dummy buffer that
-// `rack_vst3_plugin_process` leaves them pointed at.
+// `rack_vst3_plugin_process` leaves them pointed at. Symmetrically,
+// `extra_input_buses` lets a caller feed real buffers into input buses
+// beyond bus 0 (e.g. an effect plugin's per-instrument input buses) in the
+// same call, instead of leaving them unbound.
 //
 // inputs, num_input_channels, outputs, num_output_channels, frames: exactly
 // as `rack_vst3_plugin_process` (bus 0 / main bus semantics, identical
@@ -224,6 +241,16 @@ typedef struct {
 // RACK_VST3_ERROR_INVALID_PARAM (and no buffer pointers are rebound at
 // all -- validation happens before any process_data mutation). Pass NULL /
 // 0 to behave exactly like `rack_vst3_plugin_process`.
+//
+// extra_input_buses: array of `num_extra_input_buses` requests for
+// additional input buses (bus index >= 1) to feed in this same call. Each
+// entry's `bus_index` must be in range and its `channel_count` must exactly
+// match that bus's declared channel count (see
+// `rack_vst3_plugin_get_input_bus_info`), or this call fails with
+// RACK_VST3_ERROR_INVALID_PARAM (and no buffer pointers are rebound at
+// all -- validation happens before any process_data mutation, exactly as
+// for `extra_output_buses`). Duplicate `bus_index` values across the array
+// are also rejected. Pass NULL / 0 to feed no extra input buses.
 //
 // Returns 0 on success, negative error code on failure.
 //
@@ -239,7 +266,9 @@ int rack_vst3_plugin_process_multi_bus(
     uint32_t num_output_channels,
     uint32_t frames,
     const RackVST3ExtraOutputBus* extra_output_buses,
-    size_t num_extra_output_buses
+    size_t num_extra_output_buses,
+    const RackVST3ExtraInputBus* extra_input_buses,
+    size_t num_extra_input_buses
 );
 
 // Get parameter count

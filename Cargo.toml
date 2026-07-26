@@ -66,6 +66,11 @@ name = "multi_bus_capture_smoke"
 path = "examples/multi_bus_capture_smoke.rs"
 required-features = ["cpal"]
 
+[[example]]
+name = "multi_bus_input_feed_smoke"
+path = "examples/multi_bus_input_feed_smoke.rs"
+required-features = ["cpal"]
+
 [profile.dev]
 opt-level = 2  # Audio needs some optimization even in debug
 

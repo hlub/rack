@@ -242,7 +242,7 @@ mod run {
                         ExtraOutputBus { bus_index: 2, channels: &mut snare_channel_slices },
                     ];
 
-                    if plugin.process_multi_bus(&input_refs, &mut master_refs, &mut extra_outputs, BUFFER_FRAMES).is_err() {
+                    if plugin.process_multi_bus(&input_refs, &[], &mut master_refs, &mut extra_outputs, BUFFER_FRAMES).is_err() {
                         data.fill(0.0);
                         return;
                     }

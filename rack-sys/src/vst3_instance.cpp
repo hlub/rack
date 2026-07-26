@@ -1009,7 +1009,9 @@ int rack_vst3_plugin_process_multi_bus(
     uint32_t num_output_channels,
     uint32_t frames,
     const RackVST3ExtraOutputBus* extra_output_buses,
-    size_t num_extra_output_buses)
+    size_t num_extra_output_buses,
+    const RackVST3ExtraInputBus* extra_input_buses,
+    size_t num_extra_input_buses)
 {
     if (!plugin || !plugin->initialized || !plugin->processor) {
         return RACK_VST3_ERROR_NOT_INITIALIZED;
@@ -1054,6 +1056,37 @@ int rack_vst3_plugin_process_multi_bus(
         }
     }
 
+    // Validate every requested extra input bus up front, same discipline as
+    // extra output buses above: bus_index == 0 is rejected (already handled
+    // by inputs/num_input_channels), bus_index must be in range against
+    // input_bus_channel_counts, channel_count must match exactly, and no
+    // bus_index may repeat -- a duplicate would rebind the same
+    // process_data.inputs[bus_index] slot twice, which is harmless here but
+    // is rejected anyway for symmetry with the Rust-layer scratch-buffer
+    // safety requirement (see Vst3Plugin::process_multi_bus).
+    if (num_extra_input_buses > 0 && !extra_input_buses) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+    for (size_t i = 0; i < num_extra_input_buses; ++i) {
+        const RackVST3ExtraInputBus& extra = extra_input_buses[i];
+        if (extra.bus_index <= 0 ||
+            static_cast<size_t>(extra.bus_index) >= plugin->input_bus_channel_counts.size()) {
+            return RACK_VST3_ERROR_INVALID_PARAM;
+        }
+        if (extra.channel_count !=
+            static_cast<uint32_t>(plugin->input_bus_channel_counts[static_cast<size_t>(extra.bus_index)])) {
+            return RACK_VST3_ERROR_INVALID_PARAM;
+        }
+        if (extra.channel_count > 0 && !extra.channels) {
+            return RACK_VST3_ERROR_INVALID_PARAM;
+        }
+        for (size_t j = 0; j < i; ++j) {
+            if (extra_input_buses[j].bus_index == extra.bus_index) {
+                return RACK_VST3_ERROR_INVALID_PARAM;
+            }
+        }
+    }
+
     // Update dynamic fields only (prepare() was called during initialization)
     plugin->process_data.numSamples = frames;
 
@@ -1088,6 +1121,21 @@ int rack_vst3_plugin_process_multi_bus(
         AudioBusBuffers& bus = plugin->process_data.outputs[extra.bus_index];
         for (uint32_t ch = 0; ch < extra.channel_count && ch < (uint32_t)bus.numChannels; ++ch) {
             bus.channelBuffers32[ch] = extra.channels[ch];
+        }
+    }
+
+    // Rebind each requested extra input bus's channel pointers -- mirrors
+    // bus 0's own input rebind above, generalized to an arbitrary bus index.
+    // `const_cast` here matches how bus 0's input is rebound above: VST3's
+    // `AudioBusBuffers::channelBuffers32` doesn't distinguish const for
+    // inputs at the struct level, even though these buffers are logically
+    // read-only from the host's perspective (`extra.channels` is
+    // `const float* const*`).
+    for (size_t i = 0; i < num_extra_input_buses; ++i) {
+        const RackVST3ExtraInputBus& extra = extra_input_buses[i];
+        AudioBusBuffers& bus = plugin->process_data.inputs[extra.bus_index];
+        for (uint32_t ch = 0; ch < extra.channel_count && ch < (uint32_t)bus.numChannels; ++ch) {
+            bus.channelBuffers32[ch] = const_cast<float*>(extra.channels[ch]);
         }
     }
 

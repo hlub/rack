@@ -65,6 +65,19 @@ pub struct RackVST3ExtraOutputBus {
     pub channel_count: u32,
 }
 
+/// Describes one additional (non-main) input bus to feed, passed to
+/// `rack_vst3_plugin_process_multi_bus`. Matches
+/// `RackVST3ExtraInputBus` in `rack_vst3.h` exactly. `channels` is
+/// `*const *const f32` (not `*const *mut f32` like the output side) because
+/// these buffers are read-only from the host's perspective, matching how
+/// the main bus-0 `inputs` parameter is typed elsewhere in this file.
+#[repr(C)]
+pub struct RackVST3ExtraInputBus {
+    pub bus_index: i32,
+    pub channels: *const *const f32,
+    pub channel_count: u32,
+}
+
 // Error codes
 pub const RACK_VST3_OK: c_int = 0;
 pub const RACK_VST3_ERROR_GENERIC: c_int = -1;
@@ -379,26 +392,30 @@ extern "C" {
 
     /// Process audio through the plugin, capturing the main output bus (bus
     /// 0, identical semantics to `rack_vst3_plugin_process`) plus zero or
-    /// more additional output buses in the same underlying VST3 `process()`
-    /// call.
+    /// more additional output buses, and feeding zero or more additional
+    /// input buses, in the same underlying VST3 `process()` call.
     ///
     /// A VST3 plugin computes every activated output bus in a single
     /// `process()` call regardless of how many the host actually captures;
     /// `rack_vst3_plugin_initialize` activates every bus the plugin
-    /// declares. This lets a caller bind real buffers to buses beyond bus 0
-    /// (e.g. a drum plugin's per-instrument buses) instead of leaving them
-    /// pointed at the internal silent dummy buffer, as
-    /// `rack_vst3_plugin_process` does.
+    /// declares. This lets a caller bind real buffers to output buses beyond
+    /// bus 0 (e.g. a drum plugin's per-instrument buses) instead of leaving
+    /// them pointed at the internal silent dummy buffer, as
+    /// `rack_vst3_plugin_process` does, and symmetrically bind real buffers
+    /// to input buses beyond bus 0 (e.g. an effect plugin's per-instrument
+    /// input buses) instead of leaving them unbound.
     ///
     /// # Returns
     ///
     /// - 0 on success
     /// - Negative error code on failure. `RACK_VST3_ERROR_INVALID_PARAM` if
-    ///   any requested extra bus's `bus_index` is out of range (including 0,
-    ///   which is handled by `outputs`/`num_output_channels` instead) or its
-    ///   `channel_count` doesn't exactly match that bus's declared channel
-    ///   count. Validation happens before any buffer pointers are rebound,
-    ///   so a failed call leaves the plugin's process state untouched.
+    ///   any requested extra output or extra input bus's `bus_index` is out
+    ///   of range (including 0, which is handled by
+    ///   `outputs`/`num_output_channels` or `inputs`/`num_input_channels`
+    ///   instead) or its `channel_count` doesn't exactly match that bus's
+    ///   declared channel count. Validation happens before any buffer
+    ///   pointers are rebound, so a failed call leaves the plugin's process
+    ///   state untouched.
     ///
     /// # Safety
     ///
@@ -409,9 +426,15 @@ extern "C" {
     /// - `extra_output_buses` must point to an array of
     ///   `num_extra_output_buses` valid `RackVST3ExtraOutputBus` entries, or
     ///   be NULL if `num_extra_output_buses` is 0
-    /// - Each entry's `channels` must point to an array of `channel_count`
-    ///   mutable f32 pointers, each pointing to a buffer with space for at
-    ///   least `frames` f32 values
+    /// - Each `extra_output_buses` entry's `channels` must point to an array
+    ///   of `channel_count` mutable f32 pointers, each pointing to a buffer
+    ///   with space for at least `frames` f32 values
+    /// - `extra_input_buses` must point to an array of
+    ///   `num_extra_input_buses` valid `RackVST3ExtraInputBus` entries, or
+    ///   be NULL if `num_extra_input_buses` is 0
+    /// - Each `extra_input_buses` entry's `channels` must point to an array
+    ///   of `channel_count` const f32 pointers, each pointing to a buffer
+    ///   with at least `frames` valid f32 values
     /// - Must not be called concurrently on the same plugin from multiple
     ///   threads
     pub fn rack_vst3_plugin_process_multi_bus(
@@ -423,6 +446,8 @@ extern "C" {
         frames: u32,
         extra_output_buses: *const RackVST3ExtraOutputBus,
         num_extra_output_buses: usize,
+        extra_input_buses: *const RackVST3ExtraInputBus,
+        num_extra_input_buses: usize,
     ) -> c_int;
 
     /// Get parameter count

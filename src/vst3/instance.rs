@@ -21,6 +21,22 @@ pub struct ExtraOutputBus<'a> {
     pub channels: &'a mut [&'a mut [f32]],
 }
 
+/// One additional (non-main) input bus to feed via
+/// [`Vst3Plugin::process_multi_bus`], and the caller-supplied buffers
+/// (planar: one shared slice per channel) to read its audio from.
+pub struct ExtraInputBus<'a> {
+    /// The bus index to feed. Must be >= 1 -- bus 0 is the main bus,
+    /// already handled by `process_multi_bus`'s own `inputs` parameter.
+    pub bus_index: u32,
+    /// One shared slice per channel. Length must exactly match the bus's
+    /// declared channel count (see
+    /// [`Vst3Plugin::input_bus_channel_count`]); each slice must have at
+    /// least `num_frames` samples. Shared (not mutable) references: these
+    /// are buffers Rust hands to the plugin to read, not buffers the plugin
+    /// writes into.
+    pub channels: &'a [&'a [f32]],
+}
+
 /// An instantiated VST3 plugin
 ///
 /// # Thread Safety
@@ -59,6 +75,16 @@ pub struct Vst3Plugin {
     // One descriptor per requested extra bus, reserved (during initialize)
     // to `output_bus_channel_counts.len() - 1` (every bus but bus 0).
     extra_bus_descs: Vec<ffi::RackVST3ExtraOutputBus>,
+    // Persistent scratch storage for process_multi_bus's zero-allocation hot
+    // path, mirroring `extra_bus_channel_ptrs` above but for extra *input*
+    // buses: flat, planar channel-pointer storage for every requested extra
+    // input bus's channels, reserved (during initialize) to the sum of every
+    // non-main input bus's channel count.
+    extra_input_bus_channel_ptrs: Vec<*const f32>,
+    // One descriptor per requested extra input bus, reserved (during
+    // initialize) to `input_bus_channel_counts.len() - 1` (every bus but
+    // bus 0), mirroring `extra_bus_descs` above.
+    extra_input_bus_descs: Vec<ffi::RackVST3ExtraInputBus>,
     // PhantomData<*const ()> makes this type !Sync while keeping it Send
     _not_sync: PhantomData<*const ()>,
 }
@@ -106,6 +132,8 @@ impl Vst3Plugin {
                 input_bus_channel_counts: Vec::new(),
                 extra_bus_channel_ptrs: Vec::new(),
                 extra_bus_descs: Vec::new(),
+                extra_input_bus_channel_ptrs: Vec::new(),
+                extra_input_bus_descs: Vec::new(),
                 _not_sync: PhantomData,
             })
         }
@@ -363,6 +391,12 @@ impl Vst3Plugin {
             self.extra_bus_channel_ptrs = Vec::with_capacity(extra_bus_capacity);
             self.extra_bus_descs = Vec::with_capacity(extra_bus_count);
 
+            let extra_input_bus_capacity: usize =
+                self.input_bus_channel_counts.iter().skip(1).sum();
+            let extra_input_bus_count = self.input_bus_channel_counts.len().saturating_sub(1);
+            self.extra_input_bus_channel_ptrs = Vec::with_capacity(extra_input_bus_capacity);
+            self.extra_input_bus_descs = Vec::with_capacity(extra_input_bus_count);
+
             Ok(())
         }
     }
@@ -498,33 +532,41 @@ impl Vst3Plugin {
 
     /// Process audio, capturing the main output bus (bus 0, identical
     /// semantics to [`PluginInstance::process`]) plus zero or more
-    /// additional output buses in the same underlying VST3 `process()`
-    /// call.
+    /// additional output buses, and feeding zero or more additional input
+    /// buses, in the same underlying VST3 `process()` call.
     ///
     /// A VST3 plugin computes every activated output bus in a single
     /// `process()` call regardless of how many the host actually captures;
     /// `initialize` activates every bus the plugin declares. This lets a
-    /// caller bind real buffers to buses beyond bus 0 (e.g. a drum plugin's
-    /// per-instrument buses) instead of leaving them pointed at the
-    /// internal silent dummy buffer, as [`PluginInstance::process`] does
-    /// for anything but bus 0.
+    /// caller bind real buffers to output buses beyond bus 0 (e.g. a drum
+    /// plugin's per-instrument buses) instead of leaving them pointed at
+    /// the internal silent dummy buffer, as [`PluginInstance::process`]
+    /// does for anything but bus 0, and symmetrically feed real buffers
+    /// into input buses beyond bus 0 (e.g. an effect plugin's
+    /// per-instrument input buses, such as feeding one plugin's captured
+    /// output bus into a second plugin's matching-named input bus) instead
+    /// of leaving them unbound.
     ///
-    /// `extra_outputs` may request buses in any order and any subset of the
-    /// plugin's declared buses (beyond bus 0); each entry's `channels`
-    /// length must exactly match that bus's declared channel count (see
-    /// [`output_bus_channel_count`](Self::output_bus_channel_count)).
+    /// `extra_outputs`/`extra_inputs` may each request buses in any order
+    /// and any subset of the plugin's declared buses (beyond bus 0); each
+    /// entry's `channels` length must exactly match that bus's declared
+    /// channel count (see
+    /// [`output_bus_channel_count`](Self::output_bus_channel_count) /
+    /// [`input_bus_channel_count`](Self::input_bus_channel_count)).
     ///
     /// # Errors
     ///
     /// Returns an error if the plugin is not initialized, if `inputs`/
     /// `outputs` channel counts or buffer lengths don't match the plugin's
-    /// main-bus configuration, or if any `extra_outputs` entry's `bus_index`
-    /// is out of range, its channel count doesn't match the bus's declared
-    /// channel count, or any of its channel buffers is shorter than
-    /// `num_frames`.
+    /// main-bus configuration, or if any `extra_outputs`/`extra_inputs`
+    /// entry's `bus_index` is out of range, its channel count doesn't match
+    /// the bus's declared channel count, its `bus_index` duplicates another
+    /// entry's in the same slice, or any of its channel buffers is shorter
+    /// than `num_frames`.
     pub fn process_multi_bus(
         &mut self,
         inputs: &[&[f32]],
+        extra_inputs: &[ExtraInputBus<'_>],
         outputs: &mut [&mut [f32]],
         extra_outputs: &mut [ExtraOutputBus<'_>],
         num_frames: usize,
@@ -564,13 +606,13 @@ impl Vst3Plugin {
             }
         }
 
-        // Validate every requested extra bus against the plugin's declared
-        // bus layout before touching any scratch storage. Bus indices must
-        // be unique: `extra_bus_channel_ptrs`'s capacity (reserved in
-        // `initialize_impl`) is the sum of every *distinct* non-main bus's
-        // channel count, a bound a duplicate request would silently exceed,
-        // forcing a reallocation mid-loop below and leaving an already
-        // FFI-bound pointer dangling.
+        // Validate every requested extra output bus against the plugin's
+        // declared bus layout before touching any scratch storage. Bus
+        // indices must be unique: `extra_bus_channel_ptrs`'s capacity
+        // (reserved in `initialize_impl`) is the sum of every *distinct*
+        // non-main bus's channel count, a bound a duplicate request would
+        // silently exceed, forcing a reallocation mid-loop below and
+        // leaving an already FFI-bound pointer dangling.
         for (position, extra) in extra_outputs.iter().enumerate() {
             let bus_index = extra.bus_index as usize;
             if bus_index == 0 {
@@ -607,6 +649,48 @@ impl Vst3Plugin {
             }
         }
 
+        // Validate every requested extra input bus, mirroring the extra
+        // output bus validation above (including the same duplicate-index
+        // rejection, for the same scratch-buffer-capacity safety reason:
+        // `extra_input_bus_channel_ptrs`'s capacity, reserved in
+        // `initialize_impl`, is the sum of every *distinct* non-main input
+        // bus's channel count).
+        for (position, extra) in extra_inputs.iter().enumerate() {
+            let bus_index = extra.bus_index as usize;
+            if bus_index == 0 {
+                return Err(Error::Other(
+                    "Bus 0 is the main bus; pass it via `inputs`, not `extra_inputs`".to_string(),
+                ));
+            }
+            if extra_inputs[..position]
+                .iter()
+                .any(|other| other.bus_index == extra.bus_index)
+            {
+                return Err(Error::Other(format!(
+                    "Input bus index {bus_index} requested more than once in extra_inputs"
+                )));
+            }
+            let expected_channels = self
+                .input_bus_channel_counts
+                .get(bus_index)
+                .copied()
+                .ok_or_else(|| Error::Other(format!("Input bus index {bus_index} out of range")))?;
+            if extra.channels.len() != expected_channels {
+                return Err(Error::Other(format!(
+                    "Input bus {bus_index} channel count mismatch: plugin declares {expected_channels}, got {}",
+                    extra.channels.len()
+                )));
+            }
+            for (channel_index, channel) in extra.channels.iter().enumerate() {
+                if channel.len() < num_frames {
+                    return Err(Error::Other(format!(
+                        "Input bus {bus_index} channel {channel_index} has {} samples, need at least {num_frames}",
+                        channel.len()
+                    )));
+                }
+            }
+        }
+
         // Reuse pre-allocated pointer arrays (zero-allocation hot path).
         for (index, input_ch) in inputs.iter().enumerate() {
             self.input_ptrs[index] = input_ch.as_ptr();
@@ -615,11 +699,11 @@ impl Vst3Plugin {
             self.output_ptrs[index] = output_ch.as_mut_ptr();
         }
 
-        // Flatten each extra bus's channel pointers into scratch storage
-        // reserved (in `initialize_impl`) to the sum of every non-main
-        // bus's channel count -- a safe upper bound for any subset of buses
-        // a single call might request, so these pushes never grow the
-        // allocation.
+        // Flatten each extra output bus's channel pointers into scratch
+        // storage reserved (in `initialize_impl`) to the sum of every
+        // non-main bus's channel count -- a safe upper bound for any subset
+        // of buses a single call might request, so these pushes never grow
+        // the allocation.
         self.extra_bus_channel_ptrs.clear();
         self.extra_bus_descs.clear();
         for extra in extra_outputs.iter_mut() {
@@ -629,6 +713,24 @@ impl Vst3Plugin {
             }
             let channels_ptr = self.extra_bus_channel_ptrs[start..].as_ptr();
             self.extra_bus_descs.push(ffi::RackVST3ExtraOutputBus {
+                bus_index: extra.bus_index as i32,
+                channels: channels_ptr,
+                channel_count: extra.channels.len() as u32,
+            });
+        }
+
+        // Flatten each extra input bus's channel pointers into scratch
+        // storage the same way, reserved (in `initialize_impl`) to the sum
+        // of every non-main input bus's channel count.
+        self.extra_input_bus_channel_ptrs.clear();
+        self.extra_input_bus_descs.clear();
+        for extra in extra_inputs.iter() {
+            let start = self.extra_input_bus_channel_ptrs.len();
+            for channel in extra.channels.iter() {
+                self.extra_input_bus_channel_ptrs.push(channel.as_ptr());
+            }
+            let channels_ptr = self.extra_input_bus_channel_ptrs[start..].as_ptr();
+            self.extra_input_bus_descs.push(ffi::RackVST3ExtraInputBus {
                 bus_index: extra.bus_index as i32,
                 channels: channels_ptr,
                 channel_count: extra.channels.len() as u32,
@@ -645,6 +747,8 @@ impl Vst3Plugin {
                 num_frames as u32,
                 self.extra_bus_descs.as_ptr(),
                 self.extra_bus_descs.len(),
+                self.extra_input_bus_descs.as_ptr(),
+                self.extra_input_bus_descs.len(),
             );
 
             if result != ffi::RACK_VST3_OK {
