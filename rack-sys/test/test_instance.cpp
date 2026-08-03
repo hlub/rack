@@ -5,6 +5,21 @@
 #include <cmath>
 #include <memory>
 
+// The VST3 output-MIDI decode helper (Part 2 of the emitted-MIDI work) is a
+// pure function in vst3_instance.cpp, unit-testable against a hand-built
+// synthetic VST3 Event with no real plugin. It only exists when this build
+// includes VST3 support; gate the test on the SDK header being reachable
+// (which coincides exactly with vst3_instance.cpp being compiled, so the
+// symbol is present), leaving the AudioUnit-only build untouched.
+#if defined(__has_include) && __has_include("pluginterfaces/vst/ivstevents.h")
+#define RACK_HAS_VST3_DECODE_TEST 1
+#include "rack_vst3.h"
+#include "pluginterfaces/vst/ivstevents.h"
+// Declared here (external linkage, defined in vst3_instance.cpp) so this test
+// can exercise the decode directly.
+bool vst3_event_to_rack_midi(const Steinberg::Vst::Event& event, RackVST3MidiEvent* out);
+#endif
+
 void test_invalid_unique_id() {
     std::cout << "Test 1: Invalid unique_id handling\n";
     std::cout << "-----------------------------------\n";
@@ -921,6 +936,80 @@ void test_preset_operations() {
     std::cout << "\n";
 }
 
+#ifdef RACK_HAS_VST3_DECODE_TEST
+// Unit test for vst3_event_to_rack_midi: hand-build synthetic VST3 output
+// Events and verify the decode into RackVST3MidiEvent, with no real plugin.
+void test_vst3_output_midi_decode() {
+    using Steinberg::Vst::Event;
+
+    std::cout << "Test 8: VST3 output-MIDI decode helper\n";
+    std::cout << "--------------------------------------\n";
+
+    // Note On: pitch 60, velocity 1.0 -> 127, channel 3, sampleOffset 64.
+    Event note_on;
+    std::memset(&note_on, 0, sizeof(Event));
+    note_on.type = Event::kNoteOnEvent;
+    note_on.sampleOffset = 64;
+    note_on.noteOn.channel = 3;
+    note_on.noteOn.pitch = 60;
+    note_on.noteOn.velocity = 1.0f;
+
+    RackVST3MidiEvent decoded;
+    std::memset(&decoded, 0, sizeof(decoded));
+    if (!vst3_event_to_rack_midi(note_on, &decoded)) {
+        std::cerr << "FAIL: note-on should decode\n";
+        return;
+    }
+    if (decoded.status != 0x90 || decoded.data1 != 60 || decoded.data2 != 127 ||
+        decoded.channel != 3 || decoded.sample_offset != 64u) {
+        std::cerr << "FAIL: note-on fields wrong: status=0x" << std::hex
+                  << (int)decoded.status << std::dec
+                  << " data1=" << (int)decoded.data1
+                  << " data2=" << (int)decoded.data2
+                  << " channel=" << (int)decoded.channel
+                  << " offset=" << decoded.sample_offset << "\n";
+        return;
+    }
+    std::cout << "PASS: note-on decoded (0x90, pitch 60, vel 127, ch 3, off 64)\n";
+
+    // Note Off: pitch 62, velocity 0.5 -> round(63.5) = 64, channel 5.
+    Event note_off;
+    std::memset(&note_off, 0, sizeof(Event));
+    note_off.type = Event::kNoteOffEvent;
+    note_off.sampleOffset = 0;
+    note_off.noteOff.channel = 5;
+    note_off.noteOff.pitch = 62;
+    note_off.noteOff.velocity = 0.5f;
+
+    std::memset(&decoded, 0, sizeof(decoded));
+    if (!vst3_event_to_rack_midi(note_off, &decoded)) {
+        std::cerr << "FAIL: note-off should decode\n";
+        return;
+    }
+    if (decoded.status != 0x80 || decoded.data1 != 62 || decoded.data2 != 64 ||
+        decoded.channel != 5) {
+        std::cerr << "FAIL: note-off fields wrong: status=0x" << std::hex
+                  << (int)decoded.status << std::dec
+                  << " data1=" << (int)decoded.data1
+                  << " data2=" << (int)decoded.data2
+                  << " channel=" << (int)decoded.channel << "\n";
+        return;
+    }
+    std::cout << "PASS: note-off decoded (0x80, pitch 62, vel 64, ch 5)\n";
+
+    // A non-MIDI VST3 event type (chord) has no MIDI 1.0 mapping and must be
+    // skipped (decode returns false).
+    Event chord;
+    std::memset(&chord, 0, sizeof(Event));
+    chord.type = Event::kChordEvent;
+    if (vst3_event_to_rack_midi(chord, &decoded)) {
+        std::cerr << "FAIL: chord event should not decode to MIDI\n";
+        return;
+    }
+    std::cout << "PASS: non-MIDI event skipped\n\n";
+}
+#endif
+
 int main() {
     std::cout << "AudioUnit Plugin Instance Test\n";
     std::cout << "===============================\n\n";
@@ -932,6 +1021,9 @@ int main() {
     test_parameter_operations();
     test_midi_operations();
     test_preset_operations();
+#ifdef RACK_HAS_VST3_DECODE_TEST
+    test_vst3_output_midi_decode();
+#endif
 
     std::cout << "All tests completed!\n";
     return 0;

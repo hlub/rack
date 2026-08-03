@@ -185,7 +185,7 @@ mod run {
             let bogus_channels: Vec<&[f32]> = vec![silent.as_slice(); 2];
             let extra_inputs = [ExtraInputBus { bus_index: 0, channels: &bogus_channels }];
             let mut extra_outputs: [ExtraOutputBus<'_>; 0] = [];
-            let result = plugin.process_multi_bus(&input_refs, &extra_inputs, &mut master_refs, &mut extra_outputs, frames);
+            let result = plugin.process_multi_bus(&input_refs, &extra_inputs, &mut master_refs, &mut extra_outputs, frames, None);
             println!("  [{}] bus_index=0 rejected", if result.is_err() { "PASS" } else { "FAIL" });
         }
 
@@ -195,7 +195,7 @@ mod run {
             let bogus_channels: Vec<&[f32]> = vec![silent.as_slice(); 2];
             let extra_inputs = [ExtraInputBus { bus_index: 99, channels: &bogus_channels }];
             let mut extra_outputs: [ExtraOutputBus<'_>; 0] = [];
-            let result = plugin.process_multi_bus(&input_refs, &extra_inputs, &mut master_refs, &mut extra_outputs, frames);
+            let result = plugin.process_multi_bus(&input_refs, &extra_inputs, &mut master_refs, &mut extra_outputs, frames, None);
             println!("  [{}] out-of-range bus_index=99 rejected", if result.is_err() { "PASS" } else { "FAIL" });
         }
 
@@ -205,7 +205,7 @@ mod run {
             let bogus_channels: Vec<&[f32]> = vec![silent.as_slice(); 1];
             let extra_inputs = [ExtraInputBus { bus_index: 1, channels: &bogus_channels }];
             let mut extra_outputs: [ExtraOutputBus<'_>; 0] = [];
-            let result = plugin.process_multi_bus(&input_refs, &extra_inputs, &mut master_refs, &mut extra_outputs, frames);
+            let result = plugin.process_multi_bus(&input_refs, &extra_inputs, &mut master_refs, &mut extra_outputs, frames, None);
             println!("  [{}] wrong channel_count (1 instead of 2) rejected", if result.is_err() { "PASS" } else { "FAIL" });
         }
 
@@ -219,7 +219,7 @@ mod run {
                 ExtraInputBus { bus_index: 1, channels: &channels_b },
             ];
             let mut extra_outputs: [ExtraOutputBus<'_>; 0] = [];
-            let result = plugin.process_multi_bus(&input_refs, &extra_inputs, &mut master_refs, &mut extra_outputs, frames);
+            let result = plugin.process_multi_bus(&input_refs, &extra_inputs, &mut master_refs, &mut extra_outputs, frames, None);
             println!("  [{}] duplicate bus_index=1 rejected", if result.is_err() { "PASS" } else { "FAIL" });
         }
 
@@ -231,7 +231,7 @@ mod run {
             let good_channels: Vec<&[f32]> = vec![silent.as_slice(); 2];
             let extra_inputs = [ExtraInputBus { bus_index: 1, channels: &good_channels }];
             let mut extra_outputs: [ExtraOutputBus<'_>; 0] = [];
-            let result = plugin.process_multi_bus(&input_refs, &extra_inputs, &mut master_refs, &mut extra_outputs, frames);
+            let result = plugin.process_multi_bus(&input_refs, &extra_inputs, &mut master_refs, &mut extra_outputs, frames, None);
             println!("  [{}] well-formed extra_inputs request accepted", if result.is_ok() { "PASS" } else { "FAIL" });
         }
         println!();
@@ -356,7 +356,7 @@ mod run {
                     let mut master_refs: Vec<&mut [f32]> = master_out.iter_mut().map(|c| c.as_mut_slice()).collect();
 
                     if plugin
-                        .process_multi_bus(&input_refs, &extra_inputs, &mut master_refs, &mut extra_outputs, BUFFER_FRAMES)
+                        .process_multi_bus(&input_refs, &extra_inputs, &mut master_refs, &mut extra_outputs, BUFFER_FRAMES, None)
                         .is_err()
                     {
                         data.fill(0.0);

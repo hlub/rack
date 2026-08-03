@@ -437,6 +437,14 @@ extern "C" {
     ///   with at least `frames` valid f32 values
     /// - Must not be called concurrently on the same plugin from multiple
     ///   threads
+    /// - `output_events_out` must either be NULL (with `output_events_capacity`
+    ///   0), or point to an array of at least `output_events_capacity`
+    ///   `RackVST3MidiEvent` slots. On return, the first
+    ///   `min(*num_output_events_out, output_events_capacity)` slots hold the
+    ///   plugin's emitted MIDI events.
+    /// - `num_output_events_out` must be NULL or point to a valid `usize`; it
+    ///   receives the true emitted-event count (which may exceed
+    ///   `output_events_capacity`, indicating truncation).
     pub fn rack_vst3_plugin_process_multi_bus(
         plugin: *mut RackVST3Plugin,
         inputs: *const *const f32,
@@ -448,7 +456,18 @@ extern "C" {
         num_extra_output_buses: usize,
         extra_input_buses: *const RackVST3ExtraInputBus,
         num_extra_input_buses: usize,
+        output_events_out: *mut RackVST3MidiEvent,
+        output_events_capacity: usize,
+        num_output_events_out: *mut usize,
     ) -> c_int;
+
+    /// Whether the plugin declares any event OUTPUT bus (i.e. can emit its own
+    /// MIDI, such as an arpeggiator or MIDI-FX plugin).
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    pub fn rack_vst3_plugin_emits_midi(plugin: *mut RackVST3Plugin) -> bool;
 
     /// Get parameter count
     ///

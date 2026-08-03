@@ -85,6 +85,11 @@ pub struct Vst3Plugin {
     // initialize) to `input_bus_channel_counts.len() - 1` (every bus but
     // bus 0), mirroring `extra_bus_descs` above.
     extra_input_bus_descs: Vec<ffi::RackVST3ExtraInputBus>,
+    // Persistent, pre-sized scratch buffer for capturing the plugin's own
+    // emitted MIDI output events in `process_multi_bus`'s zero-allocation hot
+    // path. Sized once (in `initialize_impl`) to `OUTPUT_MIDI_SCRATCH_CAPACITY`
+    // and never resized, so the FFI out-pointer always addresses valid slots.
+    output_midi_scratch: Vec<ffi::RackVST3MidiEvent>,
     // PhantomData<*const ()> makes this type !Sync while keeping it Send
     _not_sync: PhantomData<*const ()>,
 }
@@ -134,6 +139,7 @@ impl Vst3Plugin {
                 extra_bus_descs: Vec::new(),
                 extra_input_bus_channel_ptrs: Vec::new(),
                 extra_input_bus_descs: Vec::new(),
+                output_midi_scratch: Vec::new(),
                 _not_sync: PhantomData,
             })
         }
@@ -397,9 +403,33 @@ impl Vst3Plugin {
             self.extra_input_bus_channel_ptrs = Vec::with_capacity(extra_input_bus_capacity);
             self.extra_input_bus_descs = Vec::with_capacity(extra_input_bus_count);
 
+            // Pre-size the emitted-MIDI capture scratch to a generous fixed
+            // bound (grown once here, never resized), so `process_multi_bus`'s
+            // FFI out-pointer always addresses `OUTPUT_MIDI_SCRATCH_CAPACITY`
+            // valid slots without allocating in the hot path.
+            self.output_midi_scratch = vec![
+                ffi::RackVST3MidiEvent {
+                    sample_offset: 0,
+                    status: 0,
+                    data1: 0,
+                    data2: 0,
+                    channel: 0,
+                };
+                Self::OUTPUT_MIDI_SCRATCH_CAPACITY
+            ];
+
             Ok(())
         }
     }
+
+    /// Fixed upper bound on the number of emitted MIDI events captured from a
+    /// single `process_multi_bus` call. A block is at most a few thousand
+    /// samples, so a MIDI-FX plugin emitting hundreds of events in one block is
+    /// already far beyond realistic; 256 is generous and never reached in
+    /// practice, matching this crate's "generous fixed bound" precedent for its
+    /// other scratch buffers. A plugin that somehow emits more has its capture
+    /// truncated to this many, with the true count still reported.
+    const OUTPUT_MIDI_SCRATCH_CAPACITY: usize = 256;
 
     // VST3 ParameterInfo::ParameterFlags bit values, from the Steinberg SDK
     // (pluginterfaces/vst/ivsteditcontroller.h). rack does not depend on the
@@ -554,6 +584,18 @@ impl Vst3Plugin {
     /// [`output_bus_channel_count`](Self::output_bus_channel_count) /
     /// [`input_bus_channel_count`](Self::input_bus_channel_count)).
     ///
+    /// `output_midi`, when `Some`, is cleared and then filled with the MIDI
+    /// events the plugin itself emitted during this call (e.g. an
+    /// arpeggiator's or MIDI-FX plugin's output). Pass `None` to skip
+    /// emitted-MIDI capture entirely, which is exactly the behavior every
+    /// audio-only caller wants and is byte-for-byte identical to before this
+    /// capability existed. Capture is zero-allocation in the steady state:
+    /// once `output_midi`'s `Vec` and the plugin's internal scratch buffer
+    /// have each grown once, neither reallocates. At most
+    /// [`OUTPUT_MIDI_SCRATCH_CAPACITY`](Self::OUTPUT_MIDI_SCRATCH_CAPACITY)
+    /// events are captured; a plugin emitting more has its output truncated to
+    /// that many.
+    ///
     /// # Errors
     ///
     /// Returns an error if the plugin is not initialized, if `inputs`/
@@ -570,6 +612,7 @@ impl Vst3Plugin {
         outputs: &mut [&mut [f32]],
         extra_outputs: &mut [ExtraOutputBus<'_>],
         num_frames: usize,
+        output_midi: Option<&mut Vec<MidiEvent>>,
     ) -> Result<()> {
         if !self.is_initialized() {
             return Err(Error::NotInitialized);
@@ -737,6 +780,25 @@ impl Vst3Plugin {
             });
         }
 
+        // Bind the emitted-MIDI capture out-parameters. When the caller wants
+        // capture, point the FFI at the pre-sized scratch buffer (a raw
+        // pointer, so this borrow ends immediately and doesn't conflict with
+        // the other field borrows in the call below); otherwise pass NULL/0 to
+        // preserve the exact audio-only behavior every existing caller relies
+        // on.
+        let capture = output_midi.is_some();
+        let (out_events_ptr, out_events_cap) = if capture {
+            (self.output_midi_scratch.as_mut_ptr(), self.output_midi_scratch.len())
+        } else {
+            (std::ptr::null_mut(), 0usize)
+        };
+        let mut num_output_events: usize = 0;
+        let num_events_ptr = if capture {
+            &mut num_output_events as *mut usize
+        } else {
+            std::ptr::null_mut()
+        };
+
         unsafe {
             let result = ffi::rack_vst3_plugin_process_multi_bus(
                 self.inner.as_ptr(),
@@ -749,15 +811,66 @@ impl Vst3Plugin {
                 self.extra_bus_descs.len(),
                 self.extra_input_bus_descs.as_ptr(),
                 self.extra_input_bus_descs.len(),
+                out_events_ptr,
+                out_events_cap,
+                num_events_ptr,
             );
 
             if result != ffi::RACK_VST3_OK {
                 return Err(map_error(result));
             }
-
-            Ok(())
         }
+
+        // Decode the captured raw events into rack's own `MidiEvent` type. The
+        // C side already truncated to the scratch capacity, so `count` can't
+        // exceed it; `num_output_events` may still report a larger true total,
+        // which we deliberately ignore beyond the captured prefix.
+        if let Some(buffer) = output_midi {
+            buffer.clear();
+            let count = num_output_events.min(self.output_midi_scratch.len());
+            for raw in &self.output_midi_scratch[..count] {
+                if let Some(event) = rack_midi_to_midi_event(raw) {
+                    buffer.push(event);
+                }
+            }
+        }
+
+        Ok(())
     }
+
+    /// Whether the plugin declares any event OUTPUT bus, i.e. whether it can
+    /// emit its own MIDI (an arpeggiator or MIDI-FX plugin). When true,
+    /// [`process_multi_bus`](Self::process_multi_bus) with `Some(buffer)`
+    /// will capture those emitted events.
+    #[must_use]
+    pub fn emits_midi(&self) -> bool {
+        unsafe { ffi::rack_vst3_plugin_emits_midi(self.inner.as_ptr()) }
+    }
+}
+
+/// Decode a captured raw `RackVST3MidiEvent` (the C layer's decode of a VST3
+/// output `Event`) into rack's own [`MidiEvent`], the inverse of the encode in
+/// [`Vst3Plugin::send_midi`]. Returns `None` for a status byte with no
+/// `MidiEventKind` mapping. Pure and plugin-independent, so it is unit-tested
+/// directly against synthetic `RackVST3MidiEvent`s.
+fn rack_midi_to_midi_event(raw: &ffi::RackVST3MidiEvent) -> Option<MidiEvent> {
+    let channel = raw.channel;
+    let kind = match raw.status & 0xF0 {
+        0x90 => MidiEventKind::NoteOn { note: raw.data1, velocity: raw.data2, channel },
+        0x80 => MidiEventKind::NoteOff { note: raw.data1, velocity: raw.data2, channel },
+        0xA0 => MidiEventKind::PolyphonicAftertouch { note: raw.data1, pressure: raw.data2, channel },
+        0xB0 => MidiEventKind::ControlChange { controller: raw.data1, value: raw.data2, channel },
+        0xC0 => MidiEventKind::ProgramChange { program: raw.data1, channel },
+        0xD0 => MidiEventKind::ChannelAftertouch { pressure: raw.data1, channel },
+        0xE0 => {
+            // Reassemble the 14-bit pitch-bend value from LSB (data1) and MSB
+            // (data2), mirroring `send_midi`'s split encode exactly.
+            let value = ((raw.data1 as u16) & 0x7F) | (((raw.data2 as u16) & 0x7F) << 7);
+            MidiEventKind::PitchBend { value, channel }
+        }
+        _ => return None,
+    };
+    Some(MidiEvent { sample_offset: raw.sample_offset, kind })
 }
 
 impl Drop for Vst3Plugin {
@@ -1382,5 +1495,68 @@ mod tests {
         if let Some(category) = &preset.category {
             assert!(!category.is_empty(), "category, if present, must not be an empty string");
         }
+    }
+
+    fn raw_event(sample_offset: u32, status: u8, data1: u8, data2: u8, channel: u8)
+        -> ffi::RackVST3MidiEvent
+    {
+        ffi::RackVST3MidiEvent { sample_offset, status, data1, data2, channel }
+    }
+
+    #[test]
+    fn decode_note_on() {
+        let raw = raw_event(64, 0x90, 60, 100, 3);
+        let event = rack_midi_to_midi_event(&raw).expect("note-on should decode");
+        assert_eq!(event.sample_offset, 64);
+        assert_eq!(
+            event.kind,
+            MidiEventKind::NoteOn { note: 60, velocity: 100, channel: 3 }
+        );
+    }
+
+    #[test]
+    fn decode_note_off() {
+        let raw = raw_event(0, 0x80, 62, 40, 5);
+        let event = rack_midi_to_midi_event(&raw).expect("note-off should decode");
+        assert_eq!(
+            event.kind,
+            MidiEventKind::NoteOff { note: 62, velocity: 40, channel: 5 }
+        );
+    }
+
+    #[test]
+    fn decode_control_change() {
+        let raw = raw_event(0, 0xB0, 1, 64, 0);
+        let event = rack_midi_to_midi_event(&raw).expect("cc should decode");
+        assert_eq!(
+            event.kind,
+            MidiEventKind::ControlChange { controller: 1, value: 64, channel: 0 }
+        );
+    }
+
+    #[test]
+    fn decode_pitch_bend_reassembles_14_bit() {
+        // 8192 (center) splits into LSB 0x00, MSB 0x40 in send_midi's encode.
+        let raw = raw_event(0, 0xE0, 0x00, 0x40, 2);
+        let event = rack_midi_to_midi_event(&raw).expect("pitch bend should decode");
+        assert_eq!(event.kind, MidiEventKind::PitchBend { value: 8192, channel: 2 });
+    }
+
+    #[test]
+    fn decode_program_and_channel_aftertouch() {
+        assert_eq!(
+            rack_midi_to_midi_event(&raw_event(0, 0xC0, 7, 0, 1)).unwrap().kind,
+            MidiEventKind::ProgramChange { program: 7, channel: 1 }
+        );
+        assert_eq!(
+            rack_midi_to_midi_event(&raw_event(0, 0xD0, 90, 0, 4)).unwrap().kind,
+            MidiEventKind::ChannelAftertouch { pressure: 90, channel: 4 }
+        );
+    }
+
+    #[test]
+    fn decode_unknown_status_returns_none() {
+        // 0xF0 (system) has no channel-voice MidiEventKind mapping here.
+        assert!(rack_midi_to_midi_event(&raw_event(0, 0xF0, 0, 0, 0)).is_none());
     }
 }

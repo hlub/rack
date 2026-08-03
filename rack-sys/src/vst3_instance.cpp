@@ -17,6 +17,7 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <cmath>
 #include <mutex>
 #include <algorithm>
 
@@ -673,6 +674,17 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
         plugin->component->activateBus(kEvent, kInput, i, true);
     }
 
+    // Activate every MIDI/event OUTPUT bus so a plugin that emits its own MIDI
+    // (e.g. an arpeggiator or MIDI-FX plugin) actually populates
+    // process_data.outputEvents during process(). Without this, a declared
+    // event-out bus stays inactive and never produces events, so
+    // rack_vst3_plugin_process_multi_bus's output-MIDI capture would always be
+    // empty. Symmetric to the event-input-bus activation just above.
+    int32 numEventOutputBuses = plugin->component->getBusCount(kEvent, kOutput);
+    for (int32 i = 0; i < numEventOutputBuses; ++i) {
+        plugin->component->activateBus(kEvent, kOutput, i, true);
+    }
+
     // Activate component
     if (plugin->component->setActive(true) != kResultOk) {
         return RACK_VST3_ERROR_GENERIC;
@@ -865,6 +877,13 @@ int rack_vst3_plugin_get_input_bus_count(RackVST3Plugin* plugin) {
     return plugin->component->getBusCount(kAudio, kInput);
 }
 
+bool rack_vst3_plugin_emits_midi(RackVST3Plugin* plugin) {
+    if (!plugin || !plugin->component) {
+        return false;
+    }
+    return plugin->component->getBusCount(kEvent, kOutput) > 0;
+}
+
 // Shared implementation for rack_vst3_plugin_get_{output,input}_bus_info:
 // looks up BusInfo for `bus_index` on the given direction and copies its
 // channel count / UTF-8 name out to the caller-supplied buffers. Read-only:
@@ -1001,6 +1020,100 @@ int rack_vst3_plugin_process(
     return (result == kResultOk) ? RACK_VST3_OK : RACK_VST3_ERROR_GENERIC;
 }
 
+// Scale a VST3 normalized [0.0, 1.0] value to a MIDI 1.0 data byte [0, 127],
+// the exact inverse of send_midi's `data2 / 127.0f` encode. Rounds to nearest
+// and clamps, so a normalized 1.0 velocity maps back to 127.
+static uint8_t normalized_to_midi_data(float normalized) {
+    float scaled = std::round(normalized * 127.0f);
+    if (scaled < 0.0f) {
+        scaled = 0.0f;
+    } else if (scaled > 127.0f) {
+        scaled = 127.0f;
+    }
+    return static_cast<uint8_t>(scaled);
+}
+
+// Decode a single VST3 output Event into a RackVST3MidiEvent, the exact
+// inverse of the encode in rack_vst3_plugin_send_midi. Pure: it reads only the
+// given event and touches no plugin state, so it can be unit-tested against a
+// hand-built synthetic Event without a real loaded plugin. Returns true and
+// fills `out` for a MIDI-representable event; returns false (leaving `out`
+// otherwise untouched) for VST3 event types with no MIDI 1.0 equivalent (e.g.
+// note-expression, chord, or scale events), which the caller should skip.
+//
+// Deliberately NOT static: rack-sys's C++ unit test links against this symbol
+// directly to exercise the decode without a loaded plugin.
+bool vst3_event_to_rack_midi(const Event& event, RackVST3MidiEvent* out) {
+    if (!out) {
+        return false;
+    }
+
+    // sampleOffset is a non-negative frame offset; clamp any stray negative.
+    out->sample_offset =
+        event.sampleOffset > 0 ? static_cast<uint32_t>(event.sampleOffset) : 0u;
+
+    switch (event.type) {
+        case Event::kNoteOnEvent:
+            out->status = 0x90;
+            out->channel = static_cast<uint8_t>(event.noteOn.channel);
+            out->data1 = static_cast<uint8_t>(event.noteOn.pitch);
+            out->data2 = normalized_to_midi_data(event.noteOn.velocity);
+            return true;
+
+        case Event::kNoteOffEvent:
+            out->status = 0x80;
+            out->channel = static_cast<uint8_t>(event.noteOff.channel);
+            out->data1 = static_cast<uint8_t>(event.noteOff.pitch);
+            out->data2 = normalized_to_midi_data(event.noteOff.velocity);
+            return true;
+
+        case Event::kPolyPressureEvent:
+            out->status = 0xA0;
+            out->channel = static_cast<uint8_t>(event.polyPressure.channel);
+            out->data1 = static_cast<uint8_t>(event.polyPressure.pitch);
+            out->data2 = normalized_to_midi_data(event.polyPressure.pressure);
+            return true;
+
+        case Event::kLegacyMIDICCOutEvent: {
+            // Inverse of send_midi's controlNumber convention: control numbers
+            // below 0x80 are real CC; 0x80/0x81/0x82 encode Program Change /
+            // Channel Pressure / Pitch Bend respectively.
+            const LegacyMIDICCOutEvent& cc = event.midiCCOut;
+            out->channel = static_cast<uint8_t>(cc.channel);
+            const uint8_t value = static_cast<uint8_t>(cc.value);
+            const uint8_t value2 = static_cast<uint8_t>(cc.value2);
+            if (cc.controlNumber < 0x80) {
+                out->status = 0xB0;               // Control Change
+                out->data1 = cc.controlNumber;
+                out->data2 = value;
+                return true;
+            }
+            switch (cc.controlNumber) {
+                case 0x80:                        // Program Change
+                    out->status = 0xC0;
+                    out->data1 = value;
+                    out->data2 = 0;
+                    return true;
+                case 0x81:                        // Channel Pressure
+                    out->status = 0xD0;
+                    out->data1 = value;
+                    out->data2 = 0;
+                    return true;
+                case 0x82:                        // Pitch Bend (LSB, MSB)
+                    out->status = 0xE0;
+                    out->data1 = value;           // LSB
+                    out->data2 = value2;          // MSB
+                    return true;
+                default:
+                    return false;                 // unknown non-CC encoding
+            }
+        }
+
+        default:
+            return false;                         // no MIDI 1.0 equivalent
+    }
+}
+
 int rack_vst3_plugin_process_multi_bus(
     RackVST3Plugin* plugin,
     const float* const* inputs,
@@ -1011,7 +1124,10 @@ int rack_vst3_plugin_process_multi_bus(
     const RackVST3ExtraOutputBus* extra_output_buses,
     size_t num_extra_output_buses,
     const RackVST3ExtraInputBus* extra_input_buses,
-    size_t num_extra_input_buses)
+    size_t num_extra_input_buses,
+    RackVST3MidiEvent* output_events_out,
+    size_t output_events_capacity,
+    size_t* num_output_events_out)
 {
     if (!plugin || !plugin->initialized || !plugin->processor) {
         return RACK_VST3_ERROR_NOT_INITIALIZED;
@@ -1149,6 +1265,34 @@ int rack_vst3_plugin_process_multi_bus(
     // once, so this one call produces bus 0's audio plus every extra bus
     // rebound above.
     tresult result = plugin->processor->process(plugin->process_data);
+
+    // Capture the plugin's own emitted MIDI output events (e.g. from an
+    // arpeggiator) BEFORE they are cleared below. Skipped entirely when the
+    // caller passes NULL for output_events_out, so audio-only callers see
+    // byte-for-byte identical behavior. `produced` counts every decodable
+    // event (the true total), even past output_events_capacity, so the caller
+    // can detect truncation; only the first output_events_capacity are written.
+    size_t produced = 0;
+    if (output_events_out) {
+        int32 event_count = plugin->output_events.getEventCount();
+        for (int32 i = 0; i < event_count; ++i) {
+            Event vst3_event;
+            if (plugin->output_events.getEvent(i, vst3_event) != kResultOk) {
+                continue;
+            }
+            RackVST3MidiEvent decoded;
+            if (!vst3_event_to_rack_midi(vst3_event, &decoded)) {
+                continue;
+            }
+            if (produced < output_events_capacity) {
+                output_events_out[produced] = decoded;
+            }
+            ++produced;
+        }
+    }
+    if (num_output_events_out) {
+        *num_output_events_out = produced;
+    }
 
     // Clear input/output events and parameter changes for next call
     plugin->input_events.clear();

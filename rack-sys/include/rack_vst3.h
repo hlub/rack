@@ -7,6 +7,7 @@ extern "C" {
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 // Opaque types
 typedef struct RackVST3Scanner RackVST3Scanner;
@@ -215,6 +216,11 @@ typedef struct {
     uint32_t channel_count;
 } RackVST3ExtraInputBus;
 
+// Forward declaration of the MIDI event struct (defined in full in the MIDI
+// API section below). Declared here so rack_vst3_plugin_process_multi_bus can
+// capture the plugin's own emitted MIDI output events into a caller buffer.
+typedef struct RackVST3MidiEvent RackVST3MidiEvent;
+
 // Process audio, capturing the main output bus (bus 0, same semantics as
 // `rack_vst3_plugin_process`) plus zero or more additional output buses in
 // the same underlying VST3 `process()` call.
@@ -252,6 +258,24 @@ typedef struct {
 // for `extra_output_buses`). Duplicate `bus_index` values across the array
 // are also rejected. Pass NULL / 0 to feed no extra input buses.
 //
+// output_events_out: caller-owned buffer that receives the MIDI events the
+// plugin itself emits during this process() call (e.g. from an arpeggiator or
+// MIDI-FX plugin), decoded into `RackVST3MidiEvent`s. Pass NULL (together with
+// output_events_capacity == 0) to skip output-MIDI capture entirely -- this is
+// byte-for-byte identical to the audio-only behavior for callers that don't
+// want emitted MIDI. Only event buses activated by
+// rack_vst3_plugin_initialize (which now activates event output buses) can
+// populate this.
+//
+// output_events_capacity: number of `RackVST3MidiEvent` slots in
+// output_events_out. At most this many events are written; if the plugin
+// emitted more, the buffer is truncated but *num_output_events_out still
+// reports the true total.
+//
+// num_output_events_out: written with the true count of emitted MIDI events
+// (which may exceed output_events_capacity, indicating truncation), or NULL to
+// skip receiving the count. Written 0 when no capture is requested.
+//
 // Returns 0 on success, negative error code on failure.
 //
 // # Thread-safety
@@ -268,8 +292,17 @@ int rack_vst3_plugin_process_multi_bus(
     const RackVST3ExtraOutputBus* extra_output_buses,
     size_t num_extra_output_buses,
     const RackVST3ExtraInputBus* extra_input_buses,
-    size_t num_extra_input_buses
+    size_t num_extra_input_buses,
+    RackVST3MidiEvent* output_events_out,
+    size_t output_events_capacity,
+    size_t* num_output_events_out
 );
+
+// Returns whether the plugin declares any event OUTPUT bus (i.e. whether it
+// can emit its own MIDI, such as an arpeggiator or MIDI-FX plugin). Mirrors
+// rack_vst3_plugin_get_output_bus_count's style. Returns false if `plugin` or
+// its component is NULL, or if it declares no event output bus.
+bool rack_vst3_plugin_emits_midi(RackVST3Plugin* plugin);
 
 // Get parameter count
 // Thread-safety: Read-only after initialization. Safe to call from any thread.
@@ -451,8 +484,9 @@ typedef enum {
     RACK_VST3_MIDI_PITCH_BEND = 0xE0,
 } RackVST3MidiEventType;
 
-// MIDI event struct
-typedef struct {
+// MIDI event struct (forward-declared above for
+// rack_vst3_plugin_process_multi_bus's output-capture parameters).
+typedef struct RackVST3MidiEvent {
     uint32_t sample_offset;  // Sample offset within buffer
     uint8_t status;          // MIDI status byte
     uint8_t data1;           // First data byte (note/CC number)
