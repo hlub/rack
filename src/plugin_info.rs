@@ -20,6 +20,16 @@ pub struct PluginInfo {
 
     /// Unique identifier for the plugin
     pub unique_id: String,
+
+    /// The plugin class's own declared sub-category string, exactly as the
+    /// plugin factory reports it (VST3's `PClassInfo2::subCategories`, e.g.
+    /// `"Fx|Reverb"`, `"Instrument|Synth"`, or a bare `"Fx"`/`"Instrument"`).
+    /// `None` when the plugin declares no sub-category, or for a format that
+    /// has no equivalent concept (AudioUnit reports `None`). This is the raw
+    /// factory metadata a host uses to tell an effect that needs a live input
+    /// apart from a self-generating instrument; it is a distinct, coarser
+    /// concept from [`PresetInfo::category`] (a per-preset grouping).
+    pub category: Option<String>,
 }
 
 /// Type of audio plugin
@@ -64,6 +74,7 @@ impl PluginInfo {
             plugin_type,
             path,
             unique_id,
+            category: None,
         }
     }
 }

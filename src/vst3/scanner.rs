@@ -173,6 +173,10 @@ fn convert_plugin_info(c_info: &ffi::RackVST3PluginInfo) -> Result<PluginInfo> {
         let manufacturer = c_array_to_string(&c_info.manufacturer, "manufacturer")?;
         let path_str = c_array_to_string(&c_info.path, "path")?;
         let unique_id = c_array_to_string(&c_info.unique_id, "unique_id")?;
+        // The C++ scanner fills `category` from `PClassInfo2::subCategories`;
+        // an empty string means the plugin declared no sub-category, which
+        // maps to `None` (see `PluginInfo::category`).
+        let category_str = c_array_to_string(&c_info.category, "category")?;
 
         // Convert plugin type
         let plugin_type = match c_info.plugin_type {
@@ -183,14 +187,16 @@ fn convert_plugin_info(c_info: &ffi::RackVST3PluginInfo) -> Result<PluginInfo> {
             ffi::RackVST3PluginType::Other => PluginType::Other,
         };
 
-        Ok(PluginInfo::new(
+        let mut info = PluginInfo::new(
             name,
             manufacturer,
             c_info.version,
             plugin_type,
             PathBuf::from(path_str),
             unique_id,
-        ))
+        );
+        info.category = if category_str.is_empty() { None } else { Some(category_str) };
+        Ok(info)
     }
 }
 
