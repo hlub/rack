@@ -418,7 +418,9 @@ struct RackVST3Plugin {
     EventList input_events;
     EventList output_events;
 
-    // Process context (tells plugin it is playing at 120 BPM)
+    // Process context: tempo/playback state the plugin reads on every
+    // process() call. Built once in initialize(), then kept live by
+    // rack_vst3_plugin_set_transport (see that function's own doc comment).
     ProcessContext process_context;
     int64 sample_position = 0;
 
@@ -749,7 +751,11 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
         }
     }
 
-    // Set up process context so the plugin knows it is in playback at 120 BPM.
+    // Set up the process context once; tempo/kPlaying start at this
+    // placeholder 120 BPM/playing default and are kept live afterward by
+    // rack_vst3_plugin_set_transport, which writes directly into this same
+    // persistent struct (never rebuilt) on every real host tempo/transport
+    // change.
     memset(&plugin->process_context, 0, sizeof(ProcessContext));
     plugin->process_context.state =
         ProcessContext::kPlaying |
@@ -1384,6 +1390,30 @@ uint32_t rack_vst3_plugin_get_midi_pc_param_id(RackVST3Plugin* plugin, int chann
     ParamID pid = kNoParamId;
     midiMapping->getMidiControllerAssignment(0, channel, kCtrlProgramChange, pid);
     return pid;
+}
+
+// Writes directly into plugin->process_context (a plain member, pointed to
+// once by plugin->process_data.processContext during initialize -- see the
+// memset block there -- and never rebuilt), so this call is sufficient on
+// its own with no need to touch process_data again. Safe with no
+// locking/queuing only because the caller is required (see this function's
+// own declaration in rack_vst3.h) to call it from the same thread that
+// drives process(), immediately before it -- the same thread-confinement
+// argument that already makes plain, unsynchronized access to
+// process_context safe within process() itself.
+int rack_vst3_plugin_set_transport(RackVST3Plugin* plugin, double tempo, int32_t playing) {
+    if (!plugin || !plugin->initialized) {
+        return RACK_VST3_ERROR_NOT_INITIALIZED;
+    }
+
+    plugin->process_context.tempo = tempo;
+    if (playing) {
+        plugin->process_context.state |= ProcessContext::kPlaying;
+    } else {
+        plugin->process_context.state &= ~ProcessContext::kPlaying;
+    }
+
+    return RACK_VST3_OK;
 }
 
 int rack_vst3_plugin_parameter_info(

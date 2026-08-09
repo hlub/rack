@@ -323,6 +323,18 @@ int rack_vst3_plugin_set_parameter(RackVST3Plugin* plugin, uint32_t index, float
 int rack_vst3_plugin_set_parameter_by_id(RackVST3Plugin* plugin, uint32_t param_id, float value);
 uint32_t rack_vst3_plugin_get_midi_pc_param_id(RackVST3Plugin* plugin, int channel);
 
+// Update the plugin's live process context: tempo (BPM) and playback state
+// (nonzero = playing, zero = stopped). Writes directly into the plugin's
+// persistent ProcessContext (built once during initialize and never
+// rebuilt), which the plugin reads on every subsequent process() call.
+// Thread-safety: unlike rack_vst3_plugin_set_parameter (queued for the
+// audio thread to apply), this writes the struct fields immediately with
+// no queuing or locking -- the caller MUST call this only from the same
+// thread that calls rack_vst3_plugin_process, immediately before it, never
+// concurrently with a process() call in flight.
+// Returns 0 on success, negative error code on failure.
+int rack_vst3_plugin_set_transport(RackVST3Plugin* plugin, double tempo, int32_t playing);
+
 // Get parameter info
 // name: output buffer for parameter name (allocated by caller)
 // name_size: size of name buffer

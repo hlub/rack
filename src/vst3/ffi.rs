@@ -528,6 +528,28 @@ extern "C" {
         channel: c_int,
     ) -> u32;
 
+    /// Update the plugin's live process context tempo/playback state.
+    ///
+    /// # Returns
+    ///
+    /// - 0 on success
+    /// - Negative error code on failure
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    /// - Unlike `rack_vst3_plugin_set_parameter`, this writes the plugin's
+    ///   process context directly with no queuing or locking -- the caller
+    ///   must call this only from the same thread that calls
+    ///   `rack_vst3_plugin_process`, immediately before it, never
+    ///   concurrently with a `process` call in flight.
+    /// - `playing` is nonzero for "transport playing", zero for "stopped".
+    pub fn rack_vst3_plugin_set_transport(
+        plugin: *mut RackVST3Plugin,
+        tempo: f64,
+        playing: i32,
+    ) -> c_int;
+
     /// Get parameter info (name, min, max, default, unit)
     ///
     /// # Returns

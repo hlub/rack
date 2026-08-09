@@ -170,6 +170,43 @@ impl Vst3Plugin {
         }
     }
 
+    /// Update the plugin's live process context tempo/playback state, so its
+    /// next `process()` call observes the host's real, current transport
+    /// instead of whatever it was initialized with.
+    ///
+    /// Unlike [`set_parameter`](PluginInstance::set_parameter) (queued for
+    /// the audio thread to apply on its own next `process()` call), this
+    /// writes directly into the plugin's persistent process context struct
+    /// with no queuing or locking on the C++ side -- callers MUST only call
+    /// this from the same thread that also calls `process()`, immediately
+    /// before it, never concurrently with a `process()` call in flight. The
+    /// one real caller (`backline::signal_graph_audio`'s per-block transport
+    /// publish step) already satisfies this by construction: it runs inside
+    /// the same audio-callback invocation that then calls `process()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the plugin has not been initialized.
+    pub fn set_transport(&mut self, tempo: f64, playing: bool) -> Result<()> {
+        if !self.is_initialized() {
+            return Err(Error::NotInitialized);
+        }
+
+        unsafe {
+            let result = ffi::rack_vst3_plugin_set_transport(
+                self.inner.as_ptr(),
+                tempo,
+                i32::from(playing),
+            );
+
+            if result != ffi::RACK_VST3_OK {
+                return Err(map_error(result));
+            }
+
+            Ok(())
+        }
+    }
+
     /// Number of audio input channels the plugin's main bus expects, as
     /// negotiated during `initialize`. 0 for pure instrument plugins with no
     /// audio input bus. Only meaningful after a successful `initialize` call.
