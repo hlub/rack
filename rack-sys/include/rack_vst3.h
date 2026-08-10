@@ -130,6 +130,16 @@ int rack_vst3_plugin_get_input_channels(RackVST3Plugin* plugin);
 // Thread-safety: Should be called after initialize()
 int rack_vst3_plugin_get_output_channels(RackVST3Plugin* plugin);
 
+// Get the plugin's own reported processing latency, in samples (the delay
+// its own processing introduces between input and output -- e.g. lookahead
+// limiters, linear-phase EQs, convolution). Returns 0 if not initialized,
+// if the plugin has no processor interface, or if the plugin genuinely
+// reports zero latency (the common case for most instruments/effects).
+// Thread-safety: Should be called after initialize(), from the UI/control
+// thread (mirrors the VST3 SDK's own "[UI-thread & Setup Done]" contract
+// for IAudioProcessor::getLatencySamples()).
+uint32_t rack_vst3_plugin_get_latency_samples(RackVST3Plugin* plugin);
+
 // Returns the number of audio output buses the plugin declares (>= 0), or a
 // negative RACK_VST3_ERROR_* code on failure. This is the bus COUNT, distinct
 // from rack_vst3_plugin_get_output_channels (which reports only bus 0's

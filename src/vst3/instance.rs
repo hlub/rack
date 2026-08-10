@@ -223,6 +223,21 @@ impl Vst3Plugin {
         self.output_channels
     }
 
+    /// The plugin's own reported processing latency, in samples: the delay
+    /// its own processing introduces between input and output (e.g.
+    /// lookahead limiters, linear-phase EQs, convolution). 0 if the plugin
+    /// has not been initialized or genuinely reports zero latency (the
+    /// common case for most instruments/effects). Only meaningful after a
+    /// successful `initialize` call.
+    #[must_use]
+    pub fn latency_samples(&self) -> u32 {
+        // The C function itself gates on the plugin's initialized state and
+        // returns 0 if it isn't, so no separate is_initialized() check is
+        // needed here (unlike set_transport, which must distinguish "not
+        // initialized" from a real result via an Err return).
+        unsafe { ffi::rack_vst3_plugin_get_latency_samples(self.inner.as_ptr()) }
+    }
+
     /// Number of audio output buses the plugin declares (cached from
     /// `initialize`). Distinct from [`output_channels`](Self::output_channels),
     /// which reports only bus 0's channel count. A plugin like Addictive

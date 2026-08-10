@@ -278,6 +278,25 @@ extern "C" {
     /// - Should be called after `rack_vst3_plugin_initialize`
     pub fn rack_vst3_plugin_get_output_channels(plugin: *mut RackVST3Plugin) -> c_int;
 
+    /// Get the plugin's own reported processing latency, in samples.
+    ///
+    /// The delay the plugin's own processing introduces between input and
+    /// output (e.g. lookahead limiters, linear-phase EQs, convolution).
+    ///
+    /// # Returns
+    ///
+    /// - The plugin's reported latency in samples
+    /// - 0 if not initialized, if the plugin has no processor interface, or
+    ///   if the plugin genuinely reports zero latency (the common case)
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    /// - Should be called after `rack_vst3_plugin_initialize`, from the
+    ///   UI/control thread (mirrors the VST3 SDK's own "[UI-thread & Setup
+    ///   Done]" contract for `IAudioProcessor::getLatencySamples`)
+    pub fn rack_vst3_plugin_get_latency_samples(plugin: *mut RackVST3Plugin) -> u32;
+
     /// Get the number of audio output buses the plugin declares
     ///
     /// Distinct from `rack_vst3_plugin_get_output_channels`, which reports

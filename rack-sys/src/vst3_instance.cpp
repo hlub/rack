@@ -869,6 +869,18 @@ int rack_vst3_plugin_get_output_channels(RackVST3Plugin* plugin) {
     return plugin->num_output_channels;
 }
 
+// getLatencySamples() is documented [UI-thread & Setup Done] by the VST3 SDK
+// (ivstaudioprocessor.h) -- valid any time after setupProcessing, which
+// initialize() already calls before setting plugin->initialized, so gating
+// on plugin->initialized alone (same as get_input_channels/get_output_channels
+// above) is sufficient; no separate "setup done" flag is needed.
+uint32_t rack_vst3_plugin_get_latency_samples(RackVST3Plugin* plugin) {
+    if (!plugin || !plugin->initialized || !plugin->processor) {
+        return 0;
+    }
+    return plugin->processor->getLatencySamples();
+}
+
 int rack_vst3_plugin_get_output_bus_count(RackVST3Plugin* plugin) {
     if (!plugin || !plugin->component) {
         return RACK_VST3_ERROR_INVALID_PARAM;
