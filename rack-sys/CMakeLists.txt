@@ -69,6 +69,10 @@ if(HAVE_VST3_SDK)
         ${VST3_SDK_PATH}/public.sdk/source/vst/hosting/eventlist.cpp
         ${VST3_SDK_PATH}/public.sdk/source/vst/hosting/connectionproxy.cpp
         ${VST3_SDK_PATH}/public.sdk/source/vst/hosting/pluginterfacesupport.cpp
+        # moduleinfo.json parsing -- lets the scanner list a bundle's classes
+        # without loading its binary (see vst3_scanner.cpp)
+        ${VST3_SDK_PATH}/public.sdk/source/vst/moduleinfo/moduleinfoparser.cpp
+        ${VST3_SDK_PATH}/public.sdk/source/common/readfile.cpp
     )
 
     # Platform-specific VST3 module loading

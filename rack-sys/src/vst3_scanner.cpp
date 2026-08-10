@@ -1,6 +1,8 @@
 #include "rack_vst3.h"
 #include "public.sdk/source/vst/hosting/module.h"
 #include "public.sdk/source/vst/hosting/plugprovider.h"
+#include "public.sdk/source/vst/moduleinfo/moduleinfoparser.h"
+#include "public.sdk/source/common/readfile.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivstcomponent.h"
 
@@ -162,6 +164,148 @@ static RackVST3PluginType determine_plugin_type(const std::string& subcategories
     return RACK_VST3_TYPE_OTHER;
 }
 
+// Helper: Parse a VST3 class version string (e.g. "1.0.0" or "1.2.3.4") into
+// a packed uint32_t: major(8) | minor(8) | patch(8) | build(8). Shared by
+// both metadata sources (moduleinfo.json and a full module load) so a class
+// reports the same version number regardless of which one produced it.
+static uint32_t parse_class_version(const std::string& version_str) {
+    uint32_t version = 0;
+    if (version_str.empty()) {
+        return version;
+    }
+
+    int major = 0, minor = 0, patch = 0, build = 0;
+    int parsed = sscanf(version_str.c_str(), "%d.%d.%d.%d", &major, &minor, &patch, &build);
+    if (parsed >= 1) {
+        // Clamp each component to valid byte range [0, 255]
+        // This prevents integer overflow and handles negative/oversized values
+        auto clamp_byte = [](int val) -> uint8_t {
+            return static_cast<uint8_t>(std::max(0, std::min(255, val)));
+        };
+
+        uint8_t major_byte = clamp_byte(major);
+        uint8_t minor_byte = clamp_byte(minor);
+        uint8_t patch_byte = clamp_byte(patch);
+        uint8_t build_byte = clamp_byte(build);
+
+        version = (static_cast<uint32_t>(major_byte) << 24) |
+                 (static_cast<uint32_t>(minor_byte) << 16) |
+                 (static_cast<uint32_t>(patch_byte) << 8) |
+                 static_cast<uint32_t>(build_byte);
+    }
+    return version;
+}
+
+// Helper: Fill a RackVST3PluginInfo's fixed-size fields from already-resolved
+// class metadata. Shared by the moduleinfo.json fast path and the full
+// Module::create() fallback below so their output is identical no matter
+// which one actually produced the metadata.
+static void fill_plugin_info(RackVST3PluginInfo& info,
+                              const std::string& module_path,
+                              const std::string& name,
+                              const std::string& vendor,
+                              const std::string& unique_id,
+                              const std::string& version_str,
+                              const std::string& subcategories) {
+    strncpy(info.name, name.c_str(), sizeof(info.name) - 1);
+    info.name[sizeof(info.name) - 1] = '\0';
+
+    strncpy(info.manufacturer, vendor.c_str(), sizeof(info.manufacturer) - 1);
+    info.manufacturer[sizeof(info.manufacturer) - 1] = '\0';
+
+    strncpy(info.path, module_path.c_str(), sizeof(info.path) - 1);
+    info.path[sizeof(info.path) - 1] = '\0';
+
+    strncpy(info.unique_id, unique_id.c_str(), sizeof(info.unique_id) - 1);
+    info.unique_id[sizeof(info.unique_id) - 1] = '\0';
+
+    info.version = parse_class_version(version_str);
+    info.plugin_type = determine_plugin_type(subcategories);
+
+    strncpy(info.category, subcategories.c_str(), sizeof(info.category) - 1);
+    info.category[sizeof(info.category) - 1] = '\0';
+}
+
+// Helper: join a ModuleInfo::ClassInfo's subCategories the same way
+// VST3::Hosting::ClassInfo::subCategoriesString() joins its own (with "|"),
+// so a class discovered via moduleinfo.json produces an identical category
+// string to the same class discovered via a full module load.
+static std::string join_subcategories(const std::vector<std::string>& subcategories) {
+    std::string result;
+    if (subcategories.empty()) {
+        return result;
+    }
+    result = subcategories[0];
+    for (size_t index = 1; index < subcategories.size(); ++index) {
+        result += "|" + subcategories[index];
+    }
+    return result;
+}
+
+// Helper: enumerate a VST3 bundle's audio-effect classes purely from its
+// moduleinfo.json, without loading the bundle's actual binary
+// (CFBundleLoadExecutableAndReturnError on macOS). Loading every discovered
+// bundle just to list it is what triggers macOS's "Class X is implemented in
+// both A and B" objc runtime warning when several bundles share vendor-SDK
+// class names -- common among JUCE-family plugins. moduleinfo.json (present
+// on most modern VST3 bundles) carries the same name/vendor/class-list data
+// without ever touching the binary.
+//
+// Returns true and fills `out_infos` with every audio-effect class found
+// only if the whole bundle's moduleinfo.json exists, parses, and decodes
+// cleanly. Returns false (leaving `out_infos` untouched) for a bundle
+// missing a moduleinfo.json, one that fails to parse, or one containing a
+// class this function can't fully decode (e.g. a malformed CID) -- in every
+// one of those cases the caller must fall back to the full Module::create()
+// load, so a plugin is never silently missed or reported with wrong data.
+static bool try_enumerate_from_module_info(const std::string& module_path,
+                                            std::vector<RackVST3PluginInfo>& out_infos) {
+    auto module_info_path = Hosting::Module::getModuleInfoPath(module_path);
+    if (!module_info_path) {
+        return false;
+    }
+
+    std::string json_data = readFile(*module_info_path);
+    if (json_data.empty()) {
+        return false;
+    }
+
+    // No error stream: a malformed moduleinfo.json is an expected, silent
+    // fallback case (stale or hand-edited files), not something to report --
+    // printing to stderr here would defeat the whole purpose of this path.
+    auto module_info = ModuleInfoLib::parseJson(json_data, nullptr);
+    if (!module_info) {
+        return false;
+    }
+
+    std::vector<RackVST3PluginInfo> decoded;
+    for (const auto& class_info : module_info->classes) {
+        if (class_info.category != kVstAudioEffectClass) {
+            continue;
+        }
+
+        auto uid = VST3::UID::fromString(class_info.cid);
+        if (!uid) {
+            // Can't identify this class correctly -- fall back to the full
+            // load for the whole bundle rather than drop just this class.
+            return false;
+        }
+
+        std::string vendor = class_info.vendor;
+        if (vendor.empty()) {
+            vendor = module_info->factoryInfo.vendor;
+        }
+
+        RackVST3PluginInfo info{};
+        fill_plugin_info(info, module_path, class_info.name, vendor, uid->toString(),
+                          class_info.version, join_subcategories(class_info.subCategories));
+        decoded.push_back(info);
+    }
+
+    out_infos = std::move(decoded);
+    return true;
+}
+
 // ============================================================================
 // Scanner Implementation
 // ============================================================================
@@ -236,6 +380,33 @@ int rack_vst3_scanner_scan(RackVST3Scanner* scanner, RackVST3PluginInfo* plugins
     std::lock_guard<std::mutex> lock(rack_vst3_module_load_mutex());
 
     for (const auto& module_path : module_paths) {
+        // Prefer moduleinfo.json: it lists a bundle's audio-effect classes
+        // without loading the bundle's binary at all. Only fall back to a
+        // full Module::create() load (below) when a bundle has no usable
+        // moduleinfo.json -- this is a plain listing scan, not a specific
+        // plugin being loaded for real use, so the lazy path is always
+        // preferred here when it's available.
+        std::vector<RackVST3PluginInfo> module_info_classes;
+        if (try_enumerate_from_module_info(module_path, module_info_classes)) {
+            for (const auto& info : module_info_classes) {
+                // If we're just counting, increment and continue
+                if (count_only) {
+                    count++;
+                    continue;
+                }
+
+                // If array is full, continue counting but don't fill
+                if (count >= max_plugins) {
+                    count++;
+                    continue;
+                }
+
+                plugins[count] = info;
+                count++;
+            }
+            continue;
+        }
+
         std::string error_description;
         auto module = Hosting::Module::create(module_path, error_description);
 
@@ -266,67 +437,14 @@ int rack_vst3_scanner_scan(RackVST3Scanner* scanner, RackVST3PluginInfo* plugins
                 continue;
             }
 
-            // Fill in plugin info
-            RackVST3PluginInfo& info = plugins[count];
-
-            // Name
-            std::string name = class_info.name();
-            strncpy(info.name, name.c_str(), sizeof(info.name) - 1);
-            info.name[sizeof(info.name) - 1] = '\0';
-
-            // Manufacturer
             std::string vendor = class_info.vendor();
             if (vendor.empty()) {
                 vendor = factory.info().vendor();
             }
-            strncpy(info.manufacturer, vendor.c_str(), sizeof(info.manufacturer) - 1);
-            info.manufacturer[sizeof(info.manufacturer) - 1] = '\0';
 
-            // Path (full path to the .vst3 bundle/folder)
-            strncpy(info.path, module_path.c_str(), sizeof(info.path) - 1);
-            info.path[sizeof(info.path) - 1] = '\0';
-
-            // Unique ID (UID as hex string)
-            std::string uid_str = uid_to_string(class_info.ID());
-            strncpy(info.unique_id, uid_str.c_str(), sizeof(info.unique_id) - 1);
-            info.unique_id[sizeof(info.unique_id) - 1] = '\0';
-
-            // Version - parse version string (e.g., "1.0.0" or "1.2.3.4") to uint32_t
-            // Format: major.minor.patch.build -> pack into uint32_t
-            std::string version_str = class_info.version();
-            uint32_t version = 0;
-            if (!version_str.empty()) {
-                int major = 0, minor = 0, patch = 0, build = 0;
-                // Try to parse up to 4 components
-                int parsed = sscanf(version_str.c_str(), "%d.%d.%d.%d", &major, &minor, &patch, &build);
-                if (parsed >= 1) {
-                    // Clamp each component to valid byte range [0, 255]
-                    // This prevents integer overflow and handles negative/oversized values
-                    auto clamp_byte = [](int val) -> uint8_t {
-                        return static_cast<uint8_t>(std::max(0, std::min(255, val)));
-                    };
-
-                    uint8_t major_byte = clamp_byte(major);
-                    uint8_t minor_byte = clamp_byte(minor);
-                    uint8_t patch_byte = clamp_byte(patch);
-                    uint8_t build_byte = clamp_byte(build);
-
-                    // Pack into uint32_t: major(8) | minor(8) | patch(8) | build(8)
-                    version = (static_cast<uint32_t>(major_byte) << 24) |
-                             (static_cast<uint32_t>(minor_byte) << 16) |
-                             (static_cast<uint32_t>(patch_byte) << 8) |
-                             static_cast<uint32_t>(build_byte);
-                }
-            }
-            info.version = version;
-
-            // Type (from subcategories)
-            std::string subcategories = class_info.subCategoriesString();
-            info.plugin_type = determine_plugin_type(subcategories);
-
-            // Category (subcategories string)
-            strncpy(info.category, subcategories.c_str(), sizeof(info.category) - 1);
-            info.category[sizeof(info.category) - 1] = '\0';
+            fill_plugin_info(plugins[count], module_path, class_info.name(), vendor,
+                              uid_to_string(class_info.ID()), class_info.version(),
+                              class_info.subCategoriesString());
 
             count++;
         }
