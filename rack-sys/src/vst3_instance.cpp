@@ -428,6 +428,15 @@ struct RackVST3Plugin {
     // dummy_buf: a silent buffer shared across all aux output buses that we
     // don't capture. The plugin may write to these; we ignore the contents.
     std::vector<float> dummy_buf;
+    // input_silence_buf: a zeroed buffer shared across all input buses no
+    // caller has fed real audio into for a given process call (every input
+    // bus beyond bus 0, plus bus 0 itself when the caller passes zero
+    // channels). Unlike dummy_buf, this is read BY the plugin, not written
+    // TO by it, so it must actually contain silence rather than arbitrary
+    // leftover data -- it is zeroed once here and never written to again,
+    // which holds only because a well-behaved plugin never writes into an
+    // input buffer (the VST3 spec reserves that for the host).
+    std::vector<float> input_silence_buf;
     std::vector<float*> input_ptrs;
     std::vector<float*> output_ptrs;
 
@@ -456,6 +465,44 @@ struct RackVST3Plugin {
     };
     std::vector<PresetInfo> presets;
 };
+
+// Rebinds every output bus's channel pointers back to the plugin's shared
+// dummy (silent, write-only) buffer, and every input bus's channel pointers
+// back to its shared silence (zeroed, read-only) buffer. Called at the start
+// of every process()/process_multi_bus() call, before that call's own
+// bus-0/extra-bus buffers are bound over it.
+//
+// This is the fix for two related bugs: (1) a bus a caller bound a real
+// buffer into on a previous call, then omits from a later call (or calls
+// rack_vst3_plugin_process, which only ever rebinds bus 0), would otherwise
+// keep pointing at that caller-owned buffer forever -- a VST3 plugin writes
+// every *activated* output bus on every process() call, so that stale
+// pointer is a use-after-free the moment the caller's backing storage goes
+// away. (2) every declared input bus is activated during initialize (so a
+// plugin sees it as connected), but only bus 0 (and, since this fix, every
+// bus reset here) is ever pointed at real memory -- without this, a bus
+// beyond 0 stays null and a plugin that unconditionally reads an activated
+// input bus null-derefs.
+//
+// O(total channel count across all buses) per call: a small, fixed,
+// allocation-free cost, matching this file's real-time-safety requirements.
+static void reset_bus_bindings(RackVST3Plugin* plugin) {
+    float* dummy_ptr = plugin->dummy_buf.data();
+    for (int32 b = 0; b < plugin->process_data.numOutputs; ++b) {
+        AudioBusBuffers& bus = plugin->process_data.outputs[b];
+        for (int32 ch = 0; ch < bus.numChannels; ++ch) {
+            bus.channelBuffers32[ch] = dummy_ptr;
+        }
+    }
+
+    float* silence_ptr = plugin->input_silence_buf.data();
+    for (int32 b = 0; b < plugin->process_data.numInputs; ++b) {
+        AudioBusBuffers& bus = plugin->process_data.inputs[b];
+        for (int32 ch = 0; ch < bus.numChannels; ++ch) {
+            bus.channelBuffers32[ch] = silence_ptr;
+        }
+    }
+}
 
 // ============================================================================
 // Plugin Instance Implementation
@@ -739,17 +786,19 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
     // pointers, the destructor would try to free our Rust memory).
     plugin->process_data.prepare(*plugin->component, 0, kSample32);
 
-    // Allocate a silent dummy buffer for aux output buses we don't capture.
+    // Allocate a silent dummy buffer for aux output buses we don't capture,
+    // and a zeroed silence buffer for input buses no caller feeds (see
+    // reset_bus_bindings for why these must be two distinct buffers rather
+    // than one shared between input and output).
     plugin->dummy_buf.assign(max_block_size, 0.0f);
-    float* dummy_ptr = plugin->dummy_buf.data();
+    plugin->input_silence_buf.assign(max_block_size, 0.0f);
 
-    // Point all output buses at the dummy buffer by default.
-    for (int32 b = 0; b < plugin->process_data.numOutputs; ++b) {
-        AudioBusBuffers& bus = plugin->process_data.outputs[b];
-        for (int32 ch = 0; ch < bus.numChannels; ++ch) {
-            bus.channelBuffers32[ch] = dummy_ptr;
-        }
-    }
+    // Point every output bus at the dummy buffer and every input bus at the
+    // silence buffer by default; rack_vst3_plugin_process[_multi_bus] repeat
+    // this same reset on every call so a bus a caller previously bound real
+    // audio into, then later omits, can never keep pointing at that stale
+    // memory (see reset_bus_bindings's own doc comment).
+    reset_bus_bindings(plugin);
 
     // Set up the process context once; tempo/kPlaying start at this
     // placeholder 120 BPM/playing default and are kept live afterward by
@@ -1002,6 +1051,14 @@ int rack_vst3_plugin_process(
     plugin->process_context.projectTimeSamples = plugin->sample_position;
     plugin->sample_position += frames;
 
+    // Reset every bus to its default (silent/dummy) binding before applying
+    // this call's own bus-0 buffers below. This function only ever rebinds
+    // bus 0, so without this reset any bus a previous
+    // rack_vst3_plugin_process_multi_bus call bound to a caller-owned buffer
+    // would keep pointing at it here -- see reset_bus_bindings's own doc
+    // comment.
+    reset_bus_bindings(plugin);
+
     // Set input buffers — write pointers INTO the prepare()-allocated float**
     // array rather than replacing the array pointer. This avoids freeing
     // Rust-owned memory in HostProcessData::destroyBuffers().
@@ -1227,6 +1284,14 @@ int rack_vst3_plugin_process_multi_bus(
     // Advance the timeline position so the plugin sees a moving clock.
     plugin->process_context.projectTimeSamples = plugin->sample_position;
     plugin->sample_position += frames;
+
+    // Reset every bus to its default (silent/dummy) binding before applying
+    // this call's own bus-0 and extra-bus buffers below, so any bus this
+    // particular call's request omits -- one a previous call bound a real
+    // buffer into, or an input bus no caller has ever fed -- ends up
+    // pointing at shared silent/dummy storage rather than a stale
+    // caller-owned pointer. See reset_bus_bindings's own doc comment.
+    reset_bus_bindings(plugin);
 
     // Set input buffers — write pointers INTO the prepare()-allocated float**
     // array rather than replacing the array pointer. This avoids freeing

@@ -1364,6 +1364,24 @@ mod tests {
         Ok((scanner, plugins[0].clone()))
     }
 
+    /// Finds an installed VST3 plugin whose name contains `needle`
+    /// (case-insensitive), for tests that need a specific plugin's bus
+    /// layout (e.g. a real multi-output-bus or sidechain-input-bus plugin)
+    /// rather than whatever the first scanned plugin happens to be. Returns
+    /// `None` (rather than an `Err`) so call sites can uniformly skip with a
+    /// message when the machine running the test doesn't have that plugin
+    /// installed, matching this module's existing tolerance for a
+    /// plugin-less test environment.
+    fn find_plugin_by_name(needle: &str) -> Option<(crate::vst3::Vst3Scanner, PluginInfo)> {
+        let scanner = crate::vst3::Vst3Scanner::new().ok()?;
+        let plugins = scanner.scan().ok()?;
+        let needle_lower = needle.to_lowercase();
+        let info = plugins
+            .into_iter()
+            .find(|plugin| plugin.name.to_lowercase().contains(&needle_lower))?;
+        Some((scanner, info))
+    }
+
     #[test]
     fn test_plugin_creation() {
         let (scanner, info) = match get_test_plugin() {
@@ -1610,5 +1628,148 @@ mod tests {
     fn decode_unknown_status_returns_none() {
         // 0xF0 (system) has no channel-voice MidiEventKind mapping here.
         assert!(rack_midi_to_midi_event(&raw_event(0, 0xF0, 0, 0, 0)).is_none());
+    }
+
+    // -- Regression tests for the stale-extra-output-bus-pointer /
+    // -- unfed-second-input-bus bug fixes below. These need a real
+    // -- installed VST3 plugin with a specific bus layout (a multi-output-
+    // -- bus instrument, or an effect with a genuine second input bus), so
+    // -- each looks up a specific plugin by name and skips (rather than
+    // -- failing) when the machine running the test doesn't have it
+    // -- installed -- the same tolerance every other test in this module
+    // -- already has for a plugin-less environment.
+
+    #[test]
+    fn process_multi_bus_resets_bus_no_longer_requested() {
+        // Addictive Drums 2 declares 14 output buses (bus 0 "Master" plus 13
+        // per-instrument buses) and 0 input buses -- a real fixture for the
+        // stale-extra-output-bus-pointer bug (rack_vst3_plugin_process_
+        // multi_bus used to leave a bus's process_data pointer bound to
+        // whatever buffer a previous call passed for it, forever, once that
+        // bus stopped being requested).
+        let Some((scanner, info)) = find_plugin_by_name("Addictive Drums 2") else {
+            println!("Skipping test - Addictive Drums 2 not installed");
+            return;
+        };
+
+        let mut plugin = scanner.load(&info).expect("AD2 should load");
+        plugin.initialize(48000.0, 512).expect("AD2 should initialize");
+
+        assert!(
+            plugin.output_bus_count() > 1,
+            "AD2 should declare more than one output bus"
+        );
+        let bus_index = 1u32; // "Kick" per AD2's documented bus layout
+        let extra_channels = plugin
+            .output_bus_channel_count(bus_index as usize)
+            .expect("AD2 bus 1 should exist");
+        assert_eq!(extra_channels, 1, "AD2's Kick bus is documented as mono");
+
+        let num_frames = 64usize;
+        let mut main_left = vec![0.0f32; num_frames];
+        let mut main_right = vec![0.0f32; num_frames];
+        let mut extra_buf = vec![777.0f32; num_frames];
+
+        // Call 1: bind bus 1 to extra_buf and process. AD2's process_data
+        // now points bus 1's channel(s) directly at extra_buf.
+        {
+            let mut extra_channel_slices: Vec<&mut [f32]> = vec![extra_buf.as_mut_slice()];
+            let mut extra_outputs = [ExtraOutputBus {
+                bus_index,
+                channels: &mut extra_channel_slices[..],
+            }];
+            let mut main_outputs: Vec<&mut [f32]> =
+                vec![main_left.as_mut_slice(), main_right.as_mut_slice()];
+            plugin
+                .process_multi_bus(
+                    &[],
+                    &[],
+                    &mut main_outputs[..],
+                    &mut extra_outputs[..],
+                    num_frames,
+                    None,
+                )
+                .expect("first process_multi_bus call (bus 1 requested) should succeed");
+        }
+
+        // Refill extra_buf with a sentinel AD2 would not otherwise produce,
+        // so any write to it during call 2 is unambiguous.
+        const SENTINEL: f32 = 555.0;
+        extra_buf.fill(SENTINEL);
+
+        // Call 2: omit bus 1 entirely. Before the fix, AD2's
+        // process_data.outputs[1] would still point at extra_buf from call
+        // 1 above, and AD2 -- like every VST3 plugin -- computes every
+        // activated output bus on every process() call regardless of
+        // whether the host captures it, so it would overwrite extra_buf
+        // here even though this call never mentions bus 1.
+        {
+            let mut main_outputs: Vec<&mut [f32]> =
+                vec![main_left.as_mut_slice(), main_right.as_mut_slice()];
+            plugin
+                .process_multi_bus(&[], &[], &mut main_outputs[..], &mut [], num_frames, None)
+                .expect("second process_multi_bus call (bus 1 omitted) should succeed");
+        }
+
+        assert!(
+            extra_buf.iter().all(|&sample| sample == SENTINEL),
+            "bus 1's buffer must not be written to once a later call stops \
+             requesting it -- got {extra_buf:?}, expected untouched sentinel {SENTINEL}"
+        );
+    }
+
+    #[test]
+    fn process_leaves_unfed_second_input_bus_silent_not_null() {
+        // TDR Nova and soothe2 both declare a real second (sidechain) input
+        // bus on macOS -- a fixture for the unfed-second-input-bus bug
+        // (every declared input bus is activated during initialize, but
+        // only bus 0 was ever pointed at real memory; a plugin that reads
+        // an activated bus unconditionally would null-deref on any other
+        // bus).
+        let Some((scanner, info)) =
+            find_plugin_by_name("TDR Nova").or_else(|| find_plugin_by_name("soothe2"))
+        else {
+            println!("Skipping test - no installed plugin with a second input bus found");
+            return;
+        };
+
+        let mut plugin = scanner.load(&info).expect("plugin should load");
+        plugin.initialize(48000.0, 512).expect("plugin should initialize");
+
+        assert!(
+            plugin.input_bus_channel_count(1).is_some(),
+            "test plugin must declare a second (sidechain) input bus"
+        );
+
+        let num_frames = 64usize;
+        let input_channels = plugin.input_channels();
+        let output_channels = plugin.output_channels();
+        let in_bufs: Vec<Vec<f32>> = (0..input_channels).map(|_| vec![0.0f32; num_frames]).collect();
+        let in_slices: Vec<&[f32]> = in_bufs.iter().map(|buffer| buffer.as_slice()).collect();
+        let mut out_bufs: Vec<Vec<f32>> =
+            (0..output_channels).map(|_| vec![0.0f32; num_frames]).collect();
+        let mut out_slices: Vec<&mut [f32]> =
+            out_bufs.iter_mut().map(|buffer| buffer.as_mut_slice()).collect();
+
+        // Bus 1 (the sidechain) is activated but this call, like every
+        // `process()` call, only ever feeds bus 0 -- exactly the condition
+        // that used to null-deref inside the plugin before this fix.
+        let result = plugin.process(&in_slices, &mut out_slices, num_frames);
+        assert!(
+            result.is_ok(),
+            "process() with an unfed second input bus should succeed, got {result:?}"
+        );
+
+        // Also exercise process_multi_bus's own reset (a separate code path
+        // that shares the same underlying reset_bus_bindings fix).
+        let in_slices: Vec<&[f32]> = in_bufs.iter().map(|buffer| buffer.as_slice()).collect();
+        let mut out_slices: Vec<&mut [f32]> =
+            out_bufs.iter_mut().map(|buffer| buffer.as_mut_slice()).collect();
+        let result =
+            plugin.process_multi_bus(&in_slices, &[], &mut out_slices, &mut [], num_frames, None);
+        assert!(
+            result.is_ok(),
+            "process_multi_bus with an unfed second input bus should succeed, got {result:?}"
+        );
     }
 }
