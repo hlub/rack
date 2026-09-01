@@ -512,6 +512,14 @@ static void reset_bus_bindings(RackVST3Plugin* plugin) {
     }
 }
 
+// Forward declarations: defined below under "State helpers", but also
+// needed by rack_vst3_plugin_free and rack_vst3_plugin_reset (defined
+// earlier in the file) so teardown and reset follow the exact same
+// setProcessing(false)-before-setActive(false) lifecycle order every other
+// suspend point in this file uses.
+static void suspend_for_state(RackVST3Plugin* plugin);
+static void resume_after_state(RackVST3Plugin* plugin, double post_activate_pump_seconds = 0.0);
+
 // ============================================================================
 // Plugin Instance Implementation
 // ============================================================================
@@ -626,10 +634,15 @@ void rack_vst3_plugin_free(RackVST3Plugin* plugin) {
 
     std::lock_guard<std::mutex> lock(rack_vst3_module_load_mutex());
 
-    // Deactivate if active
-    if (plugin->initialized && plugin->component) {
-        plugin->component->setActive(false);
-    }
+    // VST3 lifecycle order is setProcessing(false), then setActive(false),
+    // then terminate() -- initialize() leaves the plugin with
+    // setProcessing(true) already in effect, so teardown must undo that
+    // first. suspend_for_state does exactly this (and is a no-op if the
+    // plugin was never initialized), ignoring the plugin's return values the
+    // same way setActive's own return value is already ignored just below:
+    // a plugin refusing to stop processing must not block cleanup, since the
+    // plugin is being destroyed regardless.
+    suspend_for_state(plugin);
 
     // Disconnect connection points
     if (plugin->component_cp && plugin->controller_cp) {
@@ -902,10 +915,24 @@ int rack_vst3_plugin_reset(RackVST3Plugin* plugin) {
         return RACK_VST3_ERROR_NOT_INITIALIZED;
     }
 
-    // VST3 doesn't have a direct "reset" like AudioUnit
-    // We can deactivate and reactivate the component
-    plugin->component->setActive(false);
+    // VST3 doesn't have a direct "reset" like AudioUnit; deactivating and
+    // reactivating the component clears its internal buffers/delay lines.
+    // The teardown half must leave Processing state before deactivating --
+    // the same setProcessing(false)-before-setActive(false) order every
+    // other suspend point in this file uses (see suspend_for_state) -- and
+    // reset() must leave the plugin back in the same "ready to process"
+    // state initialize() itself leaves it in (Processing already
+    // restarted), since a caller may call process() immediately after a
+    // successful reset() and the VST3 spec does not define that call's
+    // behavior outside Processing state.
+    suspend_for_state(plugin);
+
     if (plugin->component->setActive(true) != kResultOk) {
+        return RACK_VST3_ERROR_GENERIC;
+    }
+
+    if (plugin->processor->setProcessing(true) != kResultOk) {
+        plugin->component->setActive(false);
         return RACK_VST3_ERROR_GENERIC;
     }
 
@@ -1879,7 +1906,7 @@ static void suspend_for_state(RackVST3Plugin* plugin) {
     plugin->component->setActive(false);
 }
 
-static void resume_after_state(RackVST3Plugin* plugin, double post_activate_pump_seconds = 0.0) {
+static void resume_after_state(RackVST3Plugin* plugin, double post_activate_pump_seconds) {
     if (!plugin->initialized) return;
     plugin->component->setActive(true);
     if (post_activate_pump_seconds > 0.0) {

@@ -1836,4 +1836,61 @@ mod tests {
             "300 events should overflow the documented 256-event capacity and be reported"
         );
     }
+
+    #[test]
+    fn reset_leaves_plugin_ready_to_process_again() {
+        // rack_vst3_plugin_reset used to leave the plugin deactivated then
+        // reactivated but never re-issued setProcessing(true), violating
+        // the VST3 lifecycle order this fix restores. A process() call
+        // immediately after reset() is exactly the sequence a real caller
+        // (e.g. drumr's own pattern-clear/panic-reset path) performs.
+        //
+        // Note: whether a given plugin's own process() implementation
+        // actually enforces "must be in Processing state" strongly enough
+        // to fail observably when it isn't is plugin-dependent; this test
+        // exercises the correct lifecycle call sequence and documents the
+        // expected contract, but a plugin that tolerates the old, spec-
+        // violating sequence would not turn this test red on its own.
+        let (scanner, info) = match get_test_plugin() {
+            Ok(result) => result,
+            Err(_) => {
+                println!("Skipping test - no VST3 plugins found");
+                return;
+            }
+        };
+
+        let mut plugin = scanner.load(&info).expect("Plugin creation should succeed");
+        plugin
+            .initialize(48000.0, 512)
+            .expect("Plugin initialization should succeed");
+
+        let num_frames = 64usize;
+        let input_channels = plugin.input_channels();
+        let output_channels = plugin.output_channels();
+        let in_bufs: Vec<Vec<f32>> = (0..input_channels).map(|_| vec![0.0f32; num_frames]).collect();
+        let mut out_bufs: Vec<Vec<f32>> =
+            (0..output_channels).map(|_| vec![0.0f32; num_frames]).collect();
+
+        {
+            let in_slices: Vec<&[f32]> = in_bufs.iter().map(|buffer| buffer.as_slice()).collect();
+            let mut out_slices: Vec<&mut [f32]> =
+                out_bufs.iter_mut().map(|buffer| buffer.as_mut_slice()).collect();
+            plugin
+                .process(&in_slices, &mut out_slices, num_frames)
+                .expect("process() before reset should succeed");
+        }
+
+        plugin.reset().expect("reset() should succeed");
+
+        {
+            let in_slices: Vec<&[f32]> = in_bufs.iter().map(|buffer| buffer.as_slice()).collect();
+            let mut out_slices: Vec<&mut [f32]> =
+                out_bufs.iter_mut().map(|buffer| buffer.as_mut_slice()).collect();
+            let result = plugin.process(&in_slices, &mut out_slices, num_frames);
+            assert!(
+                result.is_ok(),
+                "process() after reset() should succeed, got {result:?}"
+            );
+        }
+    }
 }
