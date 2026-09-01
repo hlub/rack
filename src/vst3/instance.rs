@@ -1284,7 +1284,9 @@ impl PluginInstance for Vst3Plugin {
         }
 
         unsafe {
-            // Get state size
+            // Get state size: a generous initial guess (see
+            // rack_vst3_plugin_get_state_size's own doc comment for why it
+            // is a guess rather than a real measurement).
             let size = ffi::rack_vst3_plugin_get_state_size(self.inner.as_ptr());
             if size <= 0 {
                 return Err(Error::Other("Failed to get plugin state size".to_string()));
@@ -1295,11 +1297,30 @@ impl PluginInstance for Vst3Plugin {
             let mut actual_size = data.len();
 
             // Get state data
-            let result = ffi::rack_vst3_plugin_get_state(
+            let mut result = ffi::rack_vst3_plugin_get_state(
                 self.inner.as_ptr(),
                 data.as_mut_ptr(),
                 &mut actual_size,
             );
+
+            // rack_vst3_plugin_get_state's contract: when the real state is
+            // larger than the buffer we gave it, it fails but still writes
+            // the true required size back through `actual_size` (and does
+            // not touch it on any other kind of failure, so this condition
+            // can only be true after that specific overflow). Retry once
+            // with a buffer sized to that real requirement instead of
+            // failing outright -- a state above the initial guess is rare
+            // but not invalid.
+            if result != ffi::RACK_VST3_OK && actual_size > data.len() {
+                data = vec![0u8; actual_size];
+                let mut retry_size = data.len();
+                result = ffi::rack_vst3_plugin_get_state(
+                    self.inner.as_ptr(),
+                    data.as_mut_ptr(),
+                    &mut retry_size,
+                );
+                actual_size = retry_size;
+            }
 
             if result != ffi::RACK_VST3_OK {
                 return Err(map_error(result));
@@ -1892,5 +1913,35 @@ mod tests {
                 "process() after reset() should succeed, got {result:?}"
             );
         }
+    }
+
+    #[test]
+    fn get_state_set_state_round_trip() {
+        // Exercises get_state's normal (no-retry) path end to end. The
+        // retry-on-overflow branch (the fix for real states larger than the
+        // 4 MB initial guess) only triggers for a state larger than that
+        // guess; no plugin installed on a real test machine is known to
+        // produce one, so that branch is covered by careful reading of
+        // rack_vst3_plugin_get_state's contract (see get_state's own
+        // comments) rather than by an automated test here.
+        let (scanner, info) = match get_test_plugin() {
+            Ok(result) => result,
+            Err(_) => {
+                println!("Skipping test - no VST3 plugins found");
+                return;
+            }
+        };
+
+        let mut plugin = scanner.load(&info).expect("Plugin creation should succeed");
+        plugin
+            .initialize(48000.0, 512)
+            .expect("Plugin initialization should succeed");
+
+        let state = plugin.get_state().expect("get_state should succeed");
+        assert!(!state.is_empty(), "state should not be empty");
+
+        plugin
+            .set_state(&state)
+            .expect("set_state with a just-captured state should succeed");
     }
 }
