@@ -1772,4 +1772,68 @@ mod tests {
             "process_multi_bus with an unfed second input bus should succeed, got {result:?}"
         );
     }
+
+    #[test]
+    fn send_midi_accepts_more_than_the_old_default_capacity() {
+        // The underlying Steinberg EventList defaults to a 50-event maxSize
+        // when default-constructed; this crate documents (and now
+        // configures) a real capacity of 256. 200 events is above the old
+        // silent cap but within the documented one, so every event must be
+        // accepted with no error.
+        let Some((scanner, info)) = find_plugin_by_name("Addictive Drums 2") else {
+            println!("Skipping test - Addictive Drums 2 not installed");
+            return;
+        };
+        let mut plugin = scanner.load(&info).expect("AD2 should load");
+        plugin.initialize(48000.0, 512).expect("AD2 should initialize");
+
+        let events: Vec<MidiEvent> = (0..200u32)
+            .map(|index| MidiEvent {
+                sample_offset: 0,
+                kind: MidiEventKind::NoteOn {
+                    note: 36,
+                    velocity: 100,
+                    channel: (index % 16) as u8,
+                },
+            })
+            .collect();
+
+        let result = plugin.send_midi(&events);
+        assert!(
+            result.is_ok(),
+            "200 queued MIDI events should all fit within the documented 256 capacity, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn send_midi_reports_truncation_past_documented_capacity() {
+        // 300 events exceeds the documented/configured 256-event capacity,
+        // so the queue-full condition must now be surfaced as an error
+        // rather than silently discarding the overflow (the pre-fix
+        // behavior, which additionally overflowed at the undocumented,
+        // much lower default of 50).
+        let Some((scanner, info)) = find_plugin_by_name("Addictive Drums 2") else {
+            println!("Skipping test - Addictive Drums 2 not installed");
+            return;
+        };
+        let mut plugin = scanner.load(&info).expect("AD2 should load");
+        plugin.initialize(48000.0, 512).expect("AD2 should initialize");
+
+        let events: Vec<MidiEvent> = (0..300u32)
+            .map(|index| MidiEvent {
+                sample_offset: 0,
+                kind: MidiEventKind::NoteOn {
+                    note: 36,
+                    velocity: 100,
+                    channel: (index % 16) as u8,
+                },
+            })
+            .collect();
+
+        let result = plugin.send_midi(&events);
+        assert!(
+            result.is_err(),
+            "300 events should overflow the documented 256-event capacity and be reported"
+        );
+    }
 }

@@ -42,6 +42,11 @@ typedef struct {
 #define RACK_VST3_ERROR_NOT_INITIALIZED -4
 #define RACK_VST3_ERROR_LOAD_FAILED -5
 #define RACK_VST3_ERROR_NOT_SUPPORTED -6  // Feature not supported by this plugin
+// One or more MIDI events passed to rack_vst3_plugin_send_midi were dropped
+// because the plugin's input event queue was already full (see that
+// function's own doc comment for the exact capacity and which events were
+// actually delivered before the drop).
+#define RACK_VST3_ERROR_EVENT_QUEUE_FULL -7
 
 // ============================================================================
 // Scanner API

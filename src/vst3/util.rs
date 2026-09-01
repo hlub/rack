@@ -16,6 +16,9 @@ pub(crate) fn map_error(code: i32) -> Error {
         ffi::RACK_VST3_ERROR_NOT_INITIALIZED => Error::NotInitialized,
         ffi::RACK_VST3_ERROR_LOAD_FAILED => Error::Other("Failed to load VST3 plugin".to_string()),
         ffi::RACK_VST3_ERROR_NOT_SUPPORTED => Error::Other("Feature not supported by this plugin".to_string()),
+        ffi::RACK_VST3_ERROR_EVENT_QUEUE_FULL => Error::Other(
+            "One or more MIDI events were dropped: the plugin's input event queue is full".to_string(),
+        ),
         _ => Error::Other(format!("Unknown VST3 error code: {}", code)),
     }
 }

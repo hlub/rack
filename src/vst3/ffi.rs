@@ -86,6 +86,9 @@ pub const RACK_VST3_ERROR_INVALID_PARAM: c_int = -3;
 pub const RACK_VST3_ERROR_NOT_INITIALIZED: c_int = -4;
 pub const RACK_VST3_ERROR_LOAD_FAILED: c_int = -5;
 pub const RACK_VST3_ERROR_NOT_SUPPORTED: c_int = -6;
+/// One or more MIDI events passed to `rack_vst3_plugin_send_midi` were
+/// dropped because the plugin's input event queue was already full.
+pub const RACK_VST3_ERROR_EVENT_QUEUE_FULL: c_int = -7;
 
 extern "C" {
     // ============================================================================

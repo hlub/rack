@@ -369,6 +369,14 @@ tresult PLUGIN_API ComponentHandler::queryInterface(const TUID _iid, void** obj)
     return kNoInterface;
 }
 
+// Capacity of RackVST3Plugin::input_events/output_events, in events. Chosen
+// to match src/vst3/instance.rs's OUTPUT_MIDI_SCRATCH_CAPACITY (256), which
+// documents this as the real, effective cap on how many MIDI events a
+// single process() call can carry in either direction -- Steinberg's
+// EventList defaults its maxSize to 50 when default-constructed, which is
+// smaller than that documented capacity unless overridden here.
+static constexpr int32 kEventListCapacity = 256;
+
 // Internal plugin state
 struct RackVST3Plugin {
     // Module and factory
@@ -415,8 +423,8 @@ struct RackVST3Plugin {
     HostProcessData process_data;
     ParameterChanges input_param_changes;
     ParameterChanges output_param_changes;
-    EventList input_events;
-    EventList output_events;
+    EventList input_events{kEventListCapacity};
+    EventList output_events{kEventListCapacity};
 
     // Process context: tempo/playback state the plugin reads on every
     // process() call. Built once in initialize(), then kept live by
@@ -2067,7 +2075,12 @@ int rack_vst3_plugin_send_midi(
         return RACK_VST3_OK;
     }
 
-    // Convert MIDI events to VST3 events
+    // Convert MIDI events to VST3 events. addEvent silently returns
+    // kResultFalse (dropping the event) once input_events reaches
+    // kEventListCapacity; track how many were dropped so this function can
+    // report it rather than let it pass as if every event succeeded.
+    uint32_t dropped_count = 0;
+
     for (uint32_t i = 0; i < event_count; ++i) {
         const auto& midi_event = events[i];
 
@@ -2085,7 +2098,9 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.noteOn.pitch = midi_event.data1;
                 vst3_event.noteOn.velocity = static_cast<float>(midi_event.data2) / 127.0f;
                 vst3_event.noteOn.noteId = -1;  // Not specified
-                plugin->input_events.addEvent(vst3_event);
+                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                    ++dropped_count;
+                }
                 break;
 
             case 0x80:  // Note Off
@@ -2094,7 +2109,9 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.noteOff.pitch = midi_event.data1;
                 vst3_event.noteOff.velocity = static_cast<float>(midi_event.data2) / 127.0f;
                 vst3_event.noteOff.noteId = -1;  // Not specified
-                plugin->input_events.addEvent(vst3_event);
+                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                    ++dropped_count;
+                }
                 break;
 
             case 0xA0:  // Polyphonic Key Pressure (Aftertouch)
@@ -2102,7 +2119,9 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.polyPressure.channel = midi_event.channel;
                 vst3_event.polyPressure.pitch = midi_event.data1;
                 vst3_event.polyPressure.pressure = static_cast<float>(midi_event.data2) / 127.0f;
-                plugin->input_events.addEvent(vst3_event);
+                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                    ++dropped_count;
+                }
                 break;
 
             case 0xB0:  // Control Change
@@ -2113,7 +2132,9 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.midiCCOut.controlNumber = midi_event.data1;
                 vst3_event.midiCCOut.value = midi_event.data2;
                 vst3_event.midiCCOut.value2 = 0;
-                plugin->input_events.addEvent(vst3_event);
+                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                    ++dropped_count;
+                }
                 break;
 
             case 0xC0:  // Program Change
@@ -2125,7 +2146,9 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.midiCCOut.controlNumber = 0x80;  // >= 0x80 indicates non-CC MIDI
                 vst3_event.midiCCOut.value = midi_event.data1;
                 vst3_event.midiCCOut.value2 = 0;
-                plugin->input_events.addEvent(vst3_event);
+                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                    ++dropped_count;
+                }
                 break;
 
             case 0xD0:  // Channel Pressure (Aftertouch)
@@ -2137,7 +2160,9 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.midiCCOut.controlNumber = 0x81;  // >= 0x80 indicates non-CC MIDI
                 vst3_event.midiCCOut.value = midi_event.data1;
                 vst3_event.midiCCOut.value2 = 0;
-                plugin->input_events.addEvent(vst3_event);
+                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                    ++dropped_count;
+                }
                 break;
 
             case 0xE0: {  // Pitch Bend
@@ -2150,7 +2175,9 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.midiCCOut.controlNumber = 0x82;  // >= 0x80 indicates non-CC MIDI
                 vst3_event.midiCCOut.value = midi_event.data1;   // LSB
                 vst3_event.midiCCOut.value2 = midi_event.data2;  // MSB
-                plugin->input_events.addEvent(vst3_event);
+                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                    ++dropped_count;
+                }
                 break;
             }
 
@@ -2158,6 +2185,17 @@ int rack_vst3_plugin_send_midi(
                 // Unknown MIDI event - skip it
                 continue;
         }
+    }
+
+    // Every event that fit was already queued above; report truncation
+    // rather than silently discarding the events beyond capacity, so a
+    // caller flooding the queue faster than process() drains it can find
+    // out. This mirrors the equivalent decision documented for
+    // rack_vst3_plugin_process_multi_bus's own output-MIDI capture (report
+    // truncation via a count, don't fail the whole call retroactively for
+    // work already done).
+    if (dropped_count > 0) {
+        return RACK_VST3_ERROR_EVENT_QUEUE_FULL;
     }
 
     return RACK_VST3_OK;

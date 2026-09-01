@@ -170,6 +170,11 @@ pub trait PluginInstance: Send {
     /// - The plugin doesn't support MIDI (e.g., most effect plugins)
     /// - Any event has invalid data (channel > 15, etc.)
     /// - The plugin is not initialized
+    /// - (VST3) The plugin's input event queue was already full: every event
+    ///   that fit was still delivered, but one or more trailing events in
+    ///   `events` were dropped. This is rare in practice -- the queue is
+    ///   drained by every `process`/`process_multi_bus` call -- but is
+    ///   surfaced rather than silently discarded.
     fn send_midi(&mut self, events: &[MidiEvent]) -> Result<()>;
 
     /// Get the number of factory presets
