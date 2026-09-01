@@ -397,11 +397,18 @@ int rack_vst3_scanner_scan(RackVST3Scanner* scanner, RackVST3PluginInfo* plugins
     if (scanner->include_system_modules || used_default_paths_only) {
         auto system_modules = Hosting::Module::getModulePaths();
         module_paths.insert(module_paths.end(), system_modules.begin(), system_modules.end());
-
-        // Remove duplicates (in case same plugin is in both custom and system paths)
-        std::sort(module_paths.begin(), module_paths.end());
-        module_paths.erase(std::unique(module_paths.begin(), module_paths.end()), module_paths.end());
     }
+
+    // Remove duplicates (e.g. the same plugin found via both a caller-added
+    // path and the system-discovered module list above, or via two
+    // overlapping rack_vst3_scanner_add_path calls). Kept unconditional
+    // rather than nested inside the block above: rack_vst3_scanner_add_path
+    // is a public C API a future caller could call more than once with
+    // overlapping paths, with no getModulePaths() merge involved at all --
+    // that path can still produce duplicate module_paths entries on its own
+    // and deserves the same dedup the merged case already got.
+    std::sort(module_paths.begin(), module_paths.end());
+    module_paths.erase(std::unique(module_paths.begin(), module_paths.end()), module_paths.end());
 
     // Scan all found modules.
     //
