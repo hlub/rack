@@ -35,6 +35,20 @@ using namespace Steinberg::Vst;
 // Internal scanner state
 struct RackVST3Scanner {
     std::vector<std::string> search_paths;
+
+    // Whether a scan should additionally merge in every system-registered
+    // module via Hosting::Module::getModulePaths(). Set only by
+    // rack_vst3_scanner_add_default_paths -- never by rack_vst3_scanner_add_path
+    // -- so a scanner built purely from explicit caller paths (e.g.
+    // Vst3Scanner::scan_path, which never calls add_default_paths) stays
+    // genuinely scoped to just those paths, while a scanner seeded with the
+    // system default directories keeps its existing, intentionally broader
+    // completeness. `search_paths.empty()` cannot be used for this instead:
+    // add_default_paths also populates search_paths, so a scan_path scanner
+    // (search_paths holding exactly the one requested path) and a scan()
+    // scanner (search_paths holding the default directories) are otherwise
+    // indistinguishable at this point.
+    bool include_system_modules = false;
 };
 
 // Helper: Scan a directory for .vst3 bundles/folders
@@ -334,6 +348,7 @@ int rack_vst3_scanner_add_default_paths(RackVST3Scanner* scanner) {
 
     auto paths = get_default_vst3_paths();
     scanner->search_paths.insert(scanner->search_paths.end(), paths.begin(), paths.end());
+    scanner->include_system_modules = true;
     return RACK_VST3_OK;
 }
 
@@ -345,10 +360,18 @@ int rack_vst3_scanner_scan(RackVST3Scanner* scanner, RackVST3PluginInfo* plugins
     bool count_only = (plugins == nullptr);
     size_t count = 0;
 
-    // Determine which paths to scan
+    // Determine which paths to scan. A scanner with no paths added at all
+    // (neither rack_vst3_scanner_add_path nor rack_vst3_scanner_add_default_paths
+    // was ever called) falls back to the system default directories here --
+    // no Rust caller in this codebase constructs a scanner this way today
+    // (`Vst3Scanner::new()` always calls add_default_paths, `scan_path`'s
+    // internal `new_empty()` always calls add_path), but a bare
+    // rack_vst3_scanner_new() + scan() from a future or external C caller
+    // should get the same "no scoping requested" completeness as
+    // add_default_paths, including the system-module merge below.
+    bool used_default_paths_only = scanner->search_paths.empty();
     std::vector<std::string> paths_to_scan = scanner->search_paths;
-    if (paths_to_scan.empty()) {
-        // No custom paths - use system defaults
+    if (used_default_paths_only) {
         paths_to_scan = get_default_vst3_paths();
     }
 
@@ -360,14 +383,25 @@ int rack_vst3_scanner_scan(RackVST3Scanner* scanner, RackVST3PluginInfo* plugins
         module_paths.insert(module_paths.end(), found_bundles.begin(), found_bundles.end());
     }
 
-    // Also include system-discovered modules (from getModulePaths)
-    // This ensures we find all plugins even if custom paths are specified
-    auto system_modules = Hosting::Module::getModulePaths();
-    module_paths.insert(module_paths.end(), system_modules.begin(), system_modules.end());
+    // Also include system-discovered modules (from getModulePaths), but only
+    // for a scan seeded with the system default paths (rack_vst3_scanner_
+    // add_default_paths) -- this is what gives that scan its intended, wider
+    // completeness (e.g. VST3 bundles embedded in an installed .app, which a
+    // plain directory walk of the default paths would miss). A scan seeded
+    // only with explicit caller paths (rack_vst3_scanner_add_path, e.g. the
+    // Rust `Vst3Scanner::scan_path`) must stay scoped to exactly what was
+    // requested: unconditionally merging every system-registered module here
+    // used to defeat that scoping entirely, making a scan of one specific
+    // bundle path silently dlopen every other installed VST3 bundle on the
+    // machine too.
+    if (scanner->include_system_modules || used_default_paths_only) {
+        auto system_modules = Hosting::Module::getModulePaths();
+        module_paths.insert(module_paths.end(), system_modules.begin(), system_modules.end());
 
-    // Remove duplicates (in case same plugin is in both custom and system paths)
-    std::sort(module_paths.begin(), module_paths.end());
-    module_paths.erase(std::unique(module_paths.begin(), module_paths.end()), module_paths.end());
+        // Remove duplicates (in case same plugin is in both custom and system paths)
+        std::sort(module_paths.begin(), module_paths.end());
+        module_paths.erase(std::unique(module_paths.begin(), module_paths.end()), module_paths.end());
+    }
 
     // Scan all found modules.
     //

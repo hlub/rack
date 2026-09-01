@@ -241,12 +241,18 @@ mod tests {
     // don't ship a `moduleinfo.json`, so `Hosting::Module::create` has to
     // `dlopen`/`CFBundleLoadExecutableAndReturnError` the real bundle to read
     // its class info) and no isolated fixture `.vst3` bundle vendored into
-    // this repo to scan instead. `scan_path` cannot be used to sandbox a scan
-    // away from the real system plugins either: the underlying C++ scanner
-    // always additionally walks `Hosting::Module::getModulePaths()`
-    // regardless of what explicit paths were requested (see
-    // `rack-sys/src/vst3_scanner.cpp`; `crates/backline/src/vst3.rs` in the
-    // sibling `drumr` workspace documents and works around the same quirk).
+    // this repo to scan instead. `scan()` itself can't be sandboxed away from
+    // the real system plugins -- it's meant to see everything installed -- but
+    // `scan_path` now genuinely is scoped to just the path(s) it was given:
+    // the underlying C++ scanner used to unconditionally also walk
+    // `Hosting::Module::getModulePaths()` regardless of what explicit paths
+    // were requested, which made a `scan_path` call on one specific bundle
+    // silently `dlopen` every other installed VST3 bundle too. Fixed by
+    // gating that merge on `RackVST3Scanner::include_system_modules`, set
+    // only by `rack_vst3_scanner_add_default_paths` (never by
+    // `rack_vst3_scanner_add_path`) -- see `rack-sys/src/vst3_scanner.cpp`
+    // and `scan_path_is_scoped_to_the_requested_bundle_only` /
+    // `full_scan_still_includes_default_directory_coverage` below.
     //
     // This used to make these tests flaky in a much worse way than "results
     // vary by machine": running more than one of them concurrently (cargo
@@ -367,5 +373,131 @@ mod tests {
         for handle in handles {
             handle.join().expect("Scanning thread should not panic");
         }
+    }
+
+    /// The standard, OS-registered VST3 install directories, mirroring
+    /// `get_default_vst3_paths()` in `rack-sys/src/vst3_scanner.cpp` exactly
+    /// (macOS only -- these tests already assume a real, installed system
+    /// plugin population, which this repository's own CI/dev environment is
+    /// macOS). Used below to build a "plain directory walk, no
+    /// `getModulePaths` merge" scan for comparison against `scan_path` and
+    /// `scan()`, via nothing but the public `scan_path` API -- so these tests
+    /// exercise the same C++ code paths a real caller does, rather than
+    /// reaching into `RackVST3Scanner`'s private state.
+    #[cfg(target_os = "macos")]
+    fn macos_default_vst3_dirs() -> Vec<PathBuf> {
+        let mut dirs = vec![PathBuf::from("/Library/Audio/Plug-Ins/VST3")];
+        if let Some(home) = std::env::var_os("HOME") {
+            dirs.push(PathBuf::from(home).join("Library/Audio/Plug-Ins/VST3"));
+        }
+        dirs
+    }
+
+    /// Regression test for the `getModulePaths()` merge that used to run
+    /// unconditionally: `scan_path` on one specific bundle path must report
+    /// classes from that bundle alone, never from any other installed
+    /// bundle. Before the fix (`RackVST3Scanner::include_system_modules`,
+    /// gated in `rack_vst3_scanner_scan`), this returned the exact same
+    /// results as a full `scan()`, regardless of the path requested.
+    ///
+    /// This needs at least two distinct VST3 bundles installed system-wide
+    /// to be a meaningful check at all (with only one installed, "scoped to
+    /// the one requested bundle" and "the whole system" are the same set) --
+    /// true for every machine this workspace's own developers use, per the
+    /// module-level comment above.
+    #[test]
+    fn scan_path_is_scoped_to_the_requested_bundle_only() {
+        let full_scan = Vst3Scanner::new()
+            .expect("Scanner creation should succeed")
+            .scan()
+            .expect("Full scan should succeed");
+
+        let distinct_bundles: std::collections::HashSet<_> =
+            full_scan.iter().map(|plugin| plugin.path.clone()).collect();
+        assert!(
+            distinct_bundles.len() > 1,
+            "this test needs at least two distinct VST3 bundles installed system-wide \
+             to be meaningful; found {} -- install a second VST3 plugin, or see this \
+             test's own doc comment",
+            distinct_bundles.len(),
+        );
+
+        let chosen_bundle = full_scan
+            .first()
+            .expect("full scan found at least one plugin")
+            .path
+            .clone();
+
+        let scanner = Vst3Scanner::new().expect("Scanner creation should succeed");
+        let scoped = scanner
+            .scan_path(&chosen_bundle)
+            .expect("scan_path on a real bundle should succeed");
+
+        assert!(
+            !scoped.is_empty(),
+            "scan_path found no classes in the requested bundle {}",
+            chosen_bundle.display(),
+        );
+
+        let scoped_bundles: std::collections::HashSet<_> =
+            scoped.iter().map(|plugin| plugin.path.clone()).collect();
+        assert_eq!(
+            scoped_bundles,
+            std::iter::once(chosen_bundle.clone()).collect(),
+            "scan_path on {} returned classes from other bundles too -- \
+             system-registered modules leaked into a scoped scan",
+            chosen_bundle.display(),
+        );
+    }
+
+    /// Completeness check for the other half of the same fix: `scan()` (via
+    /// `Vst3Scanner::new()`, which calls `rack_vst3_scanner_add_default_paths`)
+    /// must still find at least everything a plain walk of the standard
+    /// directories finds -- the `include_system_modules` gate must not have
+    /// silently dropped `scan()`'s own `getModulePaths()` merge along with
+    /// scoping `scan_path`.
+    ///
+    /// The directory-only baseline is built from nothing but `scan_path`
+    /// (which never merges `getModulePaths`, by the property the test above
+    /// checks), applied to each standard directory and unioned by bundle
+    /// path -- exactly what `scan()` would find if its `getModulePaths` merge
+    /// were broken or missing. `scan()`'s own result must be a superset.
+    ///
+    /// This is a one-directional "nothing regressed" check, not proof that
+    /// `getModulePaths()` contributes anything *beyond* the standard
+    /// directories on this machine (it can also discover VST3 bundles
+    /// embedded in an installed `.app`, via macOS's `getApplicationModules`,
+    /// which this repository has no portable fixture for) -- so equal counts
+    /// here are an expected pass, not a failure of the test.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn full_scan_still_includes_default_directory_coverage() {
+        let mut directory_only_bundles = std::collections::HashSet::new();
+        for dir in macos_default_vst3_dirs() {
+            let scanner = Vst3Scanner::new().expect("Scanner creation should succeed");
+            for plugin in scanner.scan_path(&dir).unwrap_or_default() {
+                directory_only_bundles.insert(plugin.path);
+            }
+        }
+        assert!(
+            !directory_only_bundles.is_empty(),
+            "no VST3 bundles found under the standard directories; this test needs a \
+             real, installed VST3 plugin to be meaningful",
+        );
+
+        let full_scan_bundles: std::collections::HashSet<_> = Vst3Scanner::new()
+            .expect("Scanner creation should succeed")
+            .scan()
+            .expect("Full scan should succeed")
+            .into_iter()
+            .map(|plugin| plugin.path)
+            .collect();
+
+        assert!(
+            directory_only_bundles.is_subset(&full_scan_bundles),
+            "scan() is missing bundles that a plain directory walk of the standard \
+             paths found: {:?}",
+            directory_only_bundles.difference(&full_scan_bundles).collect::<Vec<_>>(),
+        );
     }
 }
