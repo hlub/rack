@@ -329,24 +329,72 @@ int rack_vst3_plugin_parameter_count(RackVST3Plugin* plugin);
 // must not be accessed concurrently.
 int rack_vst3_plugin_get_parameter(RackVST3Plugin* plugin, uint32_t index, float* value);
 
-// Set parameter value (normalized 0.0 to 1.0)
-// Returns 0 on success, negative error code on failure
+// Set parameter value (normalized 0.0 to 1.0). ALSO calls
+// IEditController::setParamNormalized synchronously, on whatever thread
+// calls this function, so the controller (and therefore any GUI) reflects
+// the new value immediately -- a plugin's parameter-changed handler can do
+// arbitrary non-realtime work in response (allocation, UI updates), so this
+// function is NOT real-time-safe and must not be called from an audio
+// thread. Use rack_vst3_plugin_queue_parameter_change instead for automation
+// applied from the audio thread; this function remains for genuinely
+// non-realtime callers (e.g. loading a preset, or a user turning a knob on
+// the main thread) that also need the controller/GUI kept in sync.
+//
+// In addition to the controller call above, this also queues the value into
+// the same per-block automation queue rack_vst3_plugin_queue_parameter_change
+// uses, so the plugin's audio processor receives the change on its next
+// rack_vst3_plugin_process[_multi_bus] call either way.
+// Returns 0 on success, negative error code on failure.
 // Thread-safety: Can be called from any thread, but the same plugin instance
-// must not be accessed concurrently.
+// must not be accessed concurrently. NOT real-time-safe (see above).
 // Note: Calling during audio processing may cause clicks/pops.
 int rack_vst3_plugin_set_parameter(RackVST3Plugin* plugin, uint32_t index, float value);
 int rack_vst3_plugin_set_parameter_by_id(RackVST3Plugin* plugin, uint32_t param_id, float value);
+
+// Queue a normalized parameter value change ([0.0, 1.0], clamped) to be
+// delivered to the plugin's audio processor on the *next*
+// rack_vst3_plugin_process / rack_vst3_plugin_process_multi_bus call, via
+// VST3's IParameterChanges automation mechanism -- the same delivery path
+// real VST3 hosts use for per-block parameter automation.
+//
+// Unlike rack_vst3_plugin_set_parameter, this does NOT call
+// IEditController::setParamNormalized -- it never touches the controller, so
+// it is real-time-safe and may be called from the audio thread immediately
+// before rack_vst3_plugin_process[_multi_bus]. Because it skips the
+// controller call, the plugin's UI/controller-side parameter cache (and
+// therefore any GUI) will NOT reflect the change; use
+// rack_vst3_plugin_set_parameter from a non-realtime thread instead when
+// that matters (e.g. loading a preset).
+//
+// index: parameter index (see rack_vst3_plugin_parameter_info), not a raw
+// VST3 param ID.
+//
+// The queued point is delivered at sample offset 0 of the next process call.
+// The queue is cleared after every process call (see
+// rack_vst3_plugin_process), so nothing queued here is ever left stale for a
+// later, unrelated process call.
+//
+// Returns 0 on success, negative error code (e.g. RACK_VST3_ERROR_INVALID_PARAM
+// for an out-of-range index) on failure.
+// Thread-safety: real-time-safe (no allocation once this parameter has been
+// queued at least once before, matching every other zero-allocation hot path
+// in this file); must not be called concurrently with
+// rack_vst3_plugin_process[_multi_bus] or other plugin operations on the
+// same plugin.
+int rack_vst3_plugin_queue_parameter_change(RackVST3Plugin* plugin, uint32_t index, float value);
+
 uint32_t rack_vst3_plugin_get_midi_pc_param_id(RackVST3Plugin* plugin, int channel);
 
 // Update the plugin's live process context: tempo (BPM) and playback state
 // (nonzero = playing, zero = stopped). Writes directly into the plugin's
 // persistent ProcessContext (built once during initialize and never
 // rebuilt), which the plugin reads on every subsequent process() call.
-// Thread-safety: unlike rack_vst3_plugin_set_parameter (queued for the
-// audio thread to apply), this writes the struct fields immediately with
-// no queuing or locking -- the caller MUST call this only from the same
-// thread that calls rack_vst3_plugin_process, immediately before it, never
-// concurrently with a process() call in flight.
+// Thread-safety: unlike rack_vst3_plugin_queue_parameter_change (queued for
+// the audio thread to apply on its own next process() call), this writes
+// the struct fields immediately with no queuing or locking -- the caller
+// MUST call this only from the same thread that calls
+// rack_vst3_plugin_process, immediately before it, never concurrently with
+// a process() call in flight.
 // Returns 0 on success, negative error code on failure.
 int rack_vst3_plugin_set_transport(RackVST3Plugin* plugin, double tempo, int32_t playing);
 

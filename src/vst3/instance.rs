@@ -162,6 +162,48 @@ impl Vst3Plugin {
         }
     }
 
+    /// Queue a normalized parameter value change ([0.0, 1.0], clamped) for
+    /// delivery on the *next* [`process`](PluginInstance::process) /
+    /// [`process_multi_bus`](Self::process_multi_bus) call, via VST3's
+    /// `IParameterChanges` per-block automation mechanism -- the same
+    /// delivery path real VST3 hosts use for automation.
+    ///
+    /// Unlike [`set_parameter`](PluginInstance::set_parameter) /
+    /// [`set_param_by_id`](Self::set_param_by_id), this never calls
+    /// `IEditController::setParamNormalized`, so it is real-time-safe and is
+    /// the correct method to call from the audio thread, immediately before
+    /// a process call. The tradeoff: the plugin's controller/GUI does not
+    /// observe the change this way -- use `set_parameter`/`set_param_by_id`
+    /// from a non-realtime thread instead when that matters (e.g. loading a
+    /// preset from the main thread).
+    ///
+    /// `index` is the same rack parameter index used by
+    /// [`get_parameter`](PluginInstance::get_parameter)/
+    /// [`set_parameter`](PluginInstance::set_parameter), not a raw VST3
+    /// ParamID.
+    ///
+    /// The queued point is delivered at sample offset 0 of the very next
+    /// process call; the underlying queue is cleared after every process
+    /// call, so nothing queued here is ever left stale for a later,
+    /// unrelated process call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `index` is out of range.
+    pub fn queue_parameter_change(&mut self, index: usize, value: f32) -> Result<()> {
+        unsafe {
+            let result = ffi::rack_vst3_plugin_queue_parameter_change(
+                self.inner.as_ptr(),
+                index as u32,
+                value,
+            );
+            if result != ffi::RACK_VST3_OK {
+                return Err(map_error(result));
+            }
+            Ok(())
+        }
+    }
+
     /// Get the VST3 ParamID that handles MIDI Program Change on the given channel.
     /// Returns 0xFFFFFFFF (kNoParamId) if not mapped.
     pub fn midi_pc_param_id(&self, channel: i32) -> u32 {
@@ -174,15 +216,16 @@ impl Vst3Plugin {
     /// next `process()` call observes the host's real, current transport
     /// instead of whatever it was initialized with.
     ///
-    /// Unlike [`set_parameter`](PluginInstance::set_parameter) (queued for
-    /// the audio thread to apply on its own next `process()` call), this
-    /// writes directly into the plugin's persistent process context struct
-    /// with no queuing or locking on the C++ side -- callers MUST only call
-    /// this from the same thread that also calls `process()`, immediately
-    /// before it, never concurrently with a `process()` call in flight. The
-    /// one real caller (`backline::signal_graph_audio`'s per-block transport
-    /// publish step) already satisfies this by construction: it runs inside
-    /// the same audio-callback invocation that then calls `process()`.
+    /// Unlike [`queue_parameter_change`](Self::queue_parameter_change)
+    /// (queued for the audio thread to apply on its own next `process()`
+    /// call), this writes directly into the plugin's persistent process
+    /// context struct with no queuing or locking on the C++ side -- callers
+    /// MUST only call this from the same thread that also calls `process()`,
+    /// immediately before it, never concurrently with a `process()` call in
+    /// flight. The one real caller (`backline::signal_graph_audio`'s
+    /// per-block transport publish step) already satisfies this by
+    /// construction: it runs inside the same audio-callback invocation that
+    /// then calls `process()`.
     ///
     /// # Errors
     ///
@@ -1943,5 +1986,38 @@ mod tests {
         plugin
             .set_state(&state)
             .expect("set_state with a just-captured state should succeed");
+    }
+
+    #[test]
+    fn queue_parameter_change_does_not_require_controller_call() {
+        // queue_parameter_change is the real-time-safe path added for the
+        // audio-thread parameter delivery gap: it must succeed on a real
+        // parameter index without touching the controller, and reject an
+        // out-of-range index the same way set_parameter already does.
+        let (scanner, info) = match get_test_plugin() {
+            Ok(result) => result,
+            Err(_) => {
+                println!("Skipping test - no VST3 plugins found");
+                return;
+            }
+        };
+
+        let mut plugin = scanner.load(&info).expect("Plugin creation should succeed");
+        plugin
+            .initialize(48000.0, 512)
+            .expect("Plugin initialization should succeed");
+
+        if plugin.parameter_count() == 0 {
+            println!("Plugin has no parameters, skipping queue_parameter_change test");
+            return;
+        }
+
+        plugin
+            .queue_parameter_change(0, 0.5)
+            .expect("queuing a real parameter index should succeed");
+
+        let out_of_range = plugin.parameter_count();
+        let result = plugin.queue_parameter_change(out_of_range, 0.5);
+        assert!(result.is_err(), "an out-of-range index should be rejected");
     }
 }

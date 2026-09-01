@@ -1495,6 +1495,38 @@ int rack_vst3_plugin_set_parameter_by_id(RackVST3Plugin* plugin, uint32_t param_
     return RACK_VST3_OK;
 }
 
+// See this function's own doc comment in rack_vst3.h: unlike
+// rack_vst3_plugin_set_parameter[_by_id] above, this deliberately never
+// touches plugin->controller (no setParamNormalized call) -- only queues the
+// point into input_param_changes, the exact same queue
+// rack_vst3_plugin_process[_multi_bus] threads into
+// ProcessData::inputParameterChanges and clears after every call. That
+// makes this function real-time-safe and the two functions' controller-vs-
+// audio-thread scope the only difference between them.
+int rack_vst3_plugin_queue_parameter_change(RackVST3Plugin* plugin, uint32_t index, float value) {
+    if (!plugin || !plugin->controller) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+
+    if (index >= plugin->parameters.size()) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+
+    if (value < 0.0f) value = 0.0f;
+    if (value > 1.0f) value = 1.0f;
+
+    ParamID param_id = plugin->parameters[index].id;
+
+    int32 queue_index = 0;
+    IParamValueQueue* queue = plugin->input_param_changes.addParameterData(param_id, queue_index);
+    if (queue) {
+        int32 point_index = 0;
+        queue->addPoint(0, value, point_index);
+    }
+
+    return RACK_VST3_OK;
+}
+
 uint32_t rack_vst3_plugin_get_midi_pc_param_id(RackVST3Plugin* plugin, int channel) {
     if (!plugin || !plugin->controller) return kNoParamId;
     IPtr<IMidiMapping> midiMapping = U::cast<IMidiMapping>(plugin->controller);
