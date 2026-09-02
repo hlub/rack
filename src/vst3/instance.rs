@@ -162,48 +162,6 @@ impl Vst3Plugin {
         }
     }
 
-    /// Queue a normalized parameter value change ([0.0, 1.0], clamped) for
-    /// delivery on the *next* [`process`](PluginInstance::process) /
-    /// [`process_multi_bus`](Self::process_multi_bus) call, via VST3's
-    /// `IParameterChanges` per-block automation mechanism -- the same
-    /// delivery path real VST3 hosts use for automation.
-    ///
-    /// Unlike [`set_parameter`](PluginInstance::set_parameter) /
-    /// [`set_param_by_id`](Self::set_param_by_id), this never calls
-    /// `IEditController::setParamNormalized`, so it is real-time-safe and is
-    /// the correct method to call from the audio thread, immediately before
-    /// a process call. The tradeoff: the plugin's controller/GUI does not
-    /// observe the change this way -- use `set_parameter`/`set_param_by_id`
-    /// from a non-realtime thread instead when that matters (e.g. loading a
-    /// preset from the main thread).
-    ///
-    /// `index` is the same rack parameter index used by
-    /// [`get_parameter`](PluginInstance::get_parameter)/
-    /// [`set_parameter`](PluginInstance::set_parameter), not a raw VST3
-    /// ParamID.
-    ///
-    /// The queued point is delivered at sample offset 0 of the very next
-    /// process call; the underlying queue is cleared after every process
-    /// call, so nothing queued here is ever left stale for a later,
-    /// unrelated process call.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if `index` is out of range.
-    pub fn queue_parameter_change(&mut self, index: usize, value: f32) -> Result<()> {
-        unsafe {
-            let result = ffi::rack_vst3_plugin_queue_parameter_change(
-                self.inner.as_ptr(),
-                index as u32,
-                value,
-            );
-            if result != ffi::RACK_VST3_OK {
-                return Err(map_error(result));
-            }
-            Ok(())
-        }
-    }
-
     /// Get the VST3 ParamID that handles MIDI Program Change on the given channel.
     /// Returns 0xFFFFFFFF (kNoParamId) if not mapped.
     pub fn midi_pc_param_id(&self, channel: i32) -> u32 {
@@ -216,7 +174,7 @@ impl Vst3Plugin {
     /// next `process()` call observes the host's real, current transport
     /// instead of whatever it was initialized with.
     ///
-    /// Unlike [`queue_parameter_change`](Self::queue_parameter_change)
+    /// Unlike [`queue_parameter_change`](PluginInstance::queue_parameter_change)
     /// (queued for the audio thread to apply on its own next `process()`
     /// call), this writes directly into the plugin's persistent process
     /// context struct with no queuing or locking on the C++ side -- callers
@@ -1177,6 +1135,39 @@ impl PluginInstance for Vst3Plugin {
                 return Err(map_error(result));
             }
 
+            Ok(())
+        }
+    }
+
+    /// Real-time-safe VST3 implementation: queues the point into VST3's
+    /// `IParameterChanges` per-block automation mechanism -- the same
+    /// delivery path real VST3 hosts use for automation -- without ever
+    /// calling `IEditController::setParamNormalized`. See this method's
+    /// trait-level doc ([`PluginInstance::queue_parameter_change`]) for the
+    /// cross-backend contract; here specifically, once `initialize()` has
+    /// run (which pre-sizes the underlying parameter-change queue via
+    /// `setMaxParameters`, so this never allocates), this method is
+    /// real-time-safe and is the correct method to call from the audio
+    /// thread immediately before a process call. The tradeoff: the
+    /// plugin's controller/GUI does not observe the change this way -- use
+    /// `set_parameter`/[`set_param_by_id`](Self::set_param_by_id) from a
+    /// non-realtime thread instead when that matters (e.g. loading a preset
+    /// from the main thread).
+    ///
+    /// The queued point is delivered at sample offset 0 of the very next
+    /// process call; the underlying queue is cleared after every process
+    /// call, so nothing queued here is ever left stale for a later,
+    /// unrelated process call.
+    fn queue_parameter_change(&mut self, index: usize, value: f32) -> Result<()> {
+        unsafe {
+            let result = ffi::rack_vst3_plugin_queue_parameter_change(
+                self.inner.as_ptr(),
+                index as u32,
+                value,
+            );
+            if result != ffi::RACK_VST3_OK {
+                return Err(map_error(result));
+            }
             Ok(())
         }
     }

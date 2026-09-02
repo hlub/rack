@@ -301,6 +301,19 @@ impl PluginInstance for AudioUnitPlugin {
         }
     }
 
+    /// AudioUnit has no native scheduled-parameter mechanism wired up in
+    /// this crate today (Apple's `AudioUnitScheduleParameters` API could
+    /// provide one, but adding that is out of scope here -- see this
+    /// method's trait-level doc, [`PluginInstance::queue_parameter_change`],
+    /// for the cross-backend contract this fallback exists to satisfy
+    /// explicitly rather than silently). This override is therefore
+    /// identical to [`set_parameter`](Self::set_parameter) and inherits its
+    /// non-realtime-safety: callers must NOT call this from an audio thread
+    /// when targeting AudioUnit, unlike the VST3 backend's own override.
+    fn queue_parameter_change(&mut self, index: usize, value: f32) -> Result<()> {
+        self.set_parameter(index, value)
+    }
+
     fn send_midi(&mut self, events: &[MidiEvent]) -> Result<()> {
         if !self.is_initialized() {
             return Err(Error::NotInitialized);
