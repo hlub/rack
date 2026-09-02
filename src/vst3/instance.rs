@@ -1993,6 +1993,100 @@ mod tests {
     }
 
     #[test]
+    fn drop_after_process_tears_down_cleanly_from_processing_state() {
+        // rack_vst3_plugin_free used to call component->setActive(false)
+        // directly, without first calling setProcessing(false) -- even
+        // though initialize() (and, by the time a caller has actually
+        // processed audio, at least one process() call) already leaves the
+        // plugin with Processing == true. That is the exact spec-violating
+        // teardown order 2ae4dee fixed for both free() and reset();
+        // reset()'s own regression test is above (reset_leaves_plugin_
+        // ready_to_process_again). This is free()'s -- the more dangerous
+        // half of that fix, since this workspace has already been bitten by
+        // a real production teardown crash on exactly this kind of path
+        // (see the parent drumr repo's crates/backline/docs/
+        // ad2-teardown-crash-design.md).
+        //
+        // This crate has no mock IComponent layer and no way to query a
+        // real plugin's internal Processing/Active state from the outside,
+        // so there is no direct assertion available that
+        // setProcessing(false) was actually called before
+        // setActive(false)/terminate(). The real, observable signal this
+        // test has access to is indirect: drop a plugin while it is in
+        // exactly the state the bug required (initialized, then processed
+        // at least once, so Processing == true), and confirm teardown
+        // completes without crashing or deadlocking -- free() holds the
+        // process-wide module-load mutex for its whole duration, so a
+        // plugin that got stuck tearing down from Processing state would
+        // hang this entire test binary, not just this one test -- and that
+        // the shared VST3 module loader is left in a working state
+        // afterward, by successfully loading, initializing and processing a
+        // second, independent instance of the same plugin right after. Like
+        // the reset() regression test above, a plugin whose own
+        // setActive()/terminate() tolerates the old, spec-violating call
+        // order would not turn this test red on its own -- its value is in
+        // exercising the exact call sequence a regression could reorder,
+        // not in a positive assertion that the sequence itself was
+        // followed.
+        let (scanner, info) = match get_test_plugin() {
+            Ok(result) => result,
+            Err(_) => {
+                println!("Skipping test - no VST3 plugins found");
+                return;
+            }
+        };
+
+        {
+            let mut plugin = scanner.load(&info).expect("Plugin creation should succeed");
+            plugin
+                .initialize(48000.0, 512)
+                .expect("Plugin initialization should succeed");
+
+            let num_frames = 64usize;
+            let input_channels = plugin.input_channels();
+            let output_channels = plugin.output_channels();
+            let in_bufs: Vec<Vec<f32>> =
+                (0..input_channels).map(|_| vec![0.0f32; num_frames]).collect();
+            let mut out_bufs: Vec<Vec<f32>> =
+                (0..output_channels).map(|_| vec![0.0f32; num_frames]).collect();
+            let in_slices: Vec<&[f32]> = in_bufs.iter().map(|buffer| buffer.as_slice()).collect();
+            let mut out_slices: Vec<&mut [f32]> =
+                out_bufs.iter_mut().map(|buffer| buffer.as_mut_slice()).collect();
+            plugin
+                .process(&in_slices, &mut out_slices, num_frames)
+                .expect("process() should succeed, leaving the plugin in Processing state");
+
+            // Explicit drop, immediately after process(), is exactly the
+            // scenario the bug required: setProcessing(true) already in
+            // effect, never undone, when free() used to deactivate and
+            // terminate directly.
+            drop(plugin);
+        }
+
+        // Teardown must have left the shared module loader usable: load,
+        // initialize and process a second, independent instance of the
+        // same plugin.
+        let mut second = scanner.load(&info).expect("second load after teardown should succeed");
+        second
+            .initialize(48000.0, 512)
+            .expect("second initialize after teardown should succeed");
+
+        let num_frames = 64usize;
+        let input_channels = second.input_channels();
+        let output_channels = second.output_channels();
+        let in_bufs: Vec<Vec<f32>> =
+            (0..input_channels).map(|_| vec![0.0f32; num_frames]).collect();
+        let mut out_bufs: Vec<Vec<f32>> =
+            (0..output_channels).map(|_| vec![0.0f32; num_frames]).collect();
+        let in_slices: Vec<&[f32]> = in_bufs.iter().map(|buffer| buffer.as_slice()).collect();
+        let mut out_slices: Vec<&mut [f32]> =
+            out_bufs.iter_mut().map(|buffer| buffer.as_mut_slice()).collect();
+        second
+            .process(&in_slices, &mut out_slices, num_frames)
+            .expect("second instance should process successfully after first instance's teardown");
+    }
+
+    #[test]
     fn get_state_set_state_round_trip() {
         // Exercises get_state's normal (no-retry) path end to end. The
         // retry-on-overflow branch (the fix for real states larger than the
