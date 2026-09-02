@@ -1345,6 +1345,18 @@ impl PluginInstance for Vst3Plugin {
             // with a buffer sized to that real requirement instead of
             // failing outright -- a state above the initial guess is rare
             // but not invalid.
+            //
+            // Known accepted risk: each rack_vst3_plugin_get_state call
+            // brackets its own getState with a full suspend/resume cycle
+            // (setProcessing(false)/setActive(false) then setActive(true)/
+            // setProcessing(true)), so retrying here means two such cycles
+            // run back to back for this one logical get_state() -- exactly
+            // the pattern rack_vst3_plugin_get_state_size's own comment
+            // warns crashes some JUCE plugins (AD2 included) when done for
+            // an ordinary size-then-fetch. This is deliberately accepted
+            // rather than avoided: it only triggers for the rare case of a
+            // real state exceeding the initial guess, and failing outright
+            // instead would be strictly worse for that caller.
             if result != ffi::RACK_VST3_OK && actual_size > data.len() {
                 data = vec![0u8; actual_size];
                 let mut retry_size = data.len();
@@ -1829,12 +1841,30 @@ mod tests {
     }
 
     #[test]
-    fn send_midi_accepts_more_than_the_old_default_capacity() {
-        // The underlying Steinberg EventList defaults to a 50-event maxSize
-        // when default-constructed; this crate documents (and now
-        // configures) a real capacity of 256. 200 events is above the old
-        // silent cap but within the documented one, so every event must be
-        // accepted with no error.
+    fn send_midi_boundary_at_documented_capacity() {
+        // Boundary-precise regression test tied to the documented 256-event
+        // capacity value itself, rather than an arbitrary count that merely
+        // happens to sit below it (an earlier version of this test sent 200
+        // events and only asserted success -- code review pointed out that
+        // assertion would have passed even against the pre-fix code, which
+        // never checked addEvent's return value and always reported OK
+        // regardless of how many events were actually dropped, so it never
+        // proved the capacity had genuinely changed). Sending exactly 256
+        // events -- filling the queue exactly to its documented capacity --
+        // must succeed with none dropped; one further event queued on top of
+        // an already-full queue must then be reported as dropped. This
+        // combination fails if the real capacity is either smaller than 256
+        // (the first send would already report a drop) or larger (the
+        // second send would not).
+        //
+        // What this does NOT prove: whether AD2's own audio-thread event
+        // processing actually received and acted on each of the 256 host-
+        // side-accepted events -- this crate has no fixture or mechanism to
+        // introspect an instrument plugin's internal event handling that
+        // deeply. What it proves precisely is that the host-side queue
+        // (RackVST3Plugin::input_events) accepts exactly 256 events with no
+        // truncation and starts truncating at the 257th, matching
+        // kEventListCapacity's documented value exactly.
         let Some((scanner, info)) = find_plugin_by_name("Addictive Drums 2") else {
             println!("Skipping test - Addictive Drums 2 not installed");
             return;
@@ -1842,21 +1872,34 @@ mod tests {
         let mut plugin = scanner.load(&info).expect("AD2 should load");
         plugin.initialize(48000.0, 512).expect("AD2 should initialize");
 
-        let events: Vec<MidiEvent> = (0..200u32)
-            .map(|index| MidiEvent {
-                sample_offset: 0,
-                kind: MidiEventKind::NoteOn {
-                    note: 36,
-                    velocity: 100,
-                    channel: (index % 16) as u8,
-                },
-            })
-            .collect();
+        let make_note_ons = |count: u32| -> Vec<MidiEvent> {
+            (0..count)
+                .map(|index| MidiEvent {
+                    sample_offset: 0,
+                    kind: MidiEventKind::NoteOn {
+                        note: 36,
+                        velocity: 100,
+                        channel: (index % 16) as u8,
+                    },
+                })
+                .collect()
+        };
 
-        let result = plugin.send_midi(&events);
+        let at_capacity = make_note_ons(256);
+        let result = plugin.send_midi(&at_capacity);
         assert!(
             result.is_ok(),
-            "200 queued MIDI events should all fit within the documented 256 capacity, got {result:?}"
+            "exactly 256 events (the documented capacity) should all be accepted, got {result:?}"
+        );
+
+        // send_midi never clears the queue itself -- only process()/
+        // process_multi_bus() does -- so the queue is still exactly full
+        // here: one more event must now be reported as dropped.
+        let one_more = make_note_ons(1);
+        let result = plugin.send_midi(&one_more);
+        assert!(
+            result.is_err(),
+            "a 257th event queued onto an already-full 256-capacity queue must be reported as dropped, got {result:?}"
         );
     }
 
