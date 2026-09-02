@@ -369,6 +369,14 @@ tresult PLUGIN_API ComponentHandler::queryInterface(const TUID _iid, void** obj)
     return kNoInterface;
 }
 
+// Capacity of RackVST3Plugin::input_events/output_events, in events. Chosen
+// to match src/vst3/instance.rs's OUTPUT_MIDI_SCRATCH_CAPACITY (256), which
+// documents this as the real, effective cap on how many MIDI events a
+// single process() call can carry in either direction -- Steinberg's
+// EventList defaults its maxSize to 50 when default-constructed, which is
+// smaller than that documented capacity unless overridden here.
+static constexpr int32 kEventListCapacity = 256;
+
 // Internal plugin state
 struct RackVST3Plugin {
     // Module and factory
@@ -415,8 +423,8 @@ struct RackVST3Plugin {
     HostProcessData process_data;
     ParameterChanges input_param_changes;
     ParameterChanges output_param_changes;
-    EventList input_events;
-    EventList output_events;
+    EventList input_events{kEventListCapacity};
+    EventList output_events{kEventListCapacity};
 
     // Process context: tempo/playback state the plugin reads on every
     // process() call. Built once in initialize(), then kept live by
@@ -428,6 +436,15 @@ struct RackVST3Plugin {
     // dummy_buf: a silent buffer shared across all aux output buses that we
     // don't capture. The plugin may write to these; we ignore the contents.
     std::vector<float> dummy_buf;
+    // input_silence_buf: a zeroed buffer shared across all input buses no
+    // caller has fed real audio into for a given process call (every input
+    // bus beyond bus 0, plus bus 0 itself when the caller passes zero
+    // channels). Unlike dummy_buf, this is read BY the plugin, not written
+    // TO by it, so it must actually contain silence rather than arbitrary
+    // leftover data -- it is zeroed once here and never written to again,
+    // which holds only because a well-behaved plugin never writes into an
+    // input buffer (the VST3 spec reserves that for the host).
+    std::vector<float> input_silence_buf;
     std::vector<float*> input_ptrs;
     std::vector<float*> output_ptrs;
 
@@ -456,6 +473,52 @@ struct RackVST3Plugin {
     };
     std::vector<PresetInfo> presets;
 };
+
+// Rebinds every output bus's channel pointers back to the plugin's shared
+// dummy (silent, write-only) buffer, and every input bus's channel pointers
+// back to its shared silence (zeroed, read-only) buffer. Called at the start
+// of every process()/process_multi_bus() call, before that call's own
+// bus-0/extra-bus buffers are bound over it.
+//
+// This is the fix for two related bugs: (1) a bus a caller bound a real
+// buffer into on a previous call, then omits from a later call (or calls
+// rack_vst3_plugin_process, which only ever rebinds bus 0), would otherwise
+// keep pointing at that caller-owned buffer forever -- a VST3 plugin writes
+// every *activated* output bus on every process() call, so that stale
+// pointer is a use-after-free the moment the caller's backing storage goes
+// away. (2) every declared input bus is activated during initialize (so a
+// plugin sees it as connected), but only bus 0 (and, since this fix, every
+// bus reset here) is ever pointed at real memory -- without this, a bus
+// beyond 0 stays null and a plugin that unconditionally reads an activated
+// input bus null-derefs.
+//
+// O(total channel count across all buses) per call: a small, fixed,
+// allocation-free cost, matching this file's real-time-safety requirements.
+static void reset_bus_bindings(RackVST3Plugin* plugin) {
+    float* dummy_ptr = plugin->dummy_buf.data();
+    for (int32 b = 0; b < plugin->process_data.numOutputs; ++b) {
+        AudioBusBuffers& bus = plugin->process_data.outputs[b];
+        for (int32 ch = 0; ch < bus.numChannels; ++ch) {
+            bus.channelBuffers32[ch] = dummy_ptr;
+        }
+    }
+
+    float* silence_ptr = plugin->input_silence_buf.data();
+    for (int32 b = 0; b < plugin->process_data.numInputs; ++b) {
+        AudioBusBuffers& bus = plugin->process_data.inputs[b];
+        for (int32 ch = 0; ch < bus.numChannels; ++ch) {
+            bus.channelBuffers32[ch] = silence_ptr;
+        }
+    }
+}
+
+// Forward declarations: defined below under "State helpers", but also
+// needed by rack_vst3_plugin_free and rack_vst3_plugin_reset (defined
+// earlier in the file) so teardown and reset follow the exact same
+// setProcessing(false)-before-setActive(false) lifecycle order every other
+// suspend point in this file uses.
+static void suspend_for_state(RackVST3Plugin* plugin);
+static void resume_after_state(RackVST3Plugin* plugin, double post_activate_pump_seconds = 0.0);
 
 // ============================================================================
 // Plugin Instance Implementation
@@ -571,10 +634,15 @@ void rack_vst3_plugin_free(RackVST3Plugin* plugin) {
 
     std::lock_guard<std::mutex> lock(rack_vst3_module_load_mutex());
 
-    // Deactivate if active
-    if (plugin->initialized && plugin->component) {
-        plugin->component->setActive(false);
-    }
+    // VST3 lifecycle order is setProcessing(false), then setActive(false),
+    // then terminate() -- initialize() leaves the plugin with
+    // setProcessing(true) already in effect, so teardown must undo that
+    // first. suspend_for_state does exactly this (and is a no-op if the
+    // plugin was never initialized), ignoring the plugin's return values the
+    // same way setActive's own return value is already ignored just below:
+    // a plugin refusing to stop processing must not block cleanup, since the
+    // plugin is being destroyed regardless.
+    suspend_for_state(plugin);
 
     // Disconnect connection points
     if (plugin->component_cp && plugin->controller_cp) {
@@ -739,17 +807,19 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
     // pointers, the destructor would try to free our Rust memory).
     plugin->process_data.prepare(*plugin->component, 0, kSample32);
 
-    // Allocate a silent dummy buffer for aux output buses we don't capture.
+    // Allocate a silent dummy buffer for aux output buses we don't capture,
+    // and a zeroed silence buffer for input buses no caller feeds (see
+    // reset_bus_bindings for why these must be two distinct buffers rather
+    // than one shared between input and output).
     plugin->dummy_buf.assign(max_block_size, 0.0f);
-    float* dummy_ptr = plugin->dummy_buf.data();
+    plugin->input_silence_buf.assign(max_block_size, 0.0f);
 
-    // Point all output buses at the dummy buffer by default.
-    for (int32 b = 0; b < plugin->process_data.numOutputs; ++b) {
-        AudioBusBuffers& bus = plugin->process_data.outputs[b];
-        for (int32 ch = 0; ch < bus.numChannels; ++ch) {
-            bus.channelBuffers32[ch] = dummy_ptr;
-        }
-    }
+    // Point every output bus at the dummy buffer and every input bus at the
+    // silence buffer by default; rack_vst3_plugin_process[_multi_bus] repeat
+    // this same reset on every call so a bus a caller previously bound real
+    // audio into, then later omits, can never keep pointing at that stale
+    // memory (see reset_bus_bindings's own doc comment).
+    reset_bus_bindings(plugin);
 
     // Set up the process context once; tempo/kPlaying start at this
     // placeholder 120 BPM/playing default and are kept live afterward by
@@ -795,6 +865,24 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
                 plugin->parameters.push_back(info);
             }
         }
+
+        // Pre-create one ParameterValueQueue per known parameter now, up
+        // front, rather than letting ParameterChanges::addParameterData grow
+        // its `queues` vector lazily on first use. addParameterData only
+        // takes its allocation-free reuse branch (queues[usedQueueCount]) once
+        // usedQueueCount < queues.size(); clearQueue() resets usedQueueCount
+        // to 0 every process() call but never shrinks queues, so without this,
+        // the *first* process block in which the number of distinct
+        // parameters queued exceeds every previous block's count still
+        // allocates -- including, for output_param_changes, an allocation
+        // triggered by the plugin's own internal code while already running
+        // on the audio thread inside process(). Both queues are sized to the
+        // full known parameter count so rack_vst3_plugin_queue_parameter_change
+        // (which only ever queues indices already validated against
+        // plugin->parameters) can genuinely guarantee no allocation once
+        // initialize() has returned.
+        plugin->input_param_changes.setMaxParameters(static_cast<int32>(plugin->parameters.size()));
+        plugin->output_param_changes.setMaxParameters(static_cast<int32>(plugin->parameters.size()));
 
         // Query IMidiMapping to find which parameter handles MIDI Program Change.
     }
@@ -845,10 +933,24 @@ int rack_vst3_plugin_reset(RackVST3Plugin* plugin) {
         return RACK_VST3_ERROR_NOT_INITIALIZED;
     }
 
-    // VST3 doesn't have a direct "reset" like AudioUnit
-    // We can deactivate and reactivate the component
-    plugin->component->setActive(false);
+    // VST3 doesn't have a direct "reset" like AudioUnit; deactivating and
+    // reactivating the component clears its internal buffers/delay lines.
+    // The teardown half must leave Processing state before deactivating --
+    // the same setProcessing(false)-before-setActive(false) order every
+    // other suspend point in this file uses (see suspend_for_state) -- and
+    // reset() must leave the plugin back in the same "ready to process"
+    // state initialize() itself leaves it in (Processing already
+    // restarted), since a caller may call process() immediately after a
+    // successful reset() and the VST3 spec does not define that call's
+    // behavior outside Processing state.
+    suspend_for_state(plugin);
+
     if (plugin->component->setActive(true) != kResultOk) {
+        return RACK_VST3_ERROR_GENERIC;
+    }
+
+    if (plugin->processor->setProcessing(true) != kResultOk) {
+        plugin->component->setActive(false);
         return RACK_VST3_ERROR_GENERIC;
     }
 
@@ -1001,6 +1103,14 @@ int rack_vst3_plugin_process(
     // Advance the timeline position so the plugin sees a moving clock.
     plugin->process_context.projectTimeSamples = plugin->sample_position;
     plugin->sample_position += frames;
+
+    // Reset every bus to its default (silent/dummy) binding before applying
+    // this call's own bus-0 buffers below. This function only ever rebinds
+    // bus 0, so without this reset any bus a previous
+    // rack_vst3_plugin_process_multi_bus call bound to a caller-owned buffer
+    // would keep pointing at it here -- see reset_bus_bindings's own doc
+    // comment.
+    reset_bus_bindings(plugin);
 
     // Set input buffers — write pointers INTO the prepare()-allocated float**
     // array rather than replacing the array pointer. This avoids freeing
@@ -1228,6 +1338,14 @@ int rack_vst3_plugin_process_multi_bus(
     plugin->process_context.projectTimeSamples = plugin->sample_position;
     plugin->sample_position += frames;
 
+    // Reset every bus to its default (silent/dummy) binding before applying
+    // this call's own bus-0 and extra-bus buffers below, so any bus this
+    // particular call's request omits -- one a previous call bound a real
+    // buffer into, or an input bus no caller has ever fed -- ends up
+    // pointing at shared silent/dummy storage rather than a stale
+    // caller-owned pointer. See reset_bus_bindings's own doc comment.
+    reset_bus_bindings(plugin);
+
     // Set input buffers — write pointers INTO the prepare()-allocated float**
     // array rather than replacing the array pointer. This avoids freeing
     // Rust-owned memory in HostProcessData::destroyBuffers().
@@ -1392,6 +1510,38 @@ int rack_vst3_plugin_set_parameter_by_id(RackVST3Plugin* plugin, uint32_t param_
         int32 point_index = 0;
         queue->addPoint(0, value, point_index);
     }
+    return RACK_VST3_OK;
+}
+
+// See this function's own doc comment in rack_vst3.h: unlike
+// rack_vst3_plugin_set_parameter[_by_id] above, this deliberately never
+// touches plugin->controller (no setParamNormalized call) -- only queues the
+// point into input_param_changes, the exact same queue
+// rack_vst3_plugin_process[_multi_bus] threads into
+// ProcessData::inputParameterChanges and clears after every call. That
+// makes this function real-time-safe and the two functions' controller-vs-
+// audio-thread scope the only difference between them.
+int rack_vst3_plugin_queue_parameter_change(RackVST3Plugin* plugin, uint32_t index, float value) {
+    if (!plugin || !plugin->controller) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+
+    if (index >= plugin->parameters.size()) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+
+    if (value < 0.0f) value = 0.0f;
+    if (value > 1.0f) value = 1.0f;
+
+    ParamID param_id = plugin->parameters[index].id;
+
+    int32 queue_index = 0;
+    IParamValueQueue* queue = plugin->input_param_changes.addParameterData(param_id, queue_index);
+    if (queue) {
+        int32 point_index = 0;
+        queue->addPoint(0, value, point_index);
+    }
+
     return RACK_VST3_OK;
 }
 
@@ -1806,7 +1956,7 @@ static void suspend_for_state(RackVST3Plugin* plugin) {
     plugin->component->setActive(false);
 }
 
-static void resume_after_state(RackVST3Plugin* plugin, double post_activate_pump_seconds = 0.0) {
+static void resume_after_state(RackVST3Plugin* plugin, double post_activate_pump_seconds) {
     if (!plugin->initialized) return;
     plugin->component->setActive(true);
     if (post_activate_pump_seconds > 0.0) {
@@ -2002,7 +2152,12 @@ int rack_vst3_plugin_send_midi(
         return RACK_VST3_OK;
     }
 
-    // Convert MIDI events to VST3 events
+    // Convert MIDI events to VST3 events. addEvent silently returns
+    // kResultFalse (dropping the event) once input_events reaches
+    // kEventListCapacity; track how many were dropped so this function can
+    // report it rather than let it pass as if every event succeeded.
+    uint32_t dropped_count = 0;
+
     for (uint32_t i = 0; i < event_count; ++i) {
         const auto& midi_event = events[i];
 
@@ -2020,7 +2175,9 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.noteOn.pitch = midi_event.data1;
                 vst3_event.noteOn.velocity = static_cast<float>(midi_event.data2) / 127.0f;
                 vst3_event.noteOn.noteId = -1;  // Not specified
-                plugin->input_events.addEvent(vst3_event);
+                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                    ++dropped_count;
+                }
                 break;
 
             case 0x80:  // Note Off
@@ -2029,7 +2186,9 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.noteOff.pitch = midi_event.data1;
                 vst3_event.noteOff.velocity = static_cast<float>(midi_event.data2) / 127.0f;
                 vst3_event.noteOff.noteId = -1;  // Not specified
-                plugin->input_events.addEvent(vst3_event);
+                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                    ++dropped_count;
+                }
                 break;
 
             case 0xA0:  // Polyphonic Key Pressure (Aftertouch)
@@ -2037,7 +2196,9 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.polyPressure.channel = midi_event.channel;
                 vst3_event.polyPressure.pitch = midi_event.data1;
                 vst3_event.polyPressure.pressure = static_cast<float>(midi_event.data2) / 127.0f;
-                plugin->input_events.addEvent(vst3_event);
+                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                    ++dropped_count;
+                }
                 break;
 
             case 0xB0:  // Control Change
@@ -2048,7 +2209,9 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.midiCCOut.controlNumber = midi_event.data1;
                 vst3_event.midiCCOut.value = midi_event.data2;
                 vst3_event.midiCCOut.value2 = 0;
-                plugin->input_events.addEvent(vst3_event);
+                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                    ++dropped_count;
+                }
                 break;
 
             case 0xC0:  // Program Change
@@ -2060,7 +2223,9 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.midiCCOut.controlNumber = 0x80;  // >= 0x80 indicates non-CC MIDI
                 vst3_event.midiCCOut.value = midi_event.data1;
                 vst3_event.midiCCOut.value2 = 0;
-                plugin->input_events.addEvent(vst3_event);
+                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                    ++dropped_count;
+                }
                 break;
 
             case 0xD0:  // Channel Pressure (Aftertouch)
@@ -2072,7 +2237,9 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.midiCCOut.controlNumber = 0x81;  // >= 0x80 indicates non-CC MIDI
                 vst3_event.midiCCOut.value = midi_event.data1;
                 vst3_event.midiCCOut.value2 = 0;
-                plugin->input_events.addEvent(vst3_event);
+                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                    ++dropped_count;
+                }
                 break;
 
             case 0xE0: {  // Pitch Bend
@@ -2085,7 +2252,9 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.midiCCOut.controlNumber = 0x82;  // >= 0x80 indicates non-CC MIDI
                 vst3_event.midiCCOut.value = midi_event.data1;   // LSB
                 vst3_event.midiCCOut.value2 = midi_event.data2;  // MSB
-                plugin->input_events.addEvent(vst3_event);
+                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                    ++dropped_count;
+                }
                 break;
             }
 
@@ -2093,6 +2262,17 @@ int rack_vst3_plugin_send_midi(
                 // Unknown MIDI event - skip it
                 continue;
         }
+    }
+
+    // Every event that fit was already queued above; report truncation
+    // rather than silently discarding the events beyond capacity, so a
+    // caller flooding the queue faster than process() drains it can find
+    // out. This mirrors the equivalent decision documented for
+    // rack_vst3_plugin_process_multi_bus's own output-MIDI capture (report
+    // truncation via a count, don't fail the whole call retroactively for
+    // work already done).
+    if (dropped_count > 0) {
+        return RACK_VST3_ERROR_EVENT_QUEUE_FULL;
     }
 
     return RACK_VST3_OK;

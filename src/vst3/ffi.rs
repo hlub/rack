@@ -86,6 +86,9 @@ pub const RACK_VST3_ERROR_INVALID_PARAM: c_int = -3;
 pub const RACK_VST3_ERROR_NOT_INITIALIZED: c_int = -4;
 pub const RACK_VST3_ERROR_LOAD_FAILED: c_int = -5;
 pub const RACK_VST3_ERROR_NOT_SUPPORTED: c_int = -6;
+/// One or more MIDI events passed to `rack_vst3_plugin_send_midi` were
+/// dropped because the plugin's input event queue was already full.
+pub const RACK_VST3_ERROR_EVENT_QUEUE_FULL: c_int = -7;
 
 extern "C" {
     // ============================================================================
@@ -518,7 +521,11 @@ extern "C" {
         value: *mut f32,
     ) -> c_int;
 
-    /// Set parameter value (normalized 0.0 to 1.0)
+    /// Set parameter value (normalized 0.0 to 1.0). ALSO calls
+    /// `IEditController::setParamNormalized` synchronously on whatever
+    /// thread calls this function, so it is NOT real-time-safe -- see
+    /// `rack_vst3_plugin_queue_parameter_change` for the audio-thread-safe
+    /// equivalent, which skips that controller call.
     ///
     /// # Returns
     ///
@@ -530,6 +537,7 @@ extern "C" {
     /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
     /// - `index` must be less than parameter count
     /// - `value` should be in range 0.0-1.0 (values outside may be clamped)
+    /// - Must not be called from an audio/real-time thread (see above).
     pub fn rack_vst3_plugin_set_parameter(
         plugin: *mut RackVST3Plugin,
         index: u32,
@@ -539,6 +547,40 @@ extern "C" {
     pub fn rack_vst3_plugin_set_parameter_by_id(
         plugin: *mut RackVST3Plugin,
         param_id: u32,
+        value: f32,
+    ) -> c_int;
+
+    /// Queue a normalized parameter value change for delivery on the next
+    /// `rack_vst3_plugin_process`/`rack_vst3_plugin_process_multi_bus` call,
+    /// via VST3's `IParameterChanges` per-block automation mechanism.
+    ///
+    /// Unlike `rack_vst3_plugin_set_parameter`, this never calls
+    /// `IEditController::setParamNormalized`, so it is real-time-safe and
+    /// may be called from the audio thread immediately before a process
+    /// call. The tradeoff: the plugin's controller/GUI will not reflect the
+    /// change (use `rack_vst3_plugin_set_parameter` from a non-realtime
+    /// thread when that matters, e.g. loading a preset).
+    ///
+    /// Real-time-safe means genuinely allocation-free here: `initialize()`
+    /// pre-creates one queue slot per known parameter (via
+    /// `ParameterChanges::setMaxParameters`) before returning, so no call
+    /// this function makes can grow the underlying queue's storage.
+    ///
+    /// # Returns
+    ///
+    /// - 0 on success
+    /// - Negative error code (e.g. out-of-range `index`) on failure
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    /// - `index` must be less than parameter count
+    /// - `value` should be in range 0.0-1.0 (values outside are clamped)
+    /// - Must not be called concurrently with a process call or other
+    ///   plugin operations on the same plugin.
+    pub fn rack_vst3_plugin_queue_parameter_change(
+        plugin: *mut RackVST3Plugin,
+        index: u32,
         value: f32,
     ) -> c_int;
 
@@ -557,9 +599,10 @@ extern "C" {
     /// # Safety
     ///
     /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
-    /// - Unlike `rack_vst3_plugin_set_parameter`, this writes the plugin's
-    ///   process context directly with no queuing or locking -- the caller
-    ///   must call this only from the same thread that calls
+    /// - Unlike `rack_vst3_plugin_queue_parameter_change` (queued for the
+    ///   audio thread to apply on its own next process call), this writes
+    ///   the plugin's process context directly with no queuing or locking
+    ///   -- the caller must call this only from the same thread that calls
     ///   `rack_vst3_plugin_process`, immediately before it, never
     ///   concurrently with a `process` call in flight.
     /// - `playing` is nonzero for "transport playing", zero for "stopped".

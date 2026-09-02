@@ -119,6 +119,48 @@ pub trait PluginInstance: Send {
     /// Set the value of a parameter (normalized 0.0 to 1.0)
     fn set_parameter(&mut self, index: usize, value: f32) -> Result<()>;
 
+    /// Queue a normalized parameter value change (0.0 to 1.0) for delivery
+    /// to the plugin's audio processor, using each backend's real-time-safe
+    /// delivery mechanism where one exists.
+    ///
+    /// This exists as a distinct method from [`set_parameter`](Self::set_parameter)
+    /// because, on backends with one, the real-time-safe delivery path
+    /// (VST3's per-block `IParameterChanges` automation queue, for example)
+    /// is achieved by deliberately *not* performing part of what
+    /// `set_parameter` does (VST3's `IEditController::setParamNormalized`
+    /// controller/GUI-sync call, which can do arbitrary non-realtime work).
+    /// The tradeoff is the same wherever it applies: the plugin's
+    /// controller/GUI will not observe a change made this way. Use
+    /// `set_parameter` from a non-realtime thread instead when the
+    /// controller/GUI must reflect the change (e.g. loading a preset).
+    ///
+    /// # Real-time safety by backend
+    ///
+    /// - **VST3**: real-time-safe once the plugin has been initialized (see
+    ///   the VST3 backend's own doc on its override). Safe to call from an
+    ///   audio thread immediately before [`process`](Self::process).
+    /// - **AudioUnit**: NOT real-time-safe. This crate's AudioUnit backend
+    ///   has no native scheduled-parameter mechanism wired up today (Apple's
+    ///   `AudioUnitScheduleParameters` API could provide one, but adding
+    ///   that is out of scope here), so it falls back to the same
+    ///   synchronous `AudioUnitSetParameter` call `set_parameter` uses, and
+    ///   inherits its non-realtime-safety. Do not call this from an audio
+    ///   thread when targeting AudioUnit.
+    /// - **Any other/future implementer** that does not override this
+    ///   method inherits the default body below, which simply forwards to
+    ///   `set_parameter` -- correct but NOT real-time-safe, matching the
+    ///   AudioUnit backend's own explicit fallback. A backend that gains a
+    ///   genuine real-time-safe delivery mechanism should override this
+    ///   method to use it, the way the VST3 backend does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `index` is out of range, or if the plugin is not
+    /// initialized.
+    fn queue_parameter_change(&mut self, index: usize, value: f32) -> Result<()> {
+        self.set_parameter(index, value)
+    }
+
     /// Send MIDI events to the plugin
     ///
     /// This is primarily useful for instrument plugins (synthesizers, samplers).
@@ -170,6 +212,11 @@ pub trait PluginInstance: Send {
     /// - The plugin doesn't support MIDI (e.g., most effect plugins)
     /// - Any event has invalid data (channel > 15, etc.)
     /// - The plugin is not initialized
+    /// - (VST3) The plugin's input event queue was already full: every event
+    ///   that fit was still delivered, but one or more trailing events in
+    ///   `events` were dropped. This is rare in practice -- the queue is
+    ///   drained by every `process`/`process_multi_bus` call -- but is
+    ///   surfaced rather than silently discarded.
     fn send_midi(&mut self, events: &[MidiEvent]) -> Result<()>;
 
     /// Get the number of factory presets

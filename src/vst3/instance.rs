@@ -174,15 +174,16 @@ impl Vst3Plugin {
     /// next `process()` call observes the host's real, current transport
     /// instead of whatever it was initialized with.
     ///
-    /// Unlike [`set_parameter`](PluginInstance::set_parameter) (queued for
-    /// the audio thread to apply on its own next `process()` call), this
-    /// writes directly into the plugin's persistent process context struct
-    /// with no queuing or locking on the C++ side -- callers MUST only call
-    /// this from the same thread that also calls `process()`, immediately
-    /// before it, never concurrently with a `process()` call in flight. The
-    /// one real caller (`backline::signal_graph_audio`'s per-block transport
-    /// publish step) already satisfies this by construction: it runs inside
-    /// the same audio-callback invocation that then calls `process()`.
+    /// Unlike [`queue_parameter_change`](PluginInstance::queue_parameter_change)
+    /// (queued for the audio thread to apply on its own next `process()`
+    /// call), this writes directly into the plugin's persistent process
+    /// context struct with no queuing or locking on the C++ side -- callers
+    /// MUST only call this from the same thread that also calls `process()`,
+    /// immediately before it, never concurrently with a `process()` call in
+    /// flight. The one real caller (`backline::signal_graph_audio`'s
+    /// per-block transport publish step) already satisfies this by
+    /// construction: it runs inside the same audio-callback invocation that
+    /// then calls `process()`.
     ///
     /// # Errors
     ///
@@ -1138,6 +1139,39 @@ impl PluginInstance for Vst3Plugin {
         }
     }
 
+    /// Real-time-safe VST3 implementation: queues the point into VST3's
+    /// `IParameterChanges` per-block automation mechanism -- the same
+    /// delivery path real VST3 hosts use for automation -- without ever
+    /// calling `IEditController::setParamNormalized`. See this method's
+    /// trait-level doc ([`PluginInstance::queue_parameter_change`]) for the
+    /// cross-backend contract; here specifically, once `initialize()` has
+    /// run (which pre-sizes the underlying parameter-change queue via
+    /// `setMaxParameters`, so this never allocates), this method is
+    /// real-time-safe and is the correct method to call from the audio
+    /// thread immediately before a process call. The tradeoff: the
+    /// plugin's controller/GUI does not observe the change this way -- use
+    /// `set_parameter`/[`set_param_by_id`](Self::set_param_by_id) from a
+    /// non-realtime thread instead when that matters (e.g. loading a preset
+    /// from the main thread).
+    ///
+    /// The queued point is delivered at sample offset 0 of the very next
+    /// process call; the underlying queue is cleared after every process
+    /// call, so nothing queued here is ever left stale for a later,
+    /// unrelated process call.
+    fn queue_parameter_change(&mut self, index: usize, value: f32) -> Result<()> {
+        unsafe {
+            let result = ffi::rack_vst3_plugin_queue_parameter_change(
+                self.inner.as_ptr(),
+                index as u32,
+                value,
+            );
+            if result != ffi::RACK_VST3_OK {
+                return Err(map_error(result));
+            }
+            Ok(())
+        }
+    }
+
     fn send_midi(&mut self, events: &[MidiEvent]) -> Result<()> {
         if !self.is_initialized() {
             return Err(Error::NotInitialized);
@@ -1284,7 +1318,9 @@ impl PluginInstance for Vst3Plugin {
         }
 
         unsafe {
-            // Get state size
+            // Get state size: a generous initial guess (see
+            // rack_vst3_plugin_get_state_size's own doc comment for why it
+            // is a guess rather than a real measurement).
             let size = ffi::rack_vst3_plugin_get_state_size(self.inner.as_ptr());
             if size <= 0 {
                 return Err(Error::Other("Failed to get plugin state size".to_string()));
@@ -1295,11 +1331,42 @@ impl PluginInstance for Vst3Plugin {
             let mut actual_size = data.len();
 
             // Get state data
-            let result = ffi::rack_vst3_plugin_get_state(
+            let mut result = ffi::rack_vst3_plugin_get_state(
                 self.inner.as_ptr(),
                 data.as_mut_ptr(),
                 &mut actual_size,
             );
+
+            // rack_vst3_plugin_get_state's contract: when the real state is
+            // larger than the buffer we gave it, it fails but still writes
+            // the true required size back through `actual_size` (and does
+            // not touch it on any other kind of failure, so this condition
+            // can only be true after that specific overflow). Retry once
+            // with a buffer sized to that real requirement instead of
+            // failing outright -- a state above the initial guess is rare
+            // but not invalid.
+            //
+            // Known accepted risk: each rack_vst3_plugin_get_state call
+            // brackets its own getState with a full suspend/resume cycle
+            // (setProcessing(false)/setActive(false) then setActive(true)/
+            // setProcessing(true)), so retrying here means two such cycles
+            // run back to back for this one logical get_state() -- exactly
+            // the pattern rack_vst3_plugin_get_state_size's own comment
+            // warns crashes some JUCE plugins (AD2 included) when done for
+            // an ordinary size-then-fetch. This is deliberately accepted
+            // rather than avoided: it only triggers for the rare case of a
+            // real state exceeding the initial guess, and failing outright
+            // instead would be strictly worse for that caller.
+            if result != ffi::RACK_VST3_OK && actual_size > data.len() {
+                data = vec![0u8; actual_size];
+                let mut retry_size = data.len();
+                result = ffi::rack_vst3_plugin_get_state(
+                    self.inner.as_ptr(),
+                    data.as_mut_ptr(),
+                    &mut retry_size,
+                );
+                actual_size = retry_size;
+            }
 
             if result != ffi::RACK_VST3_OK {
                 return Err(map_error(result));
@@ -1362,6 +1429,24 @@ mod tests {
         }
 
         Ok((scanner, plugins[0].clone()))
+    }
+
+    /// Finds an installed VST3 plugin whose name contains `needle`
+    /// (case-insensitive), for tests that need a specific plugin's bus
+    /// layout (e.g. a real multi-output-bus or sidechain-input-bus plugin)
+    /// rather than whatever the first scanned plugin happens to be. Returns
+    /// `None` (rather than an `Err`) so call sites can uniformly skip with a
+    /// message when the machine running the test doesn't have that plugin
+    /// installed, matching this module's existing tolerance for a
+    /// plugin-less test environment.
+    fn find_plugin_by_name(needle: &str) -> Option<(crate::vst3::Vst3Scanner, PluginInfo)> {
+        let scanner = crate::vst3::Vst3Scanner::new().ok()?;
+        let plugins = scanner.scan().ok()?;
+        let needle_lower = needle.to_lowercase();
+        let info = plugins
+            .into_iter()
+            .find(|plugin| plugin.name.to_lowercase().contains(&needle_lower))?;
+        Some((scanner, info))
     }
 
     #[test]
@@ -1610,5 +1695,363 @@ mod tests {
     fn decode_unknown_status_returns_none() {
         // 0xF0 (system) has no channel-voice MidiEventKind mapping here.
         assert!(rack_midi_to_midi_event(&raw_event(0, 0xF0, 0, 0, 0)).is_none());
+    }
+
+    // -- Regression tests for the stale-extra-output-bus-pointer /
+    // -- unfed-second-input-bus bug fixes below. These need a real
+    // -- installed VST3 plugin with a specific bus layout (a multi-output-
+    // -- bus instrument, or an effect with a genuine second input bus), so
+    // -- each looks up a specific plugin by name and skips (rather than
+    // -- failing) when the machine running the test doesn't have it
+    // -- installed -- the same tolerance every other test in this module
+    // -- already has for a plugin-less environment.
+
+    #[test]
+    fn process_multi_bus_resets_bus_no_longer_requested() {
+        // Addictive Drums 2 declares 14 output buses (bus 0 "Master" plus 13
+        // per-instrument buses) and 0 input buses -- a real fixture for the
+        // stale-extra-output-bus-pointer bug (rack_vst3_plugin_process_
+        // multi_bus used to leave a bus's process_data pointer bound to
+        // whatever buffer a previous call passed for it, forever, once that
+        // bus stopped being requested).
+        let Some((scanner, info)) = find_plugin_by_name("Addictive Drums 2") else {
+            println!("Skipping test - Addictive Drums 2 not installed");
+            return;
+        };
+
+        let mut plugin = scanner.load(&info).expect("AD2 should load");
+        plugin.initialize(48000.0, 512).expect("AD2 should initialize");
+
+        assert!(
+            plugin.output_bus_count() > 1,
+            "AD2 should declare more than one output bus"
+        );
+        let bus_index = 1u32; // "Kick" per AD2's documented bus layout
+        let extra_channels = plugin
+            .output_bus_channel_count(bus_index as usize)
+            .expect("AD2 bus 1 should exist");
+        assert_eq!(extra_channels, 1, "AD2's Kick bus is documented as mono");
+
+        let num_frames = 64usize;
+        let mut main_left = vec![0.0f32; num_frames];
+        let mut main_right = vec![0.0f32; num_frames];
+        let mut extra_buf = vec![777.0f32; num_frames];
+
+        // Call 1: bind bus 1 to extra_buf and process. AD2's process_data
+        // now points bus 1's channel(s) directly at extra_buf.
+        {
+            let mut extra_channel_slices: Vec<&mut [f32]> = vec![extra_buf.as_mut_slice()];
+            let mut extra_outputs = [ExtraOutputBus {
+                bus_index,
+                channels: &mut extra_channel_slices[..],
+            }];
+            let mut main_outputs: Vec<&mut [f32]> =
+                vec![main_left.as_mut_slice(), main_right.as_mut_slice()];
+            plugin
+                .process_multi_bus(
+                    &[],
+                    &[],
+                    &mut main_outputs[..],
+                    &mut extra_outputs[..],
+                    num_frames,
+                    None,
+                )
+                .expect("first process_multi_bus call (bus 1 requested) should succeed");
+        }
+
+        // Refill extra_buf with a sentinel AD2 would not otherwise produce,
+        // so any write to it during call 2 is unambiguous.
+        const SENTINEL: f32 = 555.0;
+        extra_buf.fill(SENTINEL);
+
+        // Call 2: omit bus 1 entirely. Before the fix, AD2's
+        // process_data.outputs[1] would still point at extra_buf from call
+        // 1 above, and AD2 -- like every VST3 plugin -- computes every
+        // activated output bus on every process() call regardless of
+        // whether the host captures it, so it would overwrite extra_buf
+        // here even though this call never mentions bus 1.
+        {
+            let mut main_outputs: Vec<&mut [f32]> =
+                vec![main_left.as_mut_slice(), main_right.as_mut_slice()];
+            plugin
+                .process_multi_bus(&[], &[], &mut main_outputs[..], &mut [], num_frames, None)
+                .expect("second process_multi_bus call (bus 1 omitted) should succeed");
+        }
+
+        assert!(
+            extra_buf.iter().all(|&sample| sample == SENTINEL),
+            "bus 1's buffer must not be written to once a later call stops \
+             requesting it -- got {extra_buf:?}, expected untouched sentinel {SENTINEL}"
+        );
+    }
+
+    #[test]
+    fn process_leaves_unfed_second_input_bus_silent_not_null() {
+        // TDR Nova and soothe2 both declare a real second (sidechain) input
+        // bus on macOS -- a fixture for the unfed-second-input-bus bug
+        // (every declared input bus is activated during initialize, but
+        // only bus 0 was ever pointed at real memory; a plugin that reads
+        // an activated bus unconditionally would null-deref on any other
+        // bus).
+        let Some((scanner, info)) =
+            find_plugin_by_name("TDR Nova").or_else(|| find_plugin_by_name("soothe2"))
+        else {
+            println!("Skipping test - no installed plugin with a second input bus found");
+            return;
+        };
+
+        let mut plugin = scanner.load(&info).expect("plugin should load");
+        plugin.initialize(48000.0, 512).expect("plugin should initialize");
+
+        assert!(
+            plugin.input_bus_channel_count(1).is_some(),
+            "test plugin must declare a second (sidechain) input bus"
+        );
+
+        let num_frames = 64usize;
+        let input_channels = plugin.input_channels();
+        let output_channels = plugin.output_channels();
+        let in_bufs: Vec<Vec<f32>> = (0..input_channels).map(|_| vec![0.0f32; num_frames]).collect();
+        let in_slices: Vec<&[f32]> = in_bufs.iter().map(|buffer| buffer.as_slice()).collect();
+        let mut out_bufs: Vec<Vec<f32>> =
+            (0..output_channels).map(|_| vec![0.0f32; num_frames]).collect();
+        let mut out_slices: Vec<&mut [f32]> =
+            out_bufs.iter_mut().map(|buffer| buffer.as_mut_slice()).collect();
+
+        // Bus 1 (the sidechain) is activated but this call, like every
+        // `process()` call, only ever feeds bus 0 -- exactly the condition
+        // that used to null-deref inside the plugin before this fix.
+        let result = plugin.process(&in_slices, &mut out_slices, num_frames);
+        assert!(
+            result.is_ok(),
+            "process() with an unfed second input bus should succeed, got {result:?}"
+        );
+
+        // Also exercise process_multi_bus's own reset (a separate code path
+        // that shares the same underlying reset_bus_bindings fix).
+        let in_slices: Vec<&[f32]> = in_bufs.iter().map(|buffer| buffer.as_slice()).collect();
+        let mut out_slices: Vec<&mut [f32]> =
+            out_bufs.iter_mut().map(|buffer| buffer.as_mut_slice()).collect();
+        let result =
+            plugin.process_multi_bus(&in_slices, &[], &mut out_slices, &mut [], num_frames, None);
+        assert!(
+            result.is_ok(),
+            "process_multi_bus with an unfed second input bus should succeed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn send_midi_boundary_at_documented_capacity() {
+        // Boundary-precise regression test tied to the documented 256-event
+        // capacity value itself, rather than an arbitrary count that merely
+        // happens to sit below it (an earlier version of this test sent 200
+        // events and only asserted success -- code review pointed out that
+        // assertion would have passed even against the pre-fix code, which
+        // never checked addEvent's return value and always reported OK
+        // regardless of how many events were actually dropped, so it never
+        // proved the capacity had genuinely changed). Sending exactly 256
+        // events -- filling the queue exactly to its documented capacity --
+        // must succeed with none dropped; one further event queued on top of
+        // an already-full queue must then be reported as dropped. This
+        // combination fails if the real capacity is either smaller than 256
+        // (the first send would already report a drop) or larger (the
+        // second send would not).
+        //
+        // What this does NOT prove: whether AD2's own audio-thread event
+        // processing actually received and acted on each of the 256 host-
+        // side-accepted events -- this crate has no fixture or mechanism to
+        // introspect an instrument plugin's internal event handling that
+        // deeply. What it proves precisely is that the host-side queue
+        // (RackVST3Plugin::input_events) accepts exactly 256 events with no
+        // truncation and starts truncating at the 257th, matching
+        // kEventListCapacity's documented value exactly.
+        let Some((scanner, info)) = find_plugin_by_name("Addictive Drums 2") else {
+            println!("Skipping test - Addictive Drums 2 not installed");
+            return;
+        };
+        let mut plugin = scanner.load(&info).expect("AD2 should load");
+        plugin.initialize(48000.0, 512).expect("AD2 should initialize");
+
+        let make_note_ons = |count: u32| -> Vec<MidiEvent> {
+            (0..count)
+                .map(|index| MidiEvent {
+                    sample_offset: 0,
+                    kind: MidiEventKind::NoteOn {
+                        note: 36,
+                        velocity: 100,
+                        channel: (index % 16) as u8,
+                    },
+                })
+                .collect()
+        };
+
+        let at_capacity = make_note_ons(256);
+        let result = plugin.send_midi(&at_capacity);
+        assert!(
+            result.is_ok(),
+            "exactly 256 events (the documented capacity) should all be accepted, got {result:?}"
+        );
+
+        // send_midi never clears the queue itself -- only process()/
+        // process_multi_bus() does -- so the queue is still exactly full
+        // here: one more event must now be reported as dropped.
+        let one_more = make_note_ons(1);
+        let result = plugin.send_midi(&one_more);
+        assert!(
+            result.is_err(),
+            "a 257th event queued onto an already-full 256-capacity queue must be reported as dropped, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn send_midi_reports_truncation_past_documented_capacity() {
+        // 300 events exceeds the documented/configured 256-event capacity,
+        // so the queue-full condition must now be surfaced as an error
+        // rather than silently discarding the overflow (the pre-fix
+        // behavior, which additionally overflowed at the undocumented,
+        // much lower default of 50).
+        let Some((scanner, info)) = find_plugin_by_name("Addictive Drums 2") else {
+            println!("Skipping test - Addictive Drums 2 not installed");
+            return;
+        };
+        let mut plugin = scanner.load(&info).expect("AD2 should load");
+        plugin.initialize(48000.0, 512).expect("AD2 should initialize");
+
+        let events: Vec<MidiEvent> = (0..300u32)
+            .map(|index| MidiEvent {
+                sample_offset: 0,
+                kind: MidiEventKind::NoteOn {
+                    note: 36,
+                    velocity: 100,
+                    channel: (index % 16) as u8,
+                },
+            })
+            .collect();
+
+        let result = plugin.send_midi(&events);
+        assert!(
+            result.is_err(),
+            "300 events should overflow the documented 256-event capacity and be reported"
+        );
+    }
+
+    #[test]
+    fn reset_leaves_plugin_ready_to_process_again() {
+        // rack_vst3_plugin_reset used to leave the plugin deactivated then
+        // reactivated but never re-issued setProcessing(true), violating
+        // the VST3 lifecycle order this fix restores. A process() call
+        // immediately after reset() is exactly the sequence a real caller
+        // (e.g. drumr's own pattern-clear/panic-reset path) performs.
+        //
+        // Note: whether a given plugin's own process() implementation
+        // actually enforces "must be in Processing state" strongly enough
+        // to fail observably when it isn't is plugin-dependent; this test
+        // exercises the correct lifecycle call sequence and documents the
+        // expected contract, but a plugin that tolerates the old, spec-
+        // violating sequence would not turn this test red on its own.
+        let (scanner, info) = match get_test_plugin() {
+            Ok(result) => result,
+            Err(_) => {
+                println!("Skipping test - no VST3 plugins found");
+                return;
+            }
+        };
+
+        let mut plugin = scanner.load(&info).expect("Plugin creation should succeed");
+        plugin
+            .initialize(48000.0, 512)
+            .expect("Plugin initialization should succeed");
+
+        let num_frames = 64usize;
+        let input_channels = plugin.input_channels();
+        let output_channels = plugin.output_channels();
+        let in_bufs: Vec<Vec<f32>> = (0..input_channels).map(|_| vec![0.0f32; num_frames]).collect();
+        let mut out_bufs: Vec<Vec<f32>> =
+            (0..output_channels).map(|_| vec![0.0f32; num_frames]).collect();
+
+        {
+            let in_slices: Vec<&[f32]> = in_bufs.iter().map(|buffer| buffer.as_slice()).collect();
+            let mut out_slices: Vec<&mut [f32]> =
+                out_bufs.iter_mut().map(|buffer| buffer.as_mut_slice()).collect();
+            plugin
+                .process(&in_slices, &mut out_slices, num_frames)
+                .expect("process() before reset should succeed");
+        }
+
+        plugin.reset().expect("reset() should succeed");
+
+        {
+            let in_slices: Vec<&[f32]> = in_bufs.iter().map(|buffer| buffer.as_slice()).collect();
+            let mut out_slices: Vec<&mut [f32]> =
+                out_bufs.iter_mut().map(|buffer| buffer.as_mut_slice()).collect();
+            let result = plugin.process(&in_slices, &mut out_slices, num_frames);
+            assert!(
+                result.is_ok(),
+                "process() after reset() should succeed, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_state_set_state_round_trip() {
+        // Exercises get_state's normal (no-retry) path end to end. The
+        // retry-on-overflow branch (the fix for real states larger than the
+        // 4 MB initial guess) only triggers for a state larger than that
+        // guess; no plugin installed on a real test machine is known to
+        // produce one, so that branch is covered by careful reading of
+        // rack_vst3_plugin_get_state's contract (see get_state's own
+        // comments) rather than by an automated test here.
+        let (scanner, info) = match get_test_plugin() {
+            Ok(result) => result,
+            Err(_) => {
+                println!("Skipping test - no VST3 plugins found");
+                return;
+            }
+        };
+
+        let mut plugin = scanner.load(&info).expect("Plugin creation should succeed");
+        plugin
+            .initialize(48000.0, 512)
+            .expect("Plugin initialization should succeed");
+
+        let state = plugin.get_state().expect("get_state should succeed");
+        assert!(!state.is_empty(), "state should not be empty");
+
+        plugin
+            .set_state(&state)
+            .expect("set_state with a just-captured state should succeed");
+    }
+
+    #[test]
+    fn queue_parameter_change_does_not_require_controller_call() {
+        // queue_parameter_change is the real-time-safe path added for the
+        // audio-thread parameter delivery gap: it must succeed on a real
+        // parameter index without touching the controller, and reject an
+        // out-of-range index the same way set_parameter already does.
+        let (scanner, info) = match get_test_plugin() {
+            Ok(result) => result,
+            Err(_) => {
+                println!("Skipping test - no VST3 plugins found");
+                return;
+            }
+        };
+
+        let mut plugin = scanner.load(&info).expect("Plugin creation should succeed");
+        plugin
+            .initialize(48000.0, 512)
+            .expect("Plugin initialization should succeed");
+
+        if plugin.parameter_count() == 0 {
+            println!("Plugin has no parameters, skipping queue_parameter_change test");
+            return;
+        }
+
+        plugin
+            .queue_parameter_change(0, 0.5)
+            .expect("queuing a real parameter index should succeed");
+
+        let out_of_range = plugin.parameter_count();
+        let result = plugin.queue_parameter_change(out_of_range, 0.5);
+        assert!(result.is_err(), "an out-of-range index should be rejected");
     }
 }
