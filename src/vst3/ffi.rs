@@ -561,6 +561,11 @@ extern "C" {
     /// change (use `rack_vst3_plugin_set_parameter` from a non-realtime
     /// thread when that matters, e.g. loading a preset).
     ///
+    /// Real-time-safe means genuinely allocation-free here: `initialize()`
+    /// pre-creates one queue slot per known parameter (via
+    /// `ParameterChanges::setMaxParameters`) before returning, so no call
+    /// this function makes can grow the underlying queue's storage.
+    ///
     /// # Returns
     ///
     /// - 0 on success

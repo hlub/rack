@@ -866,6 +866,24 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
             }
         }
 
+        // Pre-create one ParameterValueQueue per known parameter now, up
+        // front, rather than letting ParameterChanges::addParameterData grow
+        // its `queues` vector lazily on first use. addParameterData only
+        // takes its allocation-free reuse branch (queues[usedQueueCount]) once
+        // usedQueueCount < queues.size(); clearQueue() resets usedQueueCount
+        // to 0 every process() call but never shrinks queues, so without this,
+        // the *first* process block in which the number of distinct
+        // parameters queued exceeds every previous block's count still
+        // allocates -- including, for output_param_changes, an allocation
+        // triggered by the plugin's own internal code while already running
+        // on the audio thread inside process(). Both queues are sized to the
+        // full known parameter count so rack_vst3_plugin_queue_parameter_change
+        // (which only ever queues indices already validated against
+        // plugin->parameters) can genuinely guarantee no allocation once
+        // initialize() has returned.
+        plugin->input_param_changes.setMaxParameters(static_cast<int32>(plugin->parameters.size()));
+        plugin->output_param_changes.setMaxParameters(static_cast<int32>(plugin->parameters.size()));
+
         // Query IMidiMapping to find which parameter handles MIDI Program Change.
     }
 

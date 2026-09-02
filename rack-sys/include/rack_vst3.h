@@ -376,11 +376,13 @@ int rack_vst3_plugin_set_parameter_by_id(RackVST3Plugin* plugin, uint32_t param_
 //
 // Returns 0 on success, negative error code (e.g. RACK_VST3_ERROR_INVALID_PARAM
 // for an out-of-range index) on failure.
-// Thread-safety: real-time-safe (no allocation once this parameter has been
-// queued at least once before, matching every other zero-allocation hot path
-// in this file); must not be called concurrently with
-// rack_vst3_plugin_process[_multi_bus] or other plugin operations on the
-// same plugin.
+// Thread-safety: real-time-safe -- rack_vst3_plugin_initialize pre-creates
+// one ParameterValueQueue per known parameter (via ParameterChanges::
+// setMaxParameters) before returning, so every call this function makes into
+// input_param_changes takes its allocation-free reuse branch; no allocation
+// occurs, full stop, once initialize() has returned. Must not be called
+// concurrently with rack_vst3_plugin_process[_multi_bus] or other plugin
+// operations on the same plugin.
 int rack_vst3_plugin_queue_parameter_change(RackVST3Plugin* plugin, uint32_t index, float value);
 
 uint32_t rack_vst3_plugin_get_midi_pc_param_id(RackVST3Plugin* plugin, int channel);
