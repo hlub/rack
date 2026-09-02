@@ -1472,6 +1472,69 @@ mod tests {
         Some((scanner, info))
     }
 
+    /// A `cfg(test)`-only global allocator wrapper that counts Rust-side
+    /// allocations, scoped per-thread so it survives `cargo test`'s default
+    /// parallel test execution without one test's allocations polluting
+    /// another's count -- only this crate's single test binary (there are
+    /// no integration test targets, see `Cargo.toml`) exists to declare a
+    /// `#[global_allocator]`, so there is no conflict with anything else in
+    /// the crate's test setup.
+    ///
+    /// Important, honest scope: this can only observe allocations Rust code
+    /// performs through its own allocation API (`Box`, `Vec`, `String`, ...
+    /// -- compiled to calls into the `__rust_alloc` intrinsic that
+    /// `#[global_allocator]` redirects). It does NOT intercept
+    /// `malloc`/`operator new` calls made directly by `rack-sys`, the
+    /// linked C++ library -- confirmed empirically with a standalone probe
+    /// outside this crate: a direct FFI call to libc's `malloc` registers
+    /// zero allocations against a counting `#[global_allocator]`, while a
+    /// Rust `Vec` allocation registers one. `#[global_allocator]` is a
+    /// Rust-compiler-level redirect, not a process-wide malloc/`operator
+    /// new` interposition, so it cannot see native-side allocations -- see
+    /// `queue_parameter_change_performs_no_rust_side_allocation`'s own doc
+    /// comment for what this means for that test's real scope.
+    mod alloc_probe {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static TRACKING: Cell<bool> = Cell::new(false);
+            static COUNT: Cell<usize> = Cell::new(0);
+        }
+
+        struct CountingAllocator;
+
+        unsafe impl GlobalAlloc for CountingAllocator {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                TRACKING.with(|tracking| {
+                    if tracking.get() {
+                        COUNT.with(|count| count.set(count.get() + 1));
+                    }
+                });
+                System.alloc(layout)
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                System.dealloc(ptr, layout)
+            }
+        }
+
+        #[global_allocator]
+        static GLOBAL: CountingAllocator = CountingAllocator;
+
+        /// Runs `body` on the calling thread, counting Rust-side
+        /// allocations made while it runs. Allocations on other threads,
+        /// or made by this same thread outside `body` (setup/teardown),
+        /// are not counted.
+        pub fn count_rust_allocations<F: FnOnce()>(body: F) -> usize {
+            COUNT.with(|count| count.set(0));
+            TRACKING.with(|tracking| tracking.set(true));
+            body();
+            TRACKING.with(|tracking| tracking.set(false));
+            COUNT.with(|count| count.get())
+        }
+    }
+
     #[test]
     fn test_plugin_creation() {
         let (scanner, info) = match get_test_plugin() {
@@ -2326,6 +2389,88 @@ mod tests {
              from its pre-queue value -- otherwise the unchanged assertions above would not be \
              meaningful (comparing to `before` rather than `target` tolerates a stepped/quantized \
              parameter rounding the requested value)"
+        );
+    }
+
+    #[test]
+    fn queue_parameter_change_performs_no_rust_side_allocation() {
+        // d284632 fixed queue_parameter_change's real allocation-free claim:
+        // input_param_changes/output_param_changes were default-constructed
+        // ParameterChanges with no setMaxParameters call, so the *first*
+        // process block in which the number of distinct parameters queued
+        // exceeded every previous block's high-water mark still allocated
+        // via ParameterChanges::addParameterData's queues.emplace_back --
+        // in C++, inside rack-sys. That fix had no automated test at all,
+        // since it changes a non-functional property (allocation behavior)
+        // that no functional test can observe as a pass/fail difference.
+        //
+        // This test queues changes for every distinct parameter the loaded
+        // plugin has -- enough to exceed any smaller high-water mark a
+        // partial fix might still leave in place -- while alloc_probe (see
+        // its own doc comment above) counts Rust-side allocations, and
+        // asserts there are none.
+        //
+        // IMPORTANT, honest limitation, matching this crate's own
+        // convention (see e.g. reset_leaves_plugin_ready_to_process_again's
+        // and get_state_set_state_round_trip's doc comments) of stating
+        // plainly what a test can't prove rather than overclaiming: as
+        // alloc_probe's own doc comment explains, a Rust
+        // `#[global_allocator]` cannot observe allocations rack-sys's
+        // linked C++ code performs directly via malloc/`operator new` --
+        // which is exactly where d284632's real fix lives. A true
+        // process-wide interception (overriding the process's
+        // malloc/free/calloc/realloc plus the Itanium-ABI-mangled `operator
+        // new`/`operator delete` symbols, so the C++ library's own
+        // allocations route through the same counter) is possible in
+        // principle, but proved fragile enough while prototyping it for
+        // this task not to build casually: a naive override that itself
+        // calls back into Rust's `System` allocator (which also ultimately
+        // resolves to `malloc`) recurses infinitely and segfaults; a safe
+        // version needs `dlsym(RTLD_NEXT, ...)`-style real-symbol lookup and
+        // has to cover every allocation entry point deliberately. That is
+        // disproportionate restructuring for this one test, so it was not
+        // attempted, and the underlying C++ fix's correctness still rests
+        // on reading `ParameterChanges::setMaxParameters`/`addParameterData`
+        // directly, exactly as d284632's own commit message already says.
+        //
+        // What this test DOES prove, for real: the Rust wrapper function
+        // itself never allocates on the Rust side across a realistic number
+        // of distinct parameter indices -- a genuine, if narrower,
+        // regression guard against a future change (a stray
+        // `Vec`/`format!`/`String`) creeping into this real-time-safe hot
+        // path from the Rust side.
+        let (scanner, info) = match get_test_plugin() {
+            Ok(result) => result,
+            Err(_) => {
+                println!("Skipping test - no VST3 plugins found");
+                return;
+            }
+        };
+
+        let mut plugin = scanner.load(&info).expect("Plugin creation should succeed");
+        plugin
+            .initialize(48000.0, 512)
+            .expect("Plugin initialization should succeed");
+
+        let count = plugin.parameter_count();
+        if count == 0 {
+            println!("Plugin has no parameters, skipping");
+            return;
+        }
+
+        let allocations = alloc_probe::count_rust_allocations(|| {
+            for index in 0..count {
+                plugin
+                    .queue_parameter_change(index, 0.5)
+                    .expect("queuing a real parameter index should succeed");
+            }
+        });
+
+        assert_eq!(
+            allocations, 0,
+            "queue_parameter_change must not allocate on the Rust side once initialize() has \
+             returned (see this test's own doc comment for what this can and cannot prove about \
+             the underlying C++ fix)"
         );
     }
 }
