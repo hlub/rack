@@ -2,6 +2,7 @@ use crate::{Error, MidiEvent, MidiEventKind, ParameterInfo, PluginInfo, PluginIn
 use smallvec::SmallVec;
 use std::ffi::CString;
 use std::marker::PhantomData;
+use std::os::raw::c_int;
 use std::ptr::NonNull;
 
 use super::ffi;
@@ -926,6 +927,27 @@ fn rack_midi_to_midi_event(raw: &ffi::RackVST3MidiEvent) -> Option<MidiEvent> {
     Some(MidiEvent { sample_offset: raw.sample_offset, kind })
 }
 
+/// Given the result code from a `rack_vst3_plugin_get_state` call, the
+/// size of the buffer that was handed to it, and the size the call
+/// reported back, decides whether the failure was specifically the
+/// documented overflow case (the real state is larger than the buffer
+/// given, so the call fails but still reports the true required size back
+/// through its size out-parameter -- see `get_state`'s own comment on this
+/// contract) and, if so, what buffer size to retry the call with.
+///
+/// Pure and independent of the real FFI call, so the retry decision
+/// itself is unit-tested directly, without needing a real plugin whose
+/// state exceeds the ~4 MB initial guess -- no such fixture is known to be
+/// available on any real test machine (see `get_state`'s own comment on
+/// that gap).
+fn state_retry_size(result: c_int, buffer_len: usize, reported_size: usize) -> Option<usize> {
+    if result != ffi::RACK_VST3_OK && reported_size > buffer_len {
+        Some(reported_size)
+    } else {
+        None
+    }
+}
+
 impl Drop for Vst3Plugin {
     fn drop(&mut self) {
         unsafe {
@@ -1341,10 +1363,11 @@ impl PluginInstance for Vst3Plugin {
             // larger than the buffer we gave it, it fails but still writes
             // the true required size back through `actual_size` (and does
             // not touch it on any other kind of failure, so this condition
-            // can only be true after that specific overflow). Retry once
-            // with a buffer sized to that real requirement instead of
-            // failing outright -- a state above the initial guess is rare
-            // but not invalid.
+            // can only be true after that specific overflow). state_retry_size
+            // (a pure function, unit-tested on its own) decides whether this
+            // is that overflow case; retry once with a buffer sized to the
+            // real requirement instead of failing outright -- a state above
+            // the initial guess is rare but not invalid.
             //
             // Known accepted risk: each rack_vst3_plugin_get_state call
             // brackets its own getState with a full suspend/resume cycle
@@ -1357,8 +1380,8 @@ impl PluginInstance for Vst3Plugin {
             // rather than avoided: it only triggers for the rare case of a
             // real state exceeding the initial guess, and failing outright
             // instead would be strictly worse for that caller.
-            if result != ffi::RACK_VST3_OK && actual_size > data.len() {
-                data = vec![0u8; actual_size];
+            if let Some(retry_len) = state_retry_size(result, data.len(), actual_size) {
+                data = vec![0u8; retry_len];
                 let mut retry_size = data.len();
                 result = ffi::rack_vst3_plugin_get_state(
                     self.inner.as_ptr(),
@@ -1695,6 +1718,51 @@ mod tests {
     fn decode_unknown_status_returns_none() {
         // 0xF0 (system) has no channel-voice MidiEventKind mapping here.
         assert!(rack_midi_to_midi_event(&raw_event(0, 0xF0, 0, 0, 0)).is_none());
+    }
+
+    // -- state_retry_size: pure retry-decision logic extracted out of
+    // -- get_state (b63261f's fix), unit-tested directly rather than through
+    // -- a real oversized-state fixture that isn't available on any known
+    // -- test machine.
+
+    #[test]
+    fn state_retry_size_none_on_success() {
+        // A successful call never needs a retry, regardless of what the
+        // out-parameter happens to hold.
+        assert_eq!(state_retry_size(ffi::RACK_VST3_OK, 4096, 4096), None);
+        assert_eq!(state_retry_size(ffi::RACK_VST3_OK, 4096, 0), None);
+    }
+
+    #[test]
+    fn state_retry_size_none_on_failure_without_overflow() {
+        // A failure that is NOT the documented overflow case (the reported
+        // size is not larger than the buffer given) must not trigger a
+        // retry -- e.g. a generic failure that leaves the out-parameter at
+        // its initial value, or even reports a smaller/equal size.
+        assert_eq!(state_retry_size(ffi::RACK_VST3_ERROR_GENERIC, 4096, 4096), None);
+        assert_eq!(state_retry_size(ffi::RACK_VST3_ERROR_GENERIC, 4096, 0), None);
+        assert_eq!(state_retry_size(ffi::RACK_VST3_ERROR_GENERIC, 4096, 2048), None);
+    }
+
+    #[test]
+    fn state_retry_size_some_on_overflow_uses_reported_size() {
+        // The documented overflow case: failure, with the out-parameter
+        // reporting a real size larger than the buffer that was given.
+        // Retry with a buffer sized to that real requirement.
+        assert_eq!(
+            state_retry_size(ffi::RACK_VST3_ERROR_GENERIC, 4 * 1024 * 1024, 5 * 1024 * 1024),
+            Some(5 * 1024 * 1024)
+        );
+        // Off-by-one at the boundary: reported size exactly one byte over
+        // the buffer still counts as overflow.
+        assert_eq!(state_retry_size(ffi::RACK_VST3_ERROR_GENERIC, 100, 101), Some(101));
+    }
+
+    #[test]
+    fn state_retry_size_none_when_reported_size_not_larger() {
+        // Reported size equal to (not larger than) the buffer given is not
+        // overflow, even on failure -- the buffer was already big enough.
+        assert_eq!(state_retry_size(ffi::RACK_VST3_ERROR_GENERIC, 100, 100), None);
     }
 
     // -- Regression tests for the stale-extra-output-bus-pointer /
