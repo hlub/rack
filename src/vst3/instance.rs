@@ -2148,4 +2148,116 @@ mod tests {
         let result = plugin.queue_parameter_change(out_of_range, 0.5);
         assert!(result.is_err(), "an out-of-range index should be rejected");
     }
+
+    #[test]
+    fn queue_parameter_change_never_touches_the_controller() {
+        // The one thing that actually distinguishes queue_parameter_change
+        // from an accidental alias for set_parameter is that it never calls
+        // IEditController::setParamNormalized. get_parameter reads directly
+        // from that same controller call
+        // (rack_vst3_plugin_get_parameter -> controller->getParamNormalized,
+        // see rack-sys/src/vst3_instance.cpp), so it is a real, live signal
+        // for "was the controller touched" -- proven live within this same
+        // test by also calling the known-controller-touching set_parameter
+        // and observing get_parameter move in response. If that positive
+        // control did not move get_parameter, the negative checks below
+        // would be meaningless (a broken/stale accessor would look
+        // "unchanged" for any input).
+        //
+        // What this test deliberately does NOT claim: that get_parameter
+        // reflects a queued value once it has actually been delivered to
+        // and applied by the plugin's own audio processor via process().
+        // Verified empirically against a real installed plugin (Addictive
+        // Drums 2) and by reading the source: process() feeds queued points
+        // into ProcessData::inputParameterChanges for the processor alone
+        // (rack_vst3_plugin_process wires plugin->input_param_changes in
+        // and clears it after every call) and never writes anything back
+        // into the controller -- nothing in this crate reads the
+        // processor's own outputParameterChanges and re-applies it to the
+        // controller, and the VST3 spec does not require a plugin to keep
+        // the two in sync automatically. So get_parameter staying unchanged
+        // after process() is expected and reconfirms controller isolation
+        // holds for the real-time call too, but it cannot serve as
+        // affirmative proof that the processor actually received and
+        // applied the point -- that would need either inspecting the
+        // processor's internal state (not exposed by this crate's C API)
+        // or a specific plugin+parameter+signal-path assumption fragile
+        // enough not to generalize across installed plugins. The queue's
+        // wiring into ProcessData::inputParameterChanges is instead verified
+        // by reading rack_vst3_plugin_queue_parameter_change and process()'s
+        // own implementation directly.
+        let (scanner, info) = match get_test_plugin() {
+            Ok(result) => result,
+            Err(_) => {
+                println!("Skipping test - no VST3 plugins found");
+                return;
+            }
+        };
+
+        let mut plugin = scanner.load(&info).expect("Plugin creation should succeed");
+        plugin
+            .initialize(48000.0, 512)
+            .expect("Plugin initialization should succeed");
+
+        let index = match (0..plugin.parameter_count()).find(|&index| {
+            plugin
+                .parameter_info(index)
+                .map(|info| info.can_automate && !info.is_read_only)
+                .unwrap_or(false)
+        }) {
+            Some(index) => index,
+            None => {
+                println!("Plugin has no automatable parameter, skipping");
+                return;
+            }
+        };
+
+        let before = plugin.get_parameter(index).expect("get_parameter should succeed");
+        let target = if before < 0.5 { 0.9 } else { 0.1 };
+
+        plugin
+            .queue_parameter_change(index, target)
+            .expect("queuing a real parameter index should succeed");
+        let after_queue = plugin.get_parameter(index).expect("get_parameter should succeed");
+        assert_eq!(
+            after_queue, before,
+            "queue_parameter_change must not touch the controller: get_parameter should still \
+             read the pre-queue value"
+        );
+
+        let num_frames = 64usize;
+        let input_channels = plugin.input_channels();
+        let output_channels = plugin.output_channels();
+        let in_bufs: Vec<Vec<f32>> = (0..input_channels).map(|_| vec![0.0f32; num_frames]).collect();
+        let mut out_bufs: Vec<Vec<f32>> =
+            (0..output_channels).map(|_| vec![0.0f32; num_frames]).collect();
+        let in_slices: Vec<&[f32]> = in_bufs.iter().map(|buffer| buffer.as_slice()).collect();
+        let mut out_slices: Vec<&mut [f32]> =
+            out_bufs.iter_mut().map(|buffer| buffer.as_mut_slice()).collect();
+        plugin
+            .process(&in_slices, &mut out_slices, num_frames)
+            .expect("process() should succeed with the queued change pending");
+
+        let after_process = plugin.get_parameter(index).expect("get_parameter should succeed");
+        assert_eq!(
+            after_process, before,
+            "process() draining the queue must not touch the controller either: get_parameter \
+             should still read the pre-queue value"
+        );
+
+        // Positive control: a real controller call (set_parameter) does move
+        // get_parameter, proving the two checks above are a real signal and
+        // not a stale/broken accessor that would "pass" for any input.
+        plugin
+            .set_parameter(index, target)
+            .expect("set_parameter should succeed");
+        let after_set = plugin.get_parameter(index).expect("get_parameter should succeed");
+        assert_ne!(
+            after_set, before,
+            "set_parameter is the known controller-touching path and must move get_parameter away \
+             from its pre-queue value -- otherwise the unchanged assertions above would not be \
+             meaningful (comparing to `before` rather than `target` tolerates a stepped/quantized \
+             parameter rounding the requested value)"
+        );
+    }
 }
