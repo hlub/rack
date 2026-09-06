@@ -20,6 +20,8 @@
 #include <cmath>
 #include <mutex>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 
 #include "vst3_lifecycle_mutex.h"
 
@@ -341,13 +343,47 @@ tresult PLUGIN_API MemoryStream::queryInterface(const TUID _iid, void** obj) {
     return kNoInterface;
 }
 
+// Milliseconds elapsed since this process started. Used only to correlate
+// the Vst::IProgress observational log lines below with when a caller
+// invoked rack_vst3_plugin_set_state and how long its own fixed
+// pump_runloop wait took -- see that function's own doc comment.
+static long long log_elapsed_ms() {
+    using Clock = std::chrono::steady_clock;
+    static const Clock::time_point process_start = Clock::now();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - process_start).count();
+}
+
+static const char* progress_type_name(Vst::IProgress::ProgressType type) {
+    switch (type) {
+        case Vst::IProgress::ProgressType::AsyncStateRestoration:
+            return "AsyncStateRestoration";
+        case Vst::IProgress::ProgressType::UIBackgroundTask:
+            return "UIBackgroundTask";
+        default:
+            return "Unknown";
+    }
+}
+
 // Minimal IComponentHandler. The VST3 spec requires the host to provide one
 // via IEditController::setComponentHandler before relying on the controller
 // -- some plugins' internal parameter-cache synchronization (e.g. inside
 // setComponentState) may depend on a handler being present, even though we
 // don't need to act on beginEdit/performEdit/endEdit/restartComponent
 // ourselves in a headless host.
-class ComponentHandler : public IComponentHandler {
+//
+// Also implements Vst::IProgress, purely for observation. A plugin whose
+// setState triggers async background loading (e.g. sample streaming) may,
+// per the [optional] Vst::IProgress extension (ivsteditcontroller.h), call
+// start/update/finish on the host's IComponentHandler to push a real
+// completion signal instead of the host guessing with a fixed wait.
+// rack_vst3_plugin_set_state currently always waits a fixed
+// pump_runloop(5.0) after IComponent::setState with no early-exit
+// condition (see that function's own doc comment); these three methods
+// only log what they are called with here -- they never gate, shorten, or
+// otherwise change that wait -- so real plugins can be observed calling
+// (or not calling) this mechanism before it is relied on for anything.
+class ComponentHandler : public IComponentHandler, public Vst::IProgress {
 public:
     ComponentHandler() { FUNKNOWN_CTOR }
     virtual ~ComponentHandler() = default;
@@ -358,6 +394,37 @@ public:
     tresult PLUGIN_API performEdit(ParamID, ParamValue) override { return kResultOk; }
     tresult PLUGIN_API endEdit(ParamID) override { return kResultOk; }
     tresult PLUGIN_API restartComponent(int32) override { return kResultOk; }
+
+    tresult PLUGIN_API start(Vst::IProgress::ProgressType type,
+                              const tchar* optionalDescription,
+                              Vst::IProgress::ID& outID) override {
+        outID = next_progress_id_.fetch_add(1, std::memory_order_relaxed);
+        std::string description =
+            optionalDescription ? utf16_to_utf8(optionalDescription) : std::string();
+        fprintf(stderr,
+                "[rack] IProgress::start id=%llu type=%s description=\"%s\" t=%lldms\n",
+                static_cast<unsigned long long>(outID), progress_type_name(type),
+                description.c_str(), log_elapsed_ms());
+        return kResultOk;
+    }
+
+    tresult PLUGIN_API update(Vst::IProgress::ID id, ParamValue normValue) override {
+        fprintf(stderr, "[rack] IProgress::update id=%llu value=%.4f t=%lldms\n",
+                static_cast<unsigned long long>(id), normValue, log_elapsed_ms());
+        return kResultOk;
+    }
+
+    tresult PLUGIN_API finish(Vst::IProgress::ID id) override {
+        fprintf(stderr, "[rack] IProgress::finish id=%llu t=%lldms\n",
+                static_cast<unsigned long long>(id), log_elapsed_ms());
+        return kResultOk;
+    }
+
+private:
+    // Handed back to the plugin as each progress's opaque ID. This
+    // observational-only implementation has no real progress list to look
+    // an ID up in, but start() must still hand back a unique one per call.
+    std::atomic<uint64_t> next_progress_id_{1};
 };
 
 IMPLEMENT_REFCOUNT(ComponentHandler)
@@ -365,6 +432,7 @@ IMPLEMENT_REFCOUNT(ComponentHandler)
 tresult PLUGIN_API ComponentHandler::queryInterface(const TUID _iid, void** obj) {
     QUERY_INTERFACE(_iid, obj, FUnknown::iid, IComponentHandler)
     QUERY_INTERFACE(_iid, obj, IComponentHandler::iid, IComponentHandler)
+    QUERY_INTERFACE(_iid, obj, Vst::IProgress::iid, Vst::IProgress)
     *obj = nullptr;
     return kNoInterface;
 }
@@ -518,7 +586,8 @@ static void reset_bus_bindings(RackVST3Plugin* plugin) {
 // setProcessing(false)-before-setActive(false) lifecycle order every other
 // suspend point in this file uses.
 static void suspend_for_state(RackVST3Plugin* plugin);
-static void resume_after_state(RackVST3Plugin* plugin, double post_activate_pump_seconds = 0.0);
+static void resume_after_state(RackVST3Plugin* plugin, double post_activate_pump_seconds = 0.0,
+                                bool reactivate = true, bool resume_processing = true);
 
 // ============================================================================
 // Plugin Instance Implementation
@@ -1956,15 +2025,36 @@ static void suspend_for_state(RackVST3Plugin* plugin) {
     plugin->component->setActive(false);
 }
 
-static void resume_after_state(RackVST3Plugin* plugin, double post_activate_pump_seconds) {
-    if (!plugin->initialized) return;
-    plugin->component->setActive(true);
+// reactivate/resume_processing let a caller opt out of the setActive(true)/
+// setProcessing(true) steps while still sharing the pump: get_state's own
+// suspend_for_state fully deactivates first (setProcessing(false) then
+// setActive(false)), so its resume needs both steps to get back to
+// Active+Processing, and takes the (reactivate=true, resume_processing=true)
+// defaults below unchanged. rack_vst3_plugin_set_state's own doc comment
+// explains why it must never deactivate the component before calling
+// IComponent::setState (doing so silently drops some plugins' parameter
+// values) -- it stays Active throughout and manages setProcessing itself
+// around a call that also has to run before the component is ever marked
+// initialized, a case this function's own initialized-only guard below
+// does not cover. set_state therefore calls this only for the pump,
+// passing reactivate=false, resume_processing=false so the guard and both
+// side effects are skipped and only the wait for async plugin work (e.g.
+// AD2's background sample loader) after setState runs.
+static void resume_after_state(RackVST3Plugin* plugin, double post_activate_pump_seconds,
+                                bool reactivate, bool resume_processing) {
+    if (!plugin->initialized && (reactivate || resume_processing)) return;
+    if (reactivate) {
+        plugin->component->setActive(true);
+    }
     if (post_activate_pump_seconds > 0.0) {
-        // Let any async work triggered by setActive (e.g. JUCE prepareToPlay) complete
-        // before starting processing.  Only used in set_state, not get_state.
+        // Let any async work triggered by setState/setActive (e.g. JUCE
+        // prepareToPlay, or AD2's background sample loader) complete before
+        // resuming processing.
         pump_runloop(post_activate_pump_seconds);
     }
-    plugin->processor->setProcessing(true);
+    if (resume_processing) {
+        plugin->processor->setProcessing(true);
+    }
 }
 
 int rack_vst3_plugin_get_state_size(RackVST3Plugin* plugin) {
@@ -2098,8 +2188,20 @@ int rack_vst3_plugin_set_state(RackVST3Plugin* plugin, const uint8_t* data, size
         return RACK_VST3_ERROR_GENERIC;
     }
 
-    // Pump until AD2's async sample-loading thread finishes.
-    pump_runloop(5.0);
+    // Wait for AD2's async sample-loading thread to finish. Routed through
+    // resume_after_state (the same helper get_state's own suspend/resume
+    // bracket uses for its own, unrelated post-activation pump) so this
+    // wait has one implementation, not two hand-copied pump_runloop(5.0)
+    // calls -- but the component here was never deactivated (see this
+    // function's own comment on why setState must run while Active) and
+    // may still be pre-initialize(), so both of resume_after_state's other
+    // side effects are opted out of: reactivate=false (already Active,
+    // and calling setActive(true) again risks resembling the
+    // back-to-back double-activation sequence documented elsewhere in this
+    // codebase to crash some JUCE plugins, AD2 included) and
+    // resume_processing=false (this function already restores
+    // setProcessing itself below, only when plugin->initialized).
+    resume_after_state(plugin, 5.0, /*reactivate=*/false, /*resume_processing=*/false);
 
     // Sync controller to component state.  Only for plugins where they are
     // separate objects; for same-object plugins (JUCE), setComponentState

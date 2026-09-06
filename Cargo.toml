@@ -71,6 +71,11 @@ name = "multi_bus_input_feed_smoke"
 path = "examples/multi_bus_input_feed_smoke.rs"
 required-features = ["cpal"]
 
+[[example]]
+name = "progress_probe"
+path = "examples/progress_probe.rs"
+required-features = ["vst3"]
+
 [profile.dev]
 opt-level = 2  # Audio needs some optimization even in debug
 
