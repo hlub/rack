@@ -589,7 +589,8 @@ extern "C" {
         channel: c_int,
     ) -> u32;
 
-    /// Update the plugin's live process context tempo/playback state.
+    /// Update the plugin's live process context tempo/playback state and
+    /// host position.
     ///
     /// # Returns
     ///
@@ -606,10 +607,19 @@ extern "C" {
     ///   `rack_vst3_plugin_process`, immediately before it, never
     ///   concurrently with a `process` call in flight.
     /// - `playing` is nonzero for "transport playing", zero for "stopped".
+    /// - `project_time_samples`, `project_time_music` (quarter notes) and
+    ///   `bar_position_music` (the containing bar's start, in quarter notes)
+    ///   are the host's own position, written verbatim into
+    ///   `projectTimeSamples`/`projectTimeMusic`/`barPositionMusic`. This
+    ///   call is the only writer of all three; nothing advances them
+    ///   internally.
     pub fn rack_vst3_plugin_set_transport(
         plugin: *mut RackVST3Plugin,
         tempo: f64,
         playing: i32,
+        project_time_samples: i64,
+        project_time_music: f64,
+        bar_position_music: f64,
     ) -> c_int;
 
     /// Get parameter info (name, min, max, default, unit)
@@ -819,6 +829,20 @@ extern "C" {
         plugin: *mut RackVST3Plugin,
         data: *const u8,
         size: usize,
+    ) -> c_int;
+
+    /// Same as `rack_vst3_plugin_set_state`, but the post-`setState` wait
+    /// for async completion is `pump_seconds` instead of a fixed 5.0 -- see
+    /// that C function's own doc comment.
+    ///
+    /// # Safety
+    ///
+    /// Same requirements as `rack_vst3_plugin_set_state`.
+    pub fn rack_vst3_plugin_set_state_pumped(
+        plugin: *mut RackVST3Plugin,
+        data: *const u8,
+        size: usize,
+        pump_seconds: f64,
     ) -> c_int;
 
     // ============================================================================

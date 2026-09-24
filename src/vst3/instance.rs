@@ -171,9 +171,19 @@ impl Vst3Plugin {
         }
     }
 
-    /// Update the plugin's live process context tempo/playback state, so its
-    /// next `process()` call observes the host's real, current transport
-    /// instead of whatever it was initialized with.
+    /// Update the plugin's live process context tempo, playback state and
+    /// position, so its next `process()` call observes the host's real,
+    /// current transport instead of whatever it was initialized with.
+    ///
+    /// The position is the host's alone: `project_time_samples` is written
+    /// straight into the VST3 `projectTimeSamples` field and is never
+    /// advanced internally, so a plugin loaded or re-initialized partway
+    /// through a session is told where the host really is rather than
+    /// starting again from zero. `project_time_music` is the same position
+    /// in quarter notes (1.0 is one quarter note) and `bar_position_music`
+    /// the start of the bar containing it, also in quarter notes; both are
+    /// advertised to the plugin as valid, so a host with no musical position
+    /// to report passes 0.0 and thereby claims bar 1, beat 1.
     ///
     /// Unlike [`queue_parameter_change`](PluginInstance::queue_parameter_change)
     /// (queued for the audio thread to apply on its own next `process()`
@@ -189,7 +199,14 @@ impl Vst3Plugin {
     /// # Errors
     ///
     /// Returns an error if the plugin has not been initialized.
-    pub fn set_transport(&mut self, tempo: f64, playing: bool) -> Result<()> {
+    pub fn set_transport(
+        &mut self,
+        tempo: f64,
+        playing: bool,
+        project_time_samples: i64,
+        project_time_music: f64,
+        bar_position_music: f64,
+    ) -> Result<()> {
         if !self.is_initialized() {
             return Err(Error::NotInitialized);
         }
@@ -199,6 +216,9 @@ impl Vst3Plugin {
                 self.inner.as_ptr(),
                 tempo,
                 i32::from(playing),
+                project_time_samples,
+                project_time_music,
+                bar_position_music,
             );
 
             if result != ffi::RACK_VST3_OK {
@@ -899,6 +919,43 @@ impl Vst3Plugin {
     #[must_use]
     pub fn emits_midi(&self) -> bool {
         unsafe { ffi::rack_vst3_plugin_emits_midi(self.inner.as_ptr()) }
+    }
+
+    /// Same as [`PluginInstance::set_state`], but the wait for async
+    /// completion (e.g. sample loading) after `setState` is `pump_seconds`
+    /// instead of a fixed 5.0 -- for a caller that will poll for real
+    /// readiness itself afterward (delivering a real note/signal and
+    /// checking for real output) rather than trusting a fixed wait. Passing
+    /// the same 5.0 [`PluginInstance::set_state`] always used is equivalent
+    /// to calling that method.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error under the same conditions as
+    /// [`PluginInstance::set_state`].
+    pub fn set_state_with_pump_seconds(&mut self, data: &[u8], pump_seconds: f64) -> Result<()> {
+        if !self.is_initialized() {
+            return Err(Error::NotInitialized);
+        }
+
+        if data.is_empty() {
+            return Err(Error::Other("State data is empty".to_string()));
+        }
+
+        unsafe {
+            let result = ffi::rack_vst3_plugin_set_state_pumped(
+                self.inner.as_ptr(),
+                data.as_ptr(),
+                data.len(),
+                pump_seconds,
+            );
+
+            if result != ffi::RACK_VST3_OK {
+                return Err(map_error(result));
+            }
+
+            Ok(())
+        }
     }
 }
 

@@ -494,11 +494,13 @@ struct RackVST3Plugin {
     EventList input_events{kEventListCapacity};
     EventList output_events{kEventListCapacity};
 
-    // Process context: tempo/playback state the plugin reads on every
-    // process() call. Built once in initialize(), then kept live by
-    // rack_vst3_plugin_set_transport (see that function's own doc comment).
+    // Process context: tempo/playback state and host position the plugin
+    // reads on every process() call. Built once in initialize(), then kept
+    // live by rack_vst3_plugin_set_transport (see that function's own doc
+    // comment) -- including projectTimeSamples, which this library never
+    // advances on its own, so there is no per-instance position counter here
+    // to disagree with the host's.
     ProcessContext process_context;
-    int64 sample_position = 0;
 
     // Audio buffers for pointer arrays.
     // dummy_buf: a silent buffer shared across all aux output buses that we
@@ -890,18 +892,28 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
     // memory (see reset_bus_bindings's own doc comment).
     reset_bus_bindings(plugin);
 
-    // Set up the process context once; tempo/kPlaying start at this
-    // placeholder 120 BPM/playing default and are kept live afterward by
-    // rack_vst3_plugin_set_transport, which writes directly into this same
-    // persistent struct (never rebuilt) on every real host tempo/transport
-    // change.
+    // Set up the process context once; tempo/kPlaying and the position
+    // fields start at this placeholder 120 BPM/playing/position-zero default
+    // and are kept live afterward by rack_vst3_plugin_set_transport, which
+    // writes directly into this same persistent struct (never rebuilt) on
+    // every real host tempo/transport/position change.
+    //
+    // Only the flags this library can actually back with host-supplied data
+    // are advertised. kTimeSigValid, kSmpteValid and kClockValid are
+    // deliberately NOT set: nothing in this C API carries a time signature,
+    // an SMPTE offset/frame rate or a MIDI clock distance, so claiming they
+    // are valid would point a plugin that trusts them at a placeholder (the
+    // 4/4 below) or at memset-zero garbage (a 0 fps frame rate, a
+    // "next MIDI clock is this instant" 0). Unclaimed lets the plugin fall
+    // back to its own defaults instead. The 4/4 is still written so a plugin
+    // that reads the fields without checking the flag -- a common enough
+    // real-world sloppiness -- finds a sane time signature rather than 0/0.
     memset(&plugin->process_context, 0, sizeof(ProcessContext));
     plugin->process_context.state =
         ProcessContext::kPlaying |
         ProcessContext::kTempoValid |
-        ProcessContext::kTimeSigValid |
-        ProcessContext::kSmpteValid |
-        ProcessContext::kClockValid;
+        ProcessContext::kProjectTimeMusicValid |
+        ProcessContext::kBarPositionValid;
     plugin->process_context.sampleRate = sample_rate;
     plugin->process_context.tempo = 120.0;
     plugin->process_context.timeSigNumerator = 4;
@@ -1169,10 +1181,6 @@ int rack_vst3_plugin_process(
     // Update dynamic fields only (prepare() was called during initialization)
     plugin->process_data.numSamples = frames;
 
-    // Advance the timeline position so the plugin sees a moving clock.
-    plugin->process_context.projectTimeSamples = plugin->sample_position;
-    plugin->sample_position += frames;
-
     // Reset every bus to its default (silent/dummy) binding before applying
     // this call's own bus-0 buffers below. This function only ever rebinds
     // bus 0, so without this reset any bus a previous
@@ -1403,10 +1411,6 @@ int rack_vst3_plugin_process_multi_bus(
     // Update dynamic fields only (prepare() was called during initialization)
     plugin->process_data.numSamples = frames;
 
-    // Advance the timeline position so the plugin sees a moving clock.
-    plugin->process_context.projectTimeSamples = plugin->sample_position;
-    plugin->sample_position += frames;
-
     // Reset every bus to its default (silent/dummy) binding before applying
     // this call's own bus-0 and extra-bus buffers below, so any bus this
     // particular call's request omits -- one a previous call bound a real
@@ -1632,7 +1636,14 @@ uint32_t rack_vst3_plugin_get_midi_pc_param_id(RackVST3Plugin* plugin, int chann
 // drives process(), immediately before it -- the same thread-confinement
 // argument that already makes plain, unsynchronized access to
 // process_context safe within process() itself.
-int rack_vst3_plugin_set_transport(RackVST3Plugin* plugin, double tempo, int32_t playing) {
+int rack_vst3_plugin_set_transport(
+    RackVST3Plugin* plugin,
+    double tempo,
+    int32_t playing,
+    int64_t project_time_samples,
+    double project_time_music,
+    double bar_position_music)
+{
     if (!plugin || !plugin->initialized) {
         return RACK_VST3_ERROR_NOT_INITIALIZED;
     }
@@ -1643,6 +1654,17 @@ int rack_vst3_plugin_set_transport(RackVST3Plugin* plugin, double tempo, int32_t
     } else {
         plugin->process_context.state &= ~ProcessContext::kPlaying;
     }
+
+    // The host's position, taken verbatim. Nothing else in this library
+    // writes these three fields, and in particular process() does not
+    // advance projectTimeSamples itself: a counter kept here would restart
+    // at zero for every newly constructed or re-initialized instance while
+    // the rest of the host is minutes in, and would count only the blocks
+    // this one instance happened to process. The host knows where it is;
+    // this library does not.
+    plugin->process_context.projectTimeSamples = project_time_samples;
+    plugin->process_context.projectTimeMusic = project_time_music;
+    plugin->process_context.barPositionMusic = bar_position_music;
 
     return RACK_VST3_OK;
 }
@@ -2130,7 +2152,17 @@ int rack_vst3_plugin_get_state(RackVST3Plugin* plugin, uint8_t* data, size_t* si
     return RACK_VST3_OK;
 }
 
-int rack_vst3_plugin_set_state(RackVST3Plugin* plugin, const uint8_t* data, size_t size) {
+// Identical to rack_vst3_plugin_set_state below except the post-setState
+// wait is `pump_seconds` rather than a hardcoded 5.0 -- added so a caller
+// that has its own way of detecting real completion (backline's
+// audio-probe warmup: deliver a real note/signal and watch for real,
+// non-silent output) can ask for a short or zero pump here and do its own
+// polling afterward, instead of the fixed blind wait. See
+// `docs/plugin-pool-design.md`'s Section 1.5 for why no plugin signals
+// completion on its own and no shorter fixed constant can be derived
+// instead -- this exists to let the caller supply an empirically-obtained
+// duration, or none at all if it means to poll for readiness itself.
+int rack_vst3_plugin_set_state_pumped(RackVST3Plugin* plugin, const uint8_t* data, size_t size, double pump_seconds) {
     if (!plugin || !data || size == 0 || !plugin->component) {
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
@@ -2201,7 +2233,7 @@ int rack_vst3_plugin_set_state(RackVST3Plugin* plugin, const uint8_t* data, size
     // codebase to crash some JUCE plugins, AD2 included) and
     // resume_processing=false (this function already restores
     // setProcessing itself below, only when plugin->initialized).
-    resume_after_state(plugin, 5.0, /*reactivate=*/false, /*resume_processing=*/false);
+    resume_after_state(plugin, pump_seconds, /*reactivate=*/false, /*resume_processing=*/false);
 
     // Sync controller to component state.  Only for plugins where they are
     // separate objects; for same-object plugins (JUCE), setComponentState
@@ -2229,6 +2261,10 @@ int rack_vst3_plugin_set_state(RackVST3Plugin* plugin, const uint8_t* data, size
     }
 
     return RACK_VST3_OK;
+}
+
+int rack_vst3_plugin_set_state(RackVST3Plugin* plugin, const uint8_t* data, size_t size) {
+    return rack_vst3_plugin_set_state_pumped(plugin, data, size, 5.0);
 }
 
 // ============================================================================

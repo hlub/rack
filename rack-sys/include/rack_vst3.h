@@ -387,10 +387,27 @@ int rack_vst3_plugin_queue_parameter_change(RackVST3Plugin* plugin, uint32_t ind
 
 uint32_t rack_vst3_plugin_get_midi_pc_param_id(RackVST3Plugin* plugin, int channel);
 
-// Update the plugin's live process context: tempo (BPM) and playback state
-// (nonzero = playing, zero = stopped). Writes directly into the plugin's
-// persistent ProcessContext (built once during initialize and never
-// rebuilt), which the plugin reads on every subsequent process() call.
+// Update the plugin's live process context: tempo (BPM), playback state
+// (nonzero = playing, zero = stopped) and the host's current position.
+// Writes directly into the plugin's persistent ProcessContext (built once
+// during initialize and never rebuilt), which the plugin reads on every
+// subsequent process() call.
+//
+// The three position arguments map onto the VST3 ProcessContext fields of
+// the same names, and this call is the ONLY thing that ever writes them:
+//   project_time_samples -> projectTimeSamples, the host's position in
+//     samples. This library never advances it itself, so a plugin loaded
+//     partway through a session, or one re-initialized mid-session, is told
+//     where the host really is rather than restarting from sample zero.
+//   project_time_music   -> projectTimeMusic, the same position in quarter
+//     notes (1.0 == one quarter note); kProjectTimeMusicValid is advertised.
+//   bar_position_music   -> barPositionMusic, the start of the bar that
+//     position falls in, also in quarter notes; kBarPositionValid is
+//     advertised.
+// A host with no musical position to report should pass 0.0 for both
+// musical values; the flags are advertised unconditionally, so a caller that
+// cannot supply real ones is claiming bar 1, beat 1.
+//
 // Thread-safety: unlike rack_vst3_plugin_queue_parameter_change (queued for
 // the audio thread to apply on its own next process() call), this writes
 // the struct fields immediately with no queuing or locking -- the caller
@@ -398,7 +415,13 @@ uint32_t rack_vst3_plugin_get_midi_pc_param_id(RackVST3Plugin* plugin, int chann
 // rack_vst3_plugin_process, immediately before it, never concurrently with
 // a process() call in flight.
 // Returns 0 on success, negative error code on failure.
-int rack_vst3_plugin_set_transport(RackVST3Plugin* plugin, double tempo, int32_t playing);
+int rack_vst3_plugin_set_transport(
+    RackVST3Plugin* plugin,
+    double tempo,
+    int32_t playing,
+    int64_t project_time_samples,
+    double project_time_music,
+    double bar_position_music);
 
 // Get parameter info
 // name: output buffer for parameter name (allocated by caller)
@@ -545,6 +568,15 @@ int rack_vst3_plugin_get_state(RackVST3Plugin* plugin, uint8_t* data, size_t* si
 // Returns 0 on success, negative error code on failure
 // Thread-safety: Should be called from the same thread that owns the plugin instance.
 int rack_vst3_plugin_set_state(RackVST3Plugin* plugin, const uint8_t* data, size_t size);
+
+// Same as rack_vst3_plugin_set_state, but the wait for async completion
+// (e.g. sample loading) after setState is `pump_seconds` instead of a fixed
+// 5.0 -- for a caller that will poll for real readiness itself afterward
+// (e.g. by delivering a real note/signal and checking for real output)
+// rather than trusting a fixed wait.
+// Returns 0 on success, negative error code on failure
+// Thread-safety: Should be called from the same thread that owns the plugin instance.
+int rack_vst3_plugin_set_state_pumped(RackVST3Plugin* plugin, const uint8_t* data, size_t size, double pump_seconds);
 
 // ============================================================================
 // MIDI API
