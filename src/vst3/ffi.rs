@@ -199,7 +199,14 @@ extern "C" {
     /// - If `plugin` is NULL, this function does nothing (safe no-op)
     pub fn rack_vst3_plugin_free(plugin: *mut RackVST3Plugin);
 
-    /// Initialize plugin with sample rate and buffer size
+    /// Initialize plugin with sample rate, buffer size and process mode
+    ///
+    /// `process_mode` is `ProcessSetup::processMode`, as
+    /// [`crate::ProcessMode::as_raw`] encodes it (0 realtime, 1 prefetch,
+    /// 2 offline). The C side refuses any other value with
+    /// `RACK_VST3_ERROR_INVALID_PARAM` rather than guessing, and the mode
+    /// cannot be changed afterwards -- `setupProcessing` may only be called
+    /// while the instance is inactive.
     ///
     /// # Returns
     ///
@@ -211,12 +218,16 @@ extern "C" {
     /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
     /// - `sample_rate` must be positive and reasonable (e.g., 44100-192000)
     /// - `max_block_size` must be positive and reasonable (e.g., 64-8192)
+    /// - `process_mode` must be one of the three encoded values above
     /// - Must be called before `rack_vst3_plugin_process`
     /// - Protected by global mutex for VST3 framework thread-safety
     pub fn rack_vst3_plugin_initialize(
         plugin: *mut RackVST3Plugin,
         sample_rate: f64,
         max_block_size: u32,
+        // `i32`, not `c_int`: the C declaration is `int32_t` exactly, which is
+        // what `ProcessMode::as_raw` produces, so nothing here needs a cast.
+        process_mode: i32,
         initial_state: *const u8,
         initial_state_size: usize,
     ) -> c_int;

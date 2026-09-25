@@ -106,8 +106,18 @@ void rack_vst3_plugin_free(RackVST3Plugin* plugin);
 //
 // State blob format: [uint32_t component_size | component bytes | controller bytes]
 //
+// process_mode selects ProcessSetup::processMode, which the VST3
+// specification lets a plugin trade CPU for quality on when a host reports an
+// offline render:
+//   0 = Vst::kRealtime, 1 = Vst::kPrefetch, 2 = Vst::kOffline
+// Any other value is rejected with RACK_VST3_ERROR_INVALID_PARAM rather than
+// guessed at. The mode is fixed here because setupProcessing may only be
+// called while the instance is inactive: an instance is born in the mode it
+// will render in and is never switched.
+//
 // Returns 0 on success, negative error code on failure
 int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint32_t max_block_size,
+                                int32_t process_mode,
                                 const uint8_t* initial_state, size_t initial_state_size);
 
 // Check if plugin is initialized

@@ -1,4 +1,4 @@
-use crate::{MidiEvent, ParameterInfo, PluginInfo, PresetInfo, Result};
+use crate::{MidiEvent, ParameterInfo, PluginInfo, PresetInfo, ProcessMode, Result};
 
 /// Trait for scanning and discovering audio plugins
 pub trait PluginScanner {
@@ -24,13 +24,25 @@ pub trait PluginScanner {
 /// - Other methods (reset, parameters, etc.) are safe but should not be called from audio thread
 /// - Only `process()` is designed for realtime/audio thread usage
 pub trait PluginInstance: Send {
-    /// Initialize the plugin with the given sample rate and maximum block size
+    /// Initialize the plugin with the given sample rate, maximum block size and
+    /// process mode
+    ///
+    /// All three are one decision, not a value plus two defaults: they are the
+    /// three fields of VST3's own `ProcessSetup`, and none of them can be
+    /// changed later without deactivating the instance first (`setupProcessing`
+    /// may only be called while it is inactive). `process_mode` is therefore a
+    /// parameter here rather than a setter -- an instance is born in the mode
+    /// it will render in. See [`ProcessMode`].
+    ///
+    /// A backend that cannot report a mode to its plugins refuses the ones it
+    /// cannot honour rather than silently initialising in another: a host that
+    /// asked for an offline render and got a realtime one has no way to tell.
     ///
     /// # Thread Safety
     ///
     /// This method is **globally serialized** across all plugin instances to work around
     /// thread-safety issues in Apple's AudioUnit framework. Call from a non-realtime thread.
-    fn initialize(&mut self, sample_rate: f64, max_block_size: usize) -> Result<()>;
+    fn initialize(&mut self, sample_rate: f64, max_block_size: usize, process_mode: ProcessMode) -> Result<()>;
 
     /// Reset the plugin's internal state
     ///
@@ -55,7 +67,7 @@ pub trait PluginInstance: Send {
     /// ```no_run
     /// # use rack::prelude::*;
     /// # fn example(mut plugin: impl PluginInstance) -> Result<()> {
-    /// plugin.initialize(48000.0, 512)?;
+    /// plugin.initialize(48000.0, 512, ProcessMode::Realtime)?;
     /// // ... process audio ...
     /// plugin.reset()?; // Clear reverb tail, delay lines, etc.
     /// # Ok(())

@@ -42,7 +42,7 @@ fn main() -> Result<()> {
     // Initialize with 48kHz sample rate and 512 frame buffer
     let sample_rate = 48000.0;
     let buffer_frames = 512;
-    plugin.initialize(sample_rate, buffer_frames)?;
+    plugin.initialize(sample_rate, buffer_frames, ProcessMode::Realtime)?;
 
     println!("Plugin initialized:");
     println!("  Sample rate: {:.1} Hz", sample_rate);

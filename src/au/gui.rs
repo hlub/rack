@@ -20,7 +20,7 @@
 //! let scanner = Scanner::new()?;
 //! let plugins = scanner.scan()?;
 //! let mut plugin = scanner.load(&plugins[0])?;
-//! plugin.initialize(48000.0, 512)?;
+//! plugin.initialize(48000.0, 512, ProcessMode::Realtime)?;
 //!
 //! // Create GUI asynchronously (must be on main thread)
 //! let gui = Arc::new(Mutex::new(None));

@@ -34,7 +34,7 @@ fn main() -> Result<()> {
     let plugin_with_presets = plugins.iter().find(|info| {
         // Try to check if plugin has presets by creating a temporary instance
         if let Ok(mut plugin) = scanner.load(info) {
-            if plugin.initialize(48000.0, 512).is_ok() {
+            if plugin.initialize(48000.0, 512, ProcessMode::Realtime).is_ok() {
                 return plugin.preset_count().map_or(false, |count| count > 0);
             }
         }
@@ -60,7 +60,7 @@ fn main() -> Result<()> {
     println!("✓ Plugin instance created");
 
     println!("Initializing plugin (48kHz, 512 samples)...");
-    plugin.initialize(48000.0, 512)?;
+    plugin.initialize(48000.0, 512, ProcessMode::Realtime)?;
     println!("✓ Plugin initialized successfully!\n");
 
     // Get preset count

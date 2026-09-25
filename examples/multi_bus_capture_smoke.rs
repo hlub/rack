@@ -57,7 +57,7 @@
 mod run {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use rack::vst3::{ExtraOutputBus, Vst3Plugin, Vst3Scanner};
-    use rack::{MidiEvent, PluginInstance, PluginScanner, Result};
+    use rack::{MidiEvent, PluginInstance, PluginScanner, ProcessMode, Result};
     use std::sync::{Arc, Mutex};
 
     // JUCE-based plugins (AD2 included) load their default kit asynchronously
@@ -176,7 +176,7 @@ mod run {
         println!("Found plugin: {} by {}", info.name, info.manufacturer);
 
         let mut plugin: Vst3Plugin = scanner.load(info)?;
-        plugin.initialize(SAMPLE_RATE, BUFFER_FRAMES)?;
+        plugin.initialize(SAMPLE_RATE, BUFFER_FRAMES, ProcessMode::Realtime)?;
 
         println!(
             "Initialized. Main bus: {} in / {} out. Output bus count: {}\n",

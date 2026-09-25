@@ -1,4 +1,4 @@
-use crate::{Error, MidiEvent, MidiEventKind, ParameterInfo, PluginInfo, PluginInstance, PresetInfo, Result};
+use crate::{Error, MidiEvent, MidiEventKind, ParameterInfo, PluginInfo, PluginInstance, PresetInfo, ProcessMode, Result};
 use smallvec::SmallVec;
 use std::ffi::CString;
 use std::marker::PhantomData;
@@ -371,19 +371,24 @@ impl Vst3Plugin {
     /// This is the correct VST3 lifecycle window for state restoration; it
     /// guarantees that async sample loading (e.g. AD2) completes before the
     /// audio callback starts.
+    ///
+    /// `process_mode` is fixed here for this instance's whole life, exactly as
+    /// in [`PluginInstance::initialize`] -- see [`ProcessMode`].
     pub fn initialize_with_state(
         &mut self,
         sample_rate: f64,
         max_block_size: usize,
+        process_mode: ProcessMode,
         state: &[u8],
     ) -> Result<()> {
-        self.initialize_impl(sample_rate, max_block_size, state)
+        self.initialize_impl(sample_rate, max_block_size, process_mode, state)
     }
 
     fn initialize_impl(
         &mut self,
         sample_rate: f64,
         max_block_size: usize,
+        process_mode: ProcessMode,
         state: &[u8],
     ) -> Result<()> {
         unsafe {
@@ -397,6 +402,7 @@ impl Vst3Plugin {
                 self.inner.as_ptr(),
                 sample_rate,
                 max_block_size as u32,
+                process_mode.as_raw(),
                 state_ptr,
                 state_len,
             );
@@ -1014,8 +1020,8 @@ impl Drop for Vst3Plugin {
 }
 
 impl PluginInstance for Vst3Plugin {
-    fn initialize(&mut self, sample_rate: f64, max_block_size: usize) -> Result<()> {
-        self.initialize_impl(sample_rate, max_block_size, &[])
+    fn initialize(&mut self, sample_rate: f64, max_block_size: usize, process_mode: ProcessMode) -> Result<()> {
+        self.initialize_impl(sample_rate, max_block_size, process_mode, &[])
     }
 
     fn reset(&mut self) -> Result<()> {
@@ -1617,7 +1623,7 @@ mod tests {
         };
 
         let mut plugin = scanner.load(&info).expect("Plugin creation should succeed");
-        let result = plugin.initialize(48000.0, 512);
+        let result = plugin.initialize(48000.0, 512, ProcessMode::Realtime);
         assert!(result.is_ok(), "Plugin initialization should succeed");
         assert!(plugin.is_initialized(), "Plugin should be initialized");
     }
@@ -1650,7 +1656,7 @@ mod tests {
 
         let mut plugin = scanner.load(&info).expect("Plugin creation should succeed");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Plugin initialization should succeed");
 
         let count = plugin.parameter_count();
@@ -1693,7 +1699,7 @@ mod tests {
 
         let mut plugin = scanner.load(&info).expect("Plugin creation should succeed");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Plugin initialization should succeed");
 
         let count = plugin.parameter_count();
@@ -1757,7 +1763,7 @@ mod tests {
 
         let mut plugin = scanner.load(&info).expect("Plugin creation should succeed");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Plugin initialization should succeed");
 
         let count = plugin.preset_count().expect("preset_count should succeed");
@@ -1908,7 +1914,7 @@ mod tests {
         };
 
         let mut plugin = scanner.load(&info).expect("AD2 should load");
-        plugin.initialize(48000.0, 512).expect("AD2 should initialize");
+        plugin.initialize(48000.0, 512, ProcessMode::Realtime).expect("AD2 should initialize");
 
         assert!(
             plugin.output_bus_count() > 1,
@@ -1989,7 +1995,7 @@ mod tests {
         };
 
         let mut plugin = scanner.load(&info).expect("plugin should load");
-        plugin.initialize(48000.0, 512).expect("plugin should initialize");
+        plugin.initialize(48000.0, 512, ProcessMode::Realtime).expect("plugin should initialize");
 
         assert!(
             plugin.input_bus_channel_count(1).is_some(),
@@ -2058,7 +2064,7 @@ mod tests {
             return;
         };
         let mut plugin = scanner.load(&info).expect("AD2 should load");
-        plugin.initialize(48000.0, 512).expect("AD2 should initialize");
+        plugin.initialize(48000.0, 512, ProcessMode::Realtime).expect("AD2 should initialize");
 
         let make_note_ons = |count: u32| -> Vec<MidiEvent> {
             (0..count)
@@ -2103,7 +2109,7 @@ mod tests {
             return;
         };
         let mut plugin = scanner.load(&info).expect("AD2 should load");
-        plugin.initialize(48000.0, 512).expect("AD2 should initialize");
+        plugin.initialize(48000.0, 512, ProcessMode::Realtime).expect("AD2 should initialize");
 
         let events: Vec<MidiEvent> = (0..300u32)
             .map(|index| MidiEvent {
@@ -2147,7 +2153,7 @@ mod tests {
 
         let mut plugin = scanner.load(&info).expect("Plugin creation should succeed");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Plugin initialization should succeed");
 
         let num_frames = 64usize;
@@ -2227,7 +2233,7 @@ mod tests {
         {
             let mut plugin = scanner.load(&info).expect("Plugin creation should succeed");
             plugin
-                .initialize(48000.0, 512)
+                .initialize(48000.0, 512, ProcessMode::Realtime)
                 .expect("Plugin initialization should succeed");
 
             let num_frames = 64usize;
@@ -2256,7 +2262,7 @@ mod tests {
         // same plugin.
         let mut second = scanner.load(&info).expect("second load after teardown should succeed");
         second
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("second initialize after teardown should succeed");
 
         let num_frames = 64usize;
@@ -2293,7 +2299,7 @@ mod tests {
 
         let mut plugin = scanner.load(&info).expect("Plugin creation should succeed");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Plugin initialization should succeed");
 
         let state = plugin.get_state().expect("get_state should succeed");
@@ -2320,7 +2326,7 @@ mod tests {
 
         let mut plugin = scanner.load(&info).expect("Plugin creation should succeed");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Plugin initialization should succeed");
 
         if plugin.parameter_count() == 0 {
@@ -2384,7 +2390,7 @@ mod tests {
 
         let mut plugin = scanner.load(&info).expect("Plugin creation should succeed");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Plugin initialization should succeed");
 
         let index = match (0..plugin.parameter_count()).find(|&index| {
@@ -2506,7 +2512,7 @@ mod tests {
 
         let mut plugin = scanner.load(&info).expect("Plugin creation should succeed");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Plugin initialization should succeed");
 
         let count = plugin.parameter_count();

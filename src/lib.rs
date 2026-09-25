@@ -18,7 +18,7 @@
 //!
 //! // Load a plugin
 //! let mut plugin = scanner.load(&plugins[0])?;
-//! plugin.initialize(48000.0, 512)?;
+//! plugin.initialize(48000.0, 512, ProcessMode::Realtime)?;
 //!
 //! // Process audio (planar format - one buffer per channel)
 //! let left_in = vec![0.0f32; 512];
@@ -55,11 +55,13 @@
 pub mod error;
 pub mod midi;
 pub mod plugin_info;
+pub mod process_mode;
 pub mod traits;
 
 pub use error::{Error, Result};
 pub use midi::{MidiEvent, MidiEventKind};
 pub use plugin_info::{ParameterInfo, PluginInfo, PluginType, PresetInfo};
+pub use process_mode::ProcessMode;
 pub use traits::{PluginInstance, PluginScanner};
 
 // Platform-specific implementations
@@ -99,7 +101,7 @@ pub use vst3::{Vst3Plugin as Plugin, Vst3Scanner as Scanner};
 pub mod prelude {
     pub use crate::{
         Error, MidiEvent, MidiEventKind, ParameterInfo, PluginInfo, PluginInstance,
-        PluginScanner, PluginType, PresetInfo, Result,
+        PluginScanner, PluginType, PresetInfo, ProcessMode, Result,
     };
 
     // Platform-specific exports

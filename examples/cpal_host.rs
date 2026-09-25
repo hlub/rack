@@ -116,7 +116,7 @@ fn main() -> Result<()> {
     // Initialize plugin with device's sample rate
     // Note: We'll use a fixed buffer size for simplicity
     let buffer_frames = 512;
-    plugin.initialize(sample_rate, buffer_frames)?;
+    plugin.initialize(sample_rate, buffer_frames, ProcessMode::Realtime)?;
 
     println!("\n✓ Plugin initialized");
     println!("  Sample rate: {:.0} Hz", sample_rate);

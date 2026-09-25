@@ -23,7 +23,7 @@
 #[cfg(all(feature = "vst3", target_os = "macos"))]
 mod run {
     use rack::vst3::{Vst3Plugin, Vst3Scanner};
-    use rack::{PluginInstance, PluginScanner, Result};
+    use rack::{PluginInstance, PluginScanner, ProcessMode, Result};
     use std::path::Path;
     use std::time::Instant;
 
@@ -92,7 +92,7 @@ mod run {
         let mut plugin: Vst3Plugin = scanner.load(info)?;
 
         let init_start = Instant::now();
-        plugin.initialize(48_000.0, 512)?;
+        plugin.initialize(48_000.0, 512, ProcessMode::Realtime)?;
         println!("initialize: {:.3}s", init_start.elapsed().as_secs_f64());
 
         let get_start = Instant::now();

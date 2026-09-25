@@ -19,7 +19,7 @@ use rack::vst3::Vst3Scanner;
     not(target_os = "watchos"),
     not(target_os = "visionos")
 ))]
-use rack::{PluginInstance, PluginScanner, Result};
+use rack::{PluginInstance, PluginScanner, ProcessMode, Result};
 
 #[cfg(all(
     not(target_os = "ios"),
@@ -58,7 +58,7 @@ fn main() -> Result<()> {
     let buffer_size = 512;
 
     println!("Initializing plugin...");
-    plugin.initialize(sample_rate, buffer_size)?;
+    plugin.initialize(sample_rate, buffer_size, ProcessMode::Realtime)?;
 
     println!("Plugin initialized successfully!");
     println!();

@@ -46,7 +46,7 @@ fn main() -> Result<()> {
         println!("✓ Plugin instance created");
 
         println!("Initializing plugin (48kHz, 512 samples)...");
-        plugin.initialize(48000.0, 512)?;
+        plugin.initialize(48000.0, 512, ProcessMode::Realtime)?;
         println!("✓ Plugin initialized successfully!");
         println!();
 

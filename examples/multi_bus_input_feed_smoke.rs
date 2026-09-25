@@ -73,7 +73,7 @@
 mod run {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use rack::vst3::{ExtraInputBus, ExtraOutputBus, Vst3Plugin, Vst3Scanner};
-    use rack::{PluginInstance, PluginScanner, Result};
+    use rack::{PluginInstance, PluginScanner, ProcessMode, Result};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -280,7 +280,7 @@ mod run {
         println!("Found plugin: {} by {}", info.name, info.manufacturer);
 
         let mut plugin: Vst3Plugin = scanner.load(info)?;
-        plugin.initialize(SAMPLE_RATE, BUFFER_FRAMES)?;
+        plugin.initialize(SAMPLE_RATE, BUFFER_FRAMES, ProcessMode::Realtime)?;
 
         println!(
             "Initialized. Main bus: {} in / {} out. Input bus count: {}\n",

@@ -112,9 +112,24 @@ fn main() {
         println!("cargo:rustc-link-arg=-fno-omit-frame-pointer");
     }
 
-    // Rerun build script if C++ sources, headers, or build config changes
-    println!("cargo:rerun-if-changed=rack-sys/src");
-    println!("cargo:rerun-if-changed=rack-sys/include");
+    // Rerun build script if C++ sources, headers, or build config changes.
+    //
+    // Named file by file, not directory by directory. Cargo compares a
+    // `rerun-if-changed` path's own mtime, and a directory's mtime does not
+    // change when a file inside it is edited -- only when one is added or
+    // removed. So `rerun-if-changed=rack-sys/src` alone silently missed every
+    // edit to an existing .cpp: the C library stayed as it was while the Rust
+    // side recompiled around it, which for a change to an `extern "C"`
+    // signature means a stale callee reading arguments that are no longer
+    // there. That is a wrong-memory bug at run time with nothing at build
+    // time to notice it, so the paths are enumerated.
+    for directory in ["rack-sys/src", "rack-sys/include"] {
+        println!("cargo:rerun-if-changed={directory}");
+        let Ok(entries) = std::fs::read_dir(directory) else { continue };
+        for entry in entries.flatten() {
+            println!("cargo:rerun-if-changed={}", entry.path().display());
+        }
+    }
     println!("cargo:rerun-if-changed=rack-sys/CMakeLists.txt");
     println!("cargo:rerun-if-changed=rack-sys/external/vst3sdk");
 

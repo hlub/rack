@@ -740,9 +740,24 @@ void rack_vst3_plugin_free(RackVST3Plugin* plugin) {
 }
 
 int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint32_t max_block_size,
+                                int32_t process_mode,
                                 const uint8_t* initial_state, size_t initial_state_size) {
     if (!plugin || !plugin->component || !plugin->processor) {
         return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+
+    // Mapped explicitly, never cast: the caller's own integers are a stable
+    // part of this header's contract, and an unknown one is refused rather
+    // than handed to setupProcessing as whatever it happens to equal. The
+    // mode cannot be changed later -- setupProcessing may only be called
+    // while the instance is inactive -- so getting it wrong here is not
+    // recoverable by any later call.
+    int32 mode = kRealtime;
+    switch (process_mode) {
+        case 0: mode = kRealtime; break;
+        case 1: mode = kPrefetch; break;
+        case 2: mode = kOffline;  break;
+        default: return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
     std::lock_guard<std::mutex> lock(rack_vst3_module_load_mutex());
@@ -750,9 +765,11 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
     plugin->sample_rate = sample_rate;
     plugin->max_block_size = max_block_size;
 
-    // Setup processing with 32-bit float samples in realtime mode
+    // Setup processing with 32-bit float samples, in the mode the host asked
+    // for: the VST3 specification invites a plugin to render at higher
+    // quality than realtime when it is told a pass is offline.
     ProcessSetup setup;
-    setup.processMode = kRealtime;
+    setup.processMode = mode;
     setup.symbolicSampleSize = kSample32;
     setup.maxSamplesPerBlock = max_block_size;
     setup.sampleRate = sample_rate;

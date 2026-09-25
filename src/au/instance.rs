@@ -1,4 +1,4 @@
-use crate::{Error, MidiEvent, MidiEventKind, ParameterInfo, PluginInfo, PluginInstance, PresetInfo, Result};
+use crate::{Error, MidiEvent, MidiEventKind, ParameterInfo, PluginInfo, PluginInstance, PresetInfo, ProcessMode, Result};
 use smallvec::SmallVec;
 use std::ffi::CString;
 use std::marker::PhantomData;
@@ -67,7 +67,20 @@ impl AudioUnitPlugin {
 }
 
 impl PluginInstance for AudioUnitPlugin {
-    fn initialize(&mut self, sample_rate: f64, max_block_size: usize) -> Result<()> {
+    /// `process_mode` must be [`ProcessMode::Realtime`]: this bridge sets up an
+    /// AudioUnit through `rack_au_plugin_initialize`, which reports no mode to
+    /// the unit at all (AudioUnit's own equivalent is the
+    /// `kAudioUnitProperty_OfflineRender` property, which this bridge does not
+    /// set). Refused rather than ignored, because a caller that asked for an
+    /// offline render and silently got a realtime one has no way to tell: the
+    /// audio is plausible, just not what was asked for.
+    fn initialize(&mut self, sample_rate: f64, max_block_size: usize, process_mode: ProcessMode) -> Result<()> {
+        if process_mode != ProcessMode::Realtime {
+            return Err(Error::Other(format!(
+                "AudioUnit hosting supports {:?} only; this bridge reports no process mode to the unit, so {:?}                  cannot be honoured",
+                ProcessMode::Realtime, process_mode
+            )));
+        }
         unsafe {
             let result = ffi::rack_au_plugin_initialize(
                 self.inner.as_ptr(),
@@ -570,7 +583,7 @@ impl AudioUnitPlugin {
     /// # let scanner = Scanner::new()?;
     /// # let plugins = scanner.scan()?;
     /// # let mut plugin = scanner.load(&plugins[0])?;
-    /// plugin.initialize(48000.0, 512)?;
+    /// plugin.initialize(48000.0, 512, ProcessMode::Realtime)?;
     /// let channels = plugin.input_channels();
     /// println!("Plugin has {} input channels", channels);
     /// # Ok(())
@@ -599,7 +612,7 @@ impl AudioUnitPlugin {
     /// # let scanner = Scanner::new()?;
     /// # let plugins = scanner.scan()?;
     /// # let mut plugin = scanner.load(&plugins[0])?;
-    /// plugin.initialize(48000.0, 512)?;
+    /// plugin.initialize(48000.0, 512, ProcessMode::Realtime)?;
     /// let channels = plugin.output_channels();
     /// println!("Plugin has {} output channels", channels);
     ///
@@ -651,7 +664,7 @@ impl AudioUnitPlugin {
     /// # let scanner = Scanner::new()?;
     /// # let plugins = scanner.scan()?;
     /// # let mut plugin = scanner.load(&plugins[0])?;
-    /// plugin.initialize(48000.0, 512)?;
+    /// plugin.initialize(48000.0, 512, ProcessMode::Realtime)?;
     ///
     /// plugin.create_gui(|result| {
     ///     match result {
@@ -776,13 +789,13 @@ mod tests {
 
         // Initialize plugin
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
         assert!(plugin.is_initialized(), "Plugin should be initialized");
 
         // Re-initialize should succeed
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Re-initialization should succeed");
         assert!(plugin.is_initialized());
     }
@@ -836,7 +849,7 @@ mod tests {
         // Create and initialize plugin
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         // Create test buffers (planar format - separate buffer per channel)
@@ -885,7 +898,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         let count = plugin.parameter_count();
@@ -906,7 +919,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         let count = plugin.parameter_count();
@@ -939,7 +952,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         let count = plugin.parameter_count();
@@ -989,7 +1002,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         let count = plugin.parameter_count();
@@ -1024,7 +1037,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         let count = plugin.parameter_count();
@@ -1049,7 +1062,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         let count = plugin.parameter_count();
@@ -1097,7 +1110,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         let count = plugin.parameter_count();
@@ -1133,7 +1146,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         let count = plugin.parameter_count();
@@ -1183,7 +1196,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         // Send a C major chord
@@ -1235,7 +1248,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         // Send control change (modulation wheel)
@@ -1256,7 +1269,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         // Send program change
@@ -1277,7 +1290,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         // Send empty event array (should succeed)
@@ -1316,7 +1329,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         // Send notes on different MIDI channels (0, 5, 10, 15)
@@ -1369,7 +1382,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         // Send MIDI to effect plugin (should either fail or be ignored)
@@ -1410,7 +1423,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         // Send events with different sample offsets
@@ -1441,7 +1454,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         let count = plugin.preset_count().expect("Failed to get preset count");
@@ -1461,7 +1474,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         let count = plugin.preset_count().expect("Failed to get preset count");
@@ -1493,7 +1506,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         let count = plugin.preset_count().expect("Failed to get preset count");
@@ -1524,7 +1537,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         // Save original state
@@ -1576,7 +1589,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         let count = plugin.preset_count().expect("Failed to get preset count");
@@ -1621,7 +1634,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         // Try to set empty state
@@ -1656,7 +1669,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         let count = plugin.preset_count().expect("Failed to get preset count");
@@ -1691,7 +1704,7 @@ mod tests {
         assert_eq!(plugin.output_channels(), 0, "Output channels should be 0 before init");
 
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         // After init, should have valid channel counts
@@ -1714,7 +1727,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         let input_ch = plugin.input_channels();
@@ -1748,7 +1761,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         let input_ch = plugin.input_channels();
@@ -1785,7 +1798,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         let input_ch = plugin.input_channels();
@@ -1824,7 +1837,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         let input_ch = plugin.input_channels();
@@ -1890,7 +1903,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         // Reset should succeed after initialization
@@ -1909,7 +1922,7 @@ mod tests {
 
         let mut plugin = AudioUnitPlugin::new(&info).expect("Failed to create plugin");
         plugin
-            .initialize(48000.0, 512)
+            .initialize(48000.0, 512, ProcessMode::Realtime)
             .expect("Failed to initialize plugin");
 
         let input_ch = plugin.input_channels();
