@@ -280,14 +280,14 @@ impl Vst3Plugin {
         self.output_bus_channel_counts.get(bus_index).copied()
     }
 
-    /// Channel count and declared display name of output bus `bus_index`,
-    /// queried live via VST3 `IComponent::getBusInfo`. Read-only; does not
-    /// activate the bus.
+    /// Channel count and declared display name of output bus `bus_index`.
+    /// Once initialized this answers from what `initialize` recorded and makes
+    /// no plugin call; before, it asks VST3 `IComponent::getBusInfo`.
+    /// Read-only; does not activate the bus.
     ///
     /// Prefer [`output_bus_channel_count`](Self::output_bus_channel_count)
-    /// for just the channel count (already cached from `initialize`, no FFI
-    /// round-trip); this method exists for callers that also want the bus's
-    /// declared name (e.g. "Kick", "Snare").
+    /// for just the channel count (no FFI round-trip); this method exists for
+    /// callers that also want the bus's declared name (e.g. "Kick", "Snare").
     pub fn output_bus_info(&self, bus_index: i32) -> Result<(usize, String)> {
         unsafe {
             let mut channels: u32 = 0;
@@ -331,14 +331,14 @@ impl Vst3Plugin {
         self.input_bus_channel_counts.get(bus_index).copied()
     }
 
-    /// Channel count and declared display name of input bus `bus_index`,
-    /// queried live via VST3 `IComponent::getBusInfo`. Read-only; does not
-    /// activate the bus.
+    /// Channel count and declared display name of input bus `bus_index`.
+    /// Once initialized this answers from what `initialize` recorded and makes
+    /// no plugin call; before, it asks VST3 `IComponent::getBusInfo`.
+    /// Read-only; does not activate the bus.
     ///
     /// Prefer [`input_bus_channel_count`](Self::input_bus_channel_count)
-    /// for just the channel count (already cached from `initialize`, no FFI
-    /// round-trip); this method exists for callers that also want the bus's
-    /// declared name.
+    /// for just the channel count (no FFI round-trip); this method exists for
+    /// callers that also want the bus's declared name.
     pub fn input_bus_info(&self, bus_index: i32) -> Result<(usize, String)> {
         unsafe {
             let mut channels: u32 = 0;
@@ -921,7 +921,8 @@ impl Vst3Plugin {
     /// Whether the plugin declares any event OUTPUT bus, i.e. whether it can
     /// emit its own MIDI (an arpeggiator or MIDI-FX plugin). When true,
     /// [`process_multi_bus`](Self::process_multi_bus) with `Some(buffer)`
-    /// will capture those emitted events.
+    /// will capture those emitted events. Once initialized this answers from
+    /// what `initialize` recorded and makes no plugin call.
     #[must_use]
     pub fn emits_midi(&self) -> bool {
         unsafe { ffi::rack_vst3_plugin_emits_midi(self.inner.as_ptr()) }

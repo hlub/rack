@@ -445,93 +445,50 @@ tresult PLUGIN_API ComponentHandler::queryInterface(const TUID _iid, void** obj)
 // smaller than that documented capacity unless overridden here.
 static constexpr int32 kEventListCapacity = 256;
 
-// Internal plugin state
+// One hosted plugin instance.
+//
+// The fields are partitioned by who may touch them, because the Rust layer
+// splits an initialized instance into a processor half (moved to the audio
+// thread) and a controller half (kept on the thread that split it), and the
+// two then run at the same time with nothing serializing them:
+//
+// - The lifecycle objects (module, the three interfaces, path, uid) are
+//   written by rack_vst3_plugin_new and rack_vst3_plugin_free only. The
+//   `processor` interface is called by the processor half for process() alone;
+//   its other methods (setupProcessing, setProcessing, getLatencySamples) and
+//   every bus activation are called only by functions of the whole instance,
+//   which run while the instance is not split.
+// - `fixed` is written only by rack_vst3_plugin_new and
+//   rack_vst3_plugin_initialize and is read by either half.
+// - `proc` belongs to the processor half: process(), the MIDI and parameter
+//   queues, the transport. A function of the whole instance may write it too,
+//   because nothing processes concurrently with one.
+// - `ctrl` belongs to the controller half.
+//
+// A function that touches a field outside its own half's part is a data race
+// the moment the instance is split; the C API's own grouping in rack_vst3.h
+// says which half each function belongs to.
 struct RackVST3Plugin {
-    // Module and factory
+    // Lifecycle objects.
     Hosting::Module::Ptr module;
-
-    // Component and controller
     IPtr<IComponent> component;
     IPtr<IAudioProcessor> processor;
     IPtr<IEditController> controller;
-
-    // Host-provided IComponentHandler, required by the VST3 spec. Kept
-    // alive for the plugin's lifetime; the controller only holds a raw
-    // pointer to it (set via setComponentHandler), not a counted reference.
-    IPtr<IComponentHandler> component_handler;
-
-    // Connection proxy (if component != controller)
-    IPtr<IConnectionPoint> component_cp;
-    IPtr<IConnectionPoint> controller_cp;
-
-    // Plugin info
     std::string path;
     VST3::UID uid;
 
-    // Audio configuration
-    double sample_rate = 0.0;
-    uint32_t max_block_size = 0;
-    bool initialized = false;
-
-    // I/O configuration
-    int32 num_input_channels = 0;
-    int32 num_output_channels = 0;
-
-    // Channel count per declared audio bus, indexed by bus index, populated
-    // during initialize() once every declared bus (not just bus 0) is
-    // activated. output_bus_channel_counts[0] always equals
-    // num_output_channels (kept in sync deliberately -- num_output_channels
-    // stays the stable single-bus field existing callers already rely on via
-    // rack_vst3_plugin_get_output_channels; this vector generalizes it to
-    // every bus for rack_vst3_plugin_process_multi_bus's validation).
-    std::vector<int32_t> input_bus_channel_counts;
-    std::vector<int32_t> output_bus_channel_counts;
-
-    // Processing structures
-    HostProcessData process_data;
-    ParameterChanges input_param_changes;
-    ParameterChanges output_param_changes;
-    EventList input_events{kEventListCapacity};
-    EventList output_events{kEventListCapacity};
-
-    // Process context: tempo/playback state and host position the plugin
-    // reads on every process() call. Built once in initialize(), then kept
-    // live by rack_vst3_plugin_set_transport (see that function's own doc
-    // comment) -- including projectTimeSamples, which this library never
-    // advances on its own, so there is no per-instance position counter here
-    // to disagree with the host's.
-    ProcessContext process_context;
-
-    // Audio buffers for pointer arrays.
-    // dummy_buf: a silent buffer shared across all aux output buses that we
-    // don't capture. The plugin may write to these; we ignore the contents.
-    std::vector<float> dummy_buf;
-    // input_silence_buf: a zeroed buffer shared across all input buses no
-    // caller has fed real audio into for a given process call (every input
-    // bus beyond bus 0, plus bus 0 itself when the caller passes zero
-    // channels). Unlike dummy_buf, this is read BY the plugin, not written
-    // TO by it, so it must actually contain silence rather than arbitrary
-    // leftover data -- it is zeroed once here and never written to again,
-    // which holds only because a well-behaved plugin never writes into an
-    // input buffer (the VST3 spec reserves that for the host).
-    std::vector<float> input_silence_buf;
-    std::vector<float*> input_ptrs;
-    std::vector<float*> output_ptrs;
-
-    // Parameter cache
-    struct ParameterInfo {
-        ParamID id;
+    // A parameter's descriptive metadata, as the controller last reported it.
+    struct ParamMeta {
         std::string title;
         std::string units;
-        ParamValue min_value;
-        ParamValue max_value;
-        ParamValue default_value;
+        ParamValue min_value = 0.0;
+        ParamValue max_value = 1.0;
+        ParamValue default_value = 0.0;
         int32 flags = 0;
         int32 step_count = 0;
     };
-    std::vector<ParameterInfo> parameters;
 
-    // Preset cache (factory presets from IUnitInfo)
+    // A factory preset from IUnitInfo.
     struct PresetInfo {
         int32 program_list_id;
         int32 program_index;
@@ -541,7 +498,88 @@ struct RackVST3Plugin {
         // lists). Empty if the list itself has no name.
         std::string category;
     };
-    std::vector<PresetInfo> presets;
+
+    // Facts fixed at initialization, read by either half.
+    struct Fixed {
+        bool initialized = false;
+        double sample_rate = 0.0;
+        uint32_t max_block_size = 0;
+
+        // Bus 0's channel count in each direction.
+        int32 num_input_channels = 0;
+        int32 num_output_channels = 0;
+
+        // Channel count and name of every declared audio bus, indexed by bus
+        // index. output_bus_channel_counts[0] always equals
+        // num_output_channels (likewise for inputs); these generalize it to
+        // every bus for rack_vst3_plugin_process_multi_bus's validation.
+        std::vector<int32_t> input_bus_channel_counts;
+        std::vector<int32_t> output_bus_channel_counts;
+        std::vector<std::string> input_bus_names;
+        std::vector<std::string> output_bus_names;
+
+        // Whether the plugin declares an event output bus. Cached because the
+        // live answer is an IComponent call, which the audio thread must not
+        // make.
+        bool emits_midi = false;
+
+        // Every parameter's id, indexed by rack's parameter index. Never
+        // rewritten after initialize: the processor half resolves an index to
+        // an id here on the audio thread, so a refresh of the controller's
+        // descriptions (ctrl.param_meta) must leave this alone.
+        std::vector<ParamID> param_ids;
+
+        std::vector<PresetInfo> presets;
+    } fixed;
+
+    // The processor half's state.
+    struct Processing {
+        HostProcessData process_data;
+        ParameterChanges input_param_changes;
+        ParameterChanges output_param_changes;
+        EventList input_events{kEventListCapacity};
+        EventList output_events{kEventListCapacity};
+
+        // Process context: tempo/playback state and host position the plugin
+        // reads on every process() call. Built once in initialize(), then
+        // kept live by rack_vst3_plugin_set_transport (see that function's
+        // own doc comment) -- including projectTimeSamples, which this
+        // library never advances on its own, so there is no per-instance
+        // position counter here to disagree with the host's.
+        ProcessContext process_context;
+
+        // dummy_buf: a silent buffer shared across all aux output buses that
+        // we don't capture. The plugin may write to these; we ignore the
+        // contents.
+        std::vector<float> dummy_buf;
+        // input_silence_buf: a zeroed buffer shared across all input buses no
+        // caller has fed real audio into for a given process call (every
+        // input bus beyond bus 0, plus bus 0 itself when the caller passes
+        // zero channels). Unlike dummy_buf, this is read BY the plugin, not
+        // written TO by it, so it must actually contain silence rather than
+        // arbitrary leftover data -- it is zeroed once here and never written
+        // to again, which holds only because a well-behaved plugin never
+        // writes into an input buffer (the VST3 spec reserves that for the
+        // host).
+        std::vector<float> input_silence_buf;
+    } proc;
+
+    // The controller half's state.
+    struct Control {
+        // Each parameter's metadata, indexed like fixed.param_ids.
+        std::vector<ParamMeta> param_meta;
+
+        // Host-provided IComponentHandler, required by the VST3 spec. Kept
+        // alive for the plugin's lifetime; the controller only holds a raw
+        // pointer to it (set via setComponentHandler), not a counted
+        // reference.
+        IPtr<IComponentHandler> component_handler;
+
+        // The component's and the controller's connection points, when they
+        // are separate objects.
+        IPtr<IConnectionPoint> component_cp;
+        IPtr<IConnectionPoint> controller_cp;
+    } ctrl;
 };
 
 // Rebinds every output bus's channel pointers back to the plugin's shared
@@ -565,20 +603,55 @@ struct RackVST3Plugin {
 // O(total channel count across all buses) per call: a small, fixed,
 // allocation-free cost, matching this file's real-time-safety requirements.
 static void reset_bus_bindings(RackVST3Plugin* plugin) {
-    float* dummy_ptr = plugin->dummy_buf.data();
-    for (int32 b = 0; b < plugin->process_data.numOutputs; ++b) {
-        AudioBusBuffers& bus = plugin->process_data.outputs[b];
+    float* dummy_ptr = plugin->proc.dummy_buf.data();
+    for (int32 b = 0; b < plugin->proc.process_data.numOutputs; ++b) {
+        AudioBusBuffers& bus = plugin->proc.process_data.outputs[b];
         for (int32 ch = 0; ch < bus.numChannels; ++ch) {
             bus.channelBuffers32[ch] = dummy_ptr;
         }
     }
 
-    float* silence_ptr = plugin->input_silence_buf.data();
-    for (int32 b = 0; b < plugin->process_data.numInputs; ++b) {
-        AudioBusBuffers& bus = plugin->process_data.inputs[b];
+    float* silence_ptr = plugin->proc.input_silence_buf.data();
+    for (int32 b = 0; b < plugin->proc.process_data.numInputs; ++b) {
+        AudioBusBuffers& bus = plugin->proc.process_data.inputs[b];
         for (int32 ch = 0; ch < bus.numChannels; ++ch) {
             bus.channelBuffers32[ch] = silence_ptr;
         }
+    }
+}
+
+// Reads the controller's whole parameter list: each parameter's id into
+// `ids` and its description into `meta`, index for index. A parameter whose
+// getParameterInfo fails is left out of both, so the two always have the same
+// length. Controller calls only; the caller says which of its own fields the
+// lists are.
+static void read_parameter_list(IEditController* controller, std::vector<ParamID>& ids,
+                                std::vector<RackVST3Plugin::ParamMeta>& meta) {
+    int32 param_count = controller->getParameterCount();
+    ids.clear();
+    meta.clear();
+    if (param_count <= 0) {
+        return;
+    }
+    ids.reserve(static_cast<size_t>(param_count));
+    meta.reserve(static_cast<size_t>(param_count));
+
+    for (int32 i = 0; i < param_count; ++i) {
+        ParameterInfo vst3_param_info;
+        if (controller->getParameterInfo(i, vst3_param_info) != kResultOk) {
+            continue;
+        }
+        RackVST3Plugin::ParamMeta info;
+        info.title = utf16_to_utf8(vst3_param_info.title);
+        info.units = utf16_to_utf8(vst3_param_info.units);
+        // VST3 parameters are already normalized 0.0-1.0
+        info.min_value = 0.0;
+        info.max_value = 1.0;
+        info.default_value = vst3_param_info.defaultNormalizedValue;
+        info.flags = vst3_param_info.flags;
+        info.step_count = vst3_param_info.stepCount;
+        ids.push_back(vst3_param_info.id);
+        meta.push_back(std::move(info));
     }
 }
 
@@ -680,18 +753,18 @@ RackVST3Plugin* rack_vst3_plugin_new(const char* path, const char* uid) {
     // being present even for a headless host that never acts on its
     // beginEdit/performEdit/endEdit/restartComponent callbacks.
     if (plugin->controller) {
-        plugin->component_handler = IPtr<IComponentHandler>(new ComponentHandler(), false);
-        plugin->controller->setComponentHandler(plugin->component_handler);
+        plugin->ctrl.component_handler = IPtr<IComponentHandler>(new ComponentHandler(), false);
+        plugin->controller->setComponentHandler(plugin->ctrl.component_handler);
     }
 
     // Set up connection points if controller is separate
     if (plugin->controller && reinterpret_cast<void*>(plugin->controller.get()) != reinterpret_cast<void*>(plugin->component.get())) {
-        plugin->component_cp = U::cast<IConnectionPoint>(plugin->component);
-        plugin->controller_cp = U::cast<IConnectionPoint>(plugin->controller);
+        plugin->ctrl.component_cp = U::cast<IConnectionPoint>(plugin->component);
+        plugin->ctrl.controller_cp = U::cast<IConnectionPoint>(plugin->controller);
 
-        if (plugin->component_cp && plugin->controller_cp) {
-            plugin->component_cp->connect(plugin->controller_cp);
-            plugin->controller_cp->connect(plugin->component_cp);
+        if (plugin->ctrl.component_cp && plugin->ctrl.controller_cp) {
+            plugin->ctrl.component_cp->connect(plugin->ctrl.controller_cp);
+            plugin->ctrl.controller_cp->connect(plugin->ctrl.component_cp);
         }
     }
 
@@ -716,9 +789,9 @@ void rack_vst3_plugin_free(RackVST3Plugin* plugin) {
     suspend_for_state(plugin);
 
     // Disconnect connection points
-    if (plugin->component_cp && plugin->controller_cp) {
-        plugin->component_cp->disconnect(plugin->controller_cp);
-        plugin->controller_cp->disconnect(plugin->component_cp);
+    if (plugin->ctrl.component_cp && plugin->ctrl.controller_cp) {
+        plugin->ctrl.component_cp->disconnect(plugin->ctrl.controller_cp);
+        plugin->ctrl.controller_cp->disconnect(plugin->ctrl.component_cp);
     }
 
     // Terminate controller
@@ -762,8 +835,8 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
 
     std::lock_guard<std::mutex> lock(rack_vst3_module_load_mutex());
 
-    plugin->sample_rate = sample_rate;
-    plugin->max_block_size = max_block_size;
+    plugin->fixed.sample_rate = sample_rate;
+    plugin->fixed.max_block_size = max_block_size;
 
     // Setup processing with 32-bit float samples, in the mode the host asked
     // for: the VST3 specification invites a plugin to render at higher
@@ -796,33 +869,43 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
     // already ignored it) -- getBusInfo is queried unconditionally regardless
     // of whether activation reports success, so a channel count is still
     // recorded even if a given bus somehow fails to activate.
-    plugin->input_bus_channel_counts.clear();
-    plugin->input_bus_channel_counts.reserve(numInputBuses);
+    plugin->fixed.input_bus_channel_counts.clear();
+    plugin->fixed.input_bus_channel_counts.reserve(numInputBuses);
+    plugin->fixed.input_bus_names.clear();
+    plugin->fixed.input_bus_names.reserve(numInputBuses);
     for (int32 b = 0; b < numInputBuses; ++b) {
         plugin->component->activateBus(kAudio, kInput, b, true);
         BusInfo busInfo;
         int32 channelCount = 0;
+        std::string name;
         if (plugin->component->getBusInfo(kAudio, kInput, b, busInfo) == kResultOk) {
             channelCount = busInfo.channelCount;
+            name = utf16_to_utf8(busInfo.name);
         }
-        plugin->input_bus_channel_counts.push_back(channelCount);
+        plugin->fixed.input_bus_channel_counts.push_back(channelCount);
+        plugin->fixed.input_bus_names.push_back(std::move(name));
         if (b == 0) {
-            plugin->num_input_channels = channelCount;
+            plugin->fixed.num_input_channels = channelCount;
         }
     }
 
-    plugin->output_bus_channel_counts.clear();
-    plugin->output_bus_channel_counts.reserve(numOutputBuses);
+    plugin->fixed.output_bus_channel_counts.clear();
+    plugin->fixed.output_bus_channel_counts.reserve(numOutputBuses);
+    plugin->fixed.output_bus_names.clear();
+    plugin->fixed.output_bus_names.reserve(numOutputBuses);
     for (int32 b = 0; b < numOutputBuses; ++b) {
         plugin->component->activateBus(kAudio, kOutput, b, true);
         BusInfo busInfo;
         int32 channelCount = 0;
+        std::string name;
         if (plugin->component->getBusInfo(kAudio, kOutput, b, busInfo) == kResultOk) {
             channelCount = busInfo.channelCount;
+            name = utf16_to_utf8(busInfo.name);
         }
-        plugin->output_bus_channel_counts.push_back(channelCount);
+        plugin->fixed.output_bus_channel_counts.push_back(channelCount);
+        plugin->fixed.output_bus_names.push_back(std::move(name));
         if (b == 0) {
-            plugin->num_output_channels = channelCount;
+            plugin->fixed.num_output_channels = channelCount;
         }
     }
 
@@ -842,6 +925,7 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
     for (int32 i = 0; i < numEventOutputBuses; ++i) {
         plugin->component->activateBus(kEvent, kOutput, i, true);
     }
+    plugin->fixed.emits_midi = numEventOutputBuses > 0;
 
     // Activate component
     if (plugin->component->setActive(true) != kResultOk) {
@@ -893,14 +977,14 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
     // pointers. We manage our own buffers to avoid heap corruption on cleanup
     // (if prepare allocates buffers and we replace channelBuffers32 with Rust
     // pointers, the destructor would try to free our Rust memory).
-    plugin->process_data.prepare(*plugin->component, 0, kSample32);
+    plugin->proc.process_data.prepare(*plugin->component, 0, kSample32);
 
     // Allocate a silent dummy buffer for aux output buses we don't capture,
     // and a zeroed silence buffer for input buses no caller feeds (see
     // reset_bus_bindings for why these must be two distinct buffers rather
     // than one shared between input and output).
-    plugin->dummy_buf.assign(max_block_size, 0.0f);
-    plugin->input_silence_buf.assign(max_block_size, 0.0f);
+    plugin->proc.dummy_buf.assign(max_block_size, 0.0f);
+    plugin->proc.input_silence_buf.assign(max_block_size, 0.0f);
 
     // Point every output bus at the dummy buffer and every input bus at the
     // silence buffer by default; rack_vst3_plugin_process[_multi_bus] repeat
@@ -925,44 +1009,23 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
     // back to its own defaults instead. The 4/4 is still written so a plugin
     // that reads the fields without checking the flag -- a common enough
     // real-world sloppiness -- finds a sane time signature rather than 0/0.
-    memset(&plugin->process_context, 0, sizeof(ProcessContext));
-    plugin->process_context.state =
+    memset(&plugin->proc.process_context, 0, sizeof(ProcessContext));
+    plugin->proc.process_context.state =
         ProcessContext::kPlaying |
         ProcessContext::kTempoValid |
         ProcessContext::kProjectTimeMusicValid |
         ProcessContext::kBarPositionValid;
-    plugin->process_context.sampleRate = sample_rate;
-    plugin->process_context.tempo = 120.0;
-    plugin->process_context.timeSigNumerator = 4;
-    plugin->process_context.timeSigDenominator = 4;
-    plugin->process_data.processContext = &plugin->process_context;
+    plugin->proc.process_context.sampleRate = sample_rate;
+    plugin->proc.process_context.tempo = 120.0;
+    plugin->proc.process_context.timeSigNumerator = 4;
+    plugin->proc.process_context.timeSigDenominator = 4;
+    plugin->proc.process_data.processContext = &plugin->proc.process_context;
 
-    // Build parameter cache; log any program-change-flagged parameters.
+    // Build the parameter list: the ids into `fixed`, the descriptions into
+    // `ctrl`, so a later refresh of the descriptions never rewrites the ids
+    // the audio thread reads.
     if (plugin->controller) {
-        int32 param_count = plugin->controller->getParameterCount();
-        plugin->parameters.clear();
-        plugin->parameters.reserve(param_count);
-
-        for (int32 i = 0; i < param_count; ++i) {
-            ParameterInfo vst3_param_info;
-            if (plugin->controller->getParameterInfo(i, vst3_param_info) == kResultOk) {
-                RackVST3Plugin::ParameterInfo info;
-                info.id = vst3_param_info.id;
-
-                // Convert UTF-16 to UTF-8 (proper conversion for international characters)
-                info.title = utf16_to_utf8(vst3_param_info.title);
-                info.units = utf16_to_utf8(vst3_param_info.units);
-
-                // VST3 parameters are already normalized 0.0-1.0
-                info.min_value = 0.0;
-                info.max_value = 1.0;
-                info.default_value = vst3_param_info.defaultNormalizedValue;
-                info.flags = vst3_param_info.flags;
-                info.step_count = vst3_param_info.stepCount;
-
-                plugin->parameters.push_back(info);
-            }
-        }
+        read_parameter_list(plugin->controller, plugin->fixed.param_ids, plugin->ctrl.param_meta);
 
         // Pre-create one ParameterValueQueue per known parameter now, up
         // front, rather than letting ParameterChanges::addParameterData grow
@@ -977,12 +1040,10 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
         // on the audio thread inside process(). Both queues are sized to the
         // full known parameter count so rack_vst3_plugin_queue_parameter_change
         // (which only ever queues indices already validated against
-        // plugin->parameters) can genuinely guarantee no allocation once
+        // fixed.param_ids) can genuinely guarantee no allocation once
         // initialize() has returned.
-        plugin->input_param_changes.setMaxParameters(static_cast<int32>(plugin->parameters.size()));
-        plugin->output_param_changes.setMaxParameters(static_cast<int32>(plugin->parameters.size()));
-
-        // Query IMidiMapping to find which parameter handles MIDI Program Change.
+        plugin->proc.input_param_changes.setMaxParameters(static_cast<int32>(plugin->fixed.param_ids.size()));
+        plugin->proc.output_param_changes.setMaxParameters(static_cast<int32>(plugin->fixed.param_ids.size()));
     }
 
     // Enumerate factory presets if available
@@ -1002,19 +1063,19 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
                         preset.program_index = j;
                         preset.name = utf16_to_utf8(program_name);
                         preset.category = list_name;
-                        plugin->presets.push_back(preset);
+                        plugin->fixed.presets.push_back(preset);
                     }
                 }
             }
         }
     }
 
-    plugin->initialized = true;
+    plugin->fixed.initialized = true;
     return RACK_VST3_OK;
 }
 
 int rack_vst3_plugin_is_initialized(RackVST3Plugin* plugin) {
-    return (plugin && plugin->initialized) ? 1 : 0;
+    return (plugin && plugin->fixed.initialized) ? 1 : 0;
 }
 
 int rack_vst3_plugin_reset(RackVST3Plugin* plugin) {
@@ -1027,7 +1088,7 @@ int rack_vst3_plugin_reset(RackVST3Plugin* plugin) {
     // Without this, another thread could change initialized between check and lock
     std::lock_guard<std::mutex> lock(rack_vst3_module_load_mutex());
 
-    if (!plugin->initialized || !plugin->component) {
+    if (!plugin->fixed.initialized || !plugin->component) {
         return RACK_VST3_ERROR_NOT_INITIALIZED;
     }
 
@@ -1056,34 +1117,41 @@ int rack_vst3_plugin_reset(RackVST3Plugin* plugin) {
 }
 
 int rack_vst3_plugin_get_input_channels(RackVST3Plugin* plugin) {
-    if (!plugin || !plugin->initialized) {
+    if (!plugin || !plugin->fixed.initialized) {
         return 0;
     }
-    return plugin->num_input_channels;
+    return plugin->fixed.num_input_channels;
 }
 
 int rack_vst3_plugin_get_output_channels(RackVST3Plugin* plugin) {
-    if (!plugin || !plugin->initialized) {
+    if (!plugin || !plugin->fixed.initialized) {
         return 0;
     }
-    return plugin->num_output_channels;
+    return plugin->fixed.num_output_channels;
 }
 
 // getLatencySamples() is documented [UI-thread & Setup Done] by the VST3 SDK
 // (ivstaudioprocessor.h) -- valid any time after setupProcessing, which
-// initialize() already calls before setting plugin->initialized, so gating
-// on plugin->initialized alone (same as get_input_channels/get_output_channels
+// initialize() already calls before setting plugin->fixed.initialized, so gating
+// on plugin->fixed.initialized alone (same as get_input_channels/get_output_channels
 // above) is sufficient; no separate "setup done" flag is needed.
 uint32_t rack_vst3_plugin_get_latency_samples(RackVST3Plugin* plugin) {
-    if (!plugin || !plugin->initialized || !plugin->processor) {
+    if (!plugin || !plugin->fixed.initialized || !plugin->processor) {
         return 0;
     }
     return plugin->processor->getLatencySamples();
 }
 
+// Bus counts, bus names and emits_midi answer from `fixed` once the instance
+// is initialized, so the controller half reads them with no plugin call; the
+// live IComponent query is made only before initialize, which only the whole
+// instance can be.
 int rack_vst3_plugin_get_output_bus_count(RackVST3Plugin* plugin) {
     if (!plugin || !plugin->component) {
         return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+    if (plugin->fixed.initialized) {
+        return static_cast<int>(plugin->fixed.output_bus_channel_counts.size());
     }
     return plugin->component->getBusCount(kAudio, kOutput);
 }
@@ -1092,6 +1160,9 @@ int rack_vst3_plugin_get_input_bus_count(RackVST3Plugin* plugin) {
     if (!plugin || !plugin->component) {
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
+    if (plugin->fixed.initialized) {
+        return static_cast<int>(plugin->fixed.input_bus_channel_counts.size());
+    }
     return plugin->component->getBusCount(kAudio, kInput);
 }
 
@@ -1099,13 +1170,27 @@ bool rack_vst3_plugin_emits_midi(RackVST3Plugin* plugin) {
     if (!plugin || !plugin->component) {
         return false;
     }
+    if (plugin->fixed.initialized) {
+        return plugin->fixed.emits_midi;
+    }
     return plugin->component->getBusCount(kEvent, kOutput) > 0;
 }
 
+// Copies a UTF-8 name into a caller-supplied buffer, truncating to fit and
+// always terminating it.
+static void copy_name(const std::string& name, char* name_out, size_t name_out_size) {
+    if (name_out && name_out_size > 0) {
+        size_t copy_len = std::min(name.size(), name_out_size - 1);
+        memcpy(name_out, name.data(), copy_len);
+        name_out[copy_len] = '\0';
+    }
+}
+
 // Shared implementation for rack_vst3_plugin_get_{output,input}_bus_info:
-// looks up BusInfo for `bus_index` on the given direction and copies its
-// channel count / UTF-8 name out to the caller-supplied buffers. Read-only:
-// does not activate the bus.
+// looks up `bus_index` in the given direction and copies its channel count /
+// UTF-8 name out to the caller-supplied buffers -- from `fixed` once
+// initialized, live from IComponent::getBusInfo before. Read-only: does not
+// activate the bus.
 static int get_bus_info(
     RackVST3Plugin* plugin,
     BusDirection direction,
@@ -1116,6 +1201,21 @@ static int get_bus_info(
 {
     if (!plugin || !plugin->component) {
         return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+
+    if (plugin->fixed.initialized) {
+        const auto& counts = direction == kInput ? plugin->fixed.input_bus_channel_counts
+                                                 : plugin->fixed.output_bus_channel_counts;
+        const auto& names = direction == kInput ? plugin->fixed.input_bus_names
+                                                : plugin->fixed.output_bus_names;
+        if (bus_index < 0 || static_cast<size_t>(bus_index) >= counts.size()) {
+            return RACK_VST3_ERROR_INVALID_PARAM;
+        }
+        if (channels_out) {
+            *channels_out = static_cast<uint32_t>(counts[static_cast<size_t>(bus_index)]);
+        }
+        copy_name(names[static_cast<size_t>(bus_index)], name_out, name_out_size);
+        return RACK_VST3_OK;
     }
 
     int32 bus_count = plugin->component->getBusCount(kAudio, direction);
@@ -1131,14 +1231,7 @@ static int get_bus_info(
     if (channels_out) {
         *channels_out = static_cast<uint32_t>(bus_info.channelCount);
     }
-
-    if (name_out && name_out_size > 0) {
-        std::string name_utf8 = utf16_to_utf8(bus_info.name);
-        size_t copy_len = std::min(name_utf8.size(), name_out_size - 1);
-        memcpy(name_out, name_utf8.data(), copy_len);
-        name_out[copy_len] = '\0';
-    }
-
+    copy_name(utf16_to_utf8(bus_info.name), name_out, name_out_size);
     return RACK_VST3_OK;
 }
 
@@ -1170,20 +1263,20 @@ int rack_vst3_plugin_process(
     uint32_t num_output_channels,
     uint32_t frames)
 {
-    if (!plugin || !plugin->initialized || !plugin->processor) {
+    if (!plugin || !plugin->fixed.initialized || !plugin->processor) {
         return RACK_VST3_ERROR_NOT_INITIALIZED;
     }
 
     // Validate input parameters to prevent buffer overruns
     // Channel counts must match what was configured during initialization
-    if (num_input_channels != static_cast<uint32_t>(plugin->num_input_channels)) {
+    if (num_input_channels != static_cast<uint32_t>(plugin->fixed.num_input_channels)) {
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
-    if (num_output_channels != static_cast<uint32_t>(plugin->num_output_channels)) {
+    if (num_output_channels != static_cast<uint32_t>(plugin->fixed.num_output_channels)) {
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
     // Frame count must not exceed the max block size configured during initialization
-    if (frames > plugin->max_block_size) {
+    if (frames > plugin->fixed.max_block_size) {
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
@@ -1196,7 +1289,7 @@ int rack_vst3_plugin_process(
     }
 
     // Update dynamic fields only (prepare() was called during initialization)
-    plugin->process_data.numSamples = frames;
+    plugin->proc.process_data.numSamples = frames;
 
     // Reset every bus to its default (silent/dummy) binding before applying
     // this call's own bus-0 buffers below. This function only ever rebinds
@@ -1210,7 +1303,7 @@ int rack_vst3_plugin_process(
     // array rather than replacing the array pointer. This avoids freeing
     // Rust-owned memory in HostProcessData::destroyBuffers().
     if (num_input_channels > 0 && inputs) {
-        AudioBusBuffers& bus = plugin->process_data.inputs[0];
+        AudioBusBuffers& bus = plugin->proc.process_data.inputs[0];
         for (uint32_t ch = 0; ch < num_input_channels && ch < (uint32_t)bus.numChannels; ++ch) {
             bus.channelBuffers32[ch] = const_cast<float*>(inputs[ch]);
         }
@@ -1218,26 +1311,26 @@ int rack_vst3_plugin_process(
 
     // Set output buffers the same way.
     if (num_output_channels > 0 && outputs) {
-        AudioBusBuffers& bus = plugin->process_data.outputs[0];
+        AudioBusBuffers& bus = plugin->proc.process_data.outputs[0];
         for (uint32_t ch = 0; ch < num_output_channels && ch < (uint32_t)bus.numChannels; ++ch) {
             bus.channelBuffers32[ch] = outputs[ch];
         }
     }
 
     // Set parameter and event interfaces
-    plugin->process_data.inputParameterChanges = &plugin->input_param_changes;
-    plugin->process_data.outputParameterChanges = &plugin->output_param_changes;
-    plugin->process_data.inputEvents = &plugin->input_events;
-    plugin->process_data.outputEvents = &plugin->output_events;
+    plugin->proc.process_data.inputParameterChanges = &plugin->proc.input_param_changes;
+    plugin->proc.process_data.outputParameterChanges = &plugin->proc.output_param_changes;
+    plugin->proc.process_data.inputEvents = &plugin->proc.input_events;
+    plugin->proc.process_data.outputEvents = &plugin->proc.output_events;
 
     // Process
-    tresult result = plugin->processor->process(plugin->process_data);
+    tresult result = plugin->processor->process(plugin->proc.process_data);
 
     // Clear input/output events and parameter changes for next call
-    plugin->input_events.clear();
-    plugin->input_param_changes.clearQueue();
-    plugin->output_events.clear();
-    plugin->output_param_changes.clearQueue();
+    plugin->proc.input_events.clear();
+    plugin->proc.input_param_changes.clearQueue();
+    plugin->proc.output_events.clear();
+    plugin->proc.output_param_changes.clearQueue();
 
     return (result == kResultOk) ? RACK_VST3_OK : RACK_VST3_ERROR_GENERIC;
 }
@@ -1351,18 +1444,18 @@ int rack_vst3_plugin_process_multi_bus(
     size_t output_events_capacity,
     size_t* num_output_events_out)
 {
-    if (!plugin || !plugin->initialized || !plugin->processor) {
+    if (!plugin || !plugin->fixed.initialized || !plugin->processor) {
         return RACK_VST3_ERROR_NOT_INITIALIZED;
     }
 
     // Validate bus-0 (main) parameters exactly as rack_vst3_plugin_process does.
-    if (num_input_channels != static_cast<uint32_t>(plugin->num_input_channels)) {
+    if (num_input_channels != static_cast<uint32_t>(plugin->fixed.num_input_channels)) {
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
-    if (num_output_channels != static_cast<uint32_t>(plugin->num_output_channels)) {
+    if (num_output_channels != static_cast<uint32_t>(plugin->fixed.num_output_channels)) {
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
-    if (frames > plugin->max_block_size) {
+    if (frames > plugin->fixed.max_block_size) {
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
     if (num_input_channels > 0 && !inputs) {
@@ -1382,11 +1475,11 @@ int rack_vst3_plugin_process_multi_bus(
     for (size_t i = 0; i < num_extra_output_buses; ++i) {
         const RackVST3ExtraOutputBus& extra = extra_output_buses[i];
         if (extra.bus_index <= 0 ||
-            static_cast<size_t>(extra.bus_index) >= plugin->output_bus_channel_counts.size()) {
+            static_cast<size_t>(extra.bus_index) >= plugin->fixed.output_bus_channel_counts.size()) {
             return RACK_VST3_ERROR_INVALID_PARAM;
         }
         if (extra.channel_count !=
-            static_cast<uint32_t>(plugin->output_bus_channel_counts[static_cast<size_t>(extra.bus_index)])) {
+            static_cast<uint32_t>(plugin->fixed.output_bus_channel_counts[static_cast<size_t>(extra.bus_index)])) {
             return RACK_VST3_ERROR_INVALID_PARAM;
         }
         if (extra.channel_count > 0 && !extra.channels) {
@@ -1408,11 +1501,11 @@ int rack_vst3_plugin_process_multi_bus(
     for (size_t i = 0; i < num_extra_input_buses; ++i) {
         const RackVST3ExtraInputBus& extra = extra_input_buses[i];
         if (extra.bus_index <= 0 ||
-            static_cast<size_t>(extra.bus_index) >= plugin->input_bus_channel_counts.size()) {
+            static_cast<size_t>(extra.bus_index) >= plugin->fixed.input_bus_channel_counts.size()) {
             return RACK_VST3_ERROR_INVALID_PARAM;
         }
         if (extra.channel_count !=
-            static_cast<uint32_t>(plugin->input_bus_channel_counts[static_cast<size_t>(extra.bus_index)])) {
+            static_cast<uint32_t>(plugin->fixed.input_bus_channel_counts[static_cast<size_t>(extra.bus_index)])) {
             return RACK_VST3_ERROR_INVALID_PARAM;
         }
         if (extra.channel_count > 0 && !extra.channels) {
@@ -1426,7 +1519,7 @@ int rack_vst3_plugin_process_multi_bus(
     }
 
     // Update dynamic fields only (prepare() was called during initialization)
-    plugin->process_data.numSamples = frames;
+    plugin->proc.process_data.numSamples = frames;
 
     // Reset every bus to its default (silent/dummy) binding before applying
     // this call's own bus-0 and extra-bus buffers below, so any bus this
@@ -1440,7 +1533,7 @@ int rack_vst3_plugin_process_multi_bus(
     // array rather than replacing the array pointer. This avoids freeing
     // Rust-owned memory in HostProcessData::destroyBuffers().
     if (num_input_channels > 0 && inputs) {
-        AudioBusBuffers& bus = plugin->process_data.inputs[0];
+        AudioBusBuffers& bus = plugin->proc.process_data.inputs[0];
         for (uint32_t ch = 0; ch < num_input_channels && ch < (uint32_t)bus.numChannels; ++ch) {
             bus.channelBuffers32[ch] = const_cast<float*>(inputs[ch]);
         }
@@ -1448,7 +1541,7 @@ int rack_vst3_plugin_process_multi_bus(
 
     // Set bus-0 (main) output buffers the same way.
     if (num_output_channels > 0 && outputs) {
-        AudioBusBuffers& bus = plugin->process_data.outputs[0];
+        AudioBusBuffers& bus = plugin->proc.process_data.outputs[0];
         for (uint32_t ch = 0; ch < num_output_channels && ch < (uint32_t)bus.numChannels; ++ch) {
             bus.channelBuffers32[ch] = outputs[ch];
         }
@@ -1460,7 +1553,7 @@ int rack_vst3_plugin_process_multi_bus(
     // allocation: real-time-safe.
     for (size_t i = 0; i < num_extra_output_buses; ++i) {
         const RackVST3ExtraOutputBus& extra = extra_output_buses[i];
-        AudioBusBuffers& bus = plugin->process_data.outputs[extra.bus_index];
+        AudioBusBuffers& bus = plugin->proc.process_data.outputs[extra.bus_index];
         for (uint32_t ch = 0; ch < extra.channel_count && ch < (uint32_t)bus.numChannels; ++ch) {
             bus.channelBuffers32[ch] = extra.channels[ch];
         }
@@ -1475,22 +1568,22 @@ int rack_vst3_plugin_process_multi_bus(
     // `const float* const*`).
     for (size_t i = 0; i < num_extra_input_buses; ++i) {
         const RackVST3ExtraInputBus& extra = extra_input_buses[i];
-        AudioBusBuffers& bus = plugin->process_data.inputs[extra.bus_index];
+        AudioBusBuffers& bus = plugin->proc.process_data.inputs[extra.bus_index];
         for (uint32_t ch = 0; ch < extra.channel_count && ch < (uint32_t)bus.numChannels; ++ch) {
             bus.channelBuffers32[ch] = const_cast<float*>(extra.channels[ch]);
         }
     }
 
     // Set parameter and event interfaces
-    plugin->process_data.inputParameterChanges = &plugin->input_param_changes;
-    plugin->process_data.outputParameterChanges = &plugin->output_param_changes;
-    plugin->process_data.inputEvents = &plugin->input_events;
-    plugin->process_data.outputEvents = &plugin->output_events;
+    plugin->proc.process_data.inputParameterChanges = &plugin->proc.input_param_changes;
+    plugin->proc.process_data.outputParameterChanges = &plugin->proc.output_param_changes;
+    plugin->proc.process_data.inputEvents = &plugin->proc.input_events;
+    plugin->proc.process_data.outputEvents = &plugin->proc.output_events;
 
     // Process. A single VST3 process() call computes every activated bus at
     // once, so this one call produces bus 0's audio plus every extra bus
     // rebound above.
-    tresult result = plugin->processor->process(plugin->process_data);
+    tresult result = plugin->processor->process(plugin->proc.process_data);
 
     // Capture the plugin's own emitted MIDI output events (e.g. from an
     // arpeggiator) BEFORE they are cleared below. Skipped entirely when the
@@ -1500,10 +1593,10 @@ int rack_vst3_plugin_process_multi_bus(
     // can detect truncation; only the first output_events_capacity are written.
     size_t produced = 0;
     if (output_events_out) {
-        int32 event_count = plugin->output_events.getEventCount();
+        int32 event_count = plugin->proc.output_events.getEventCount();
         for (int32 i = 0; i < event_count; ++i) {
             Event vst3_event;
-            if (plugin->output_events.getEvent(i, vst3_event) != kResultOk) {
+            if (plugin->proc.output_events.getEvent(i, vst3_event) != kResultOk) {
                 continue;
             }
             RackVST3MidiEvent decoded;
@@ -1521,10 +1614,10 @@ int rack_vst3_plugin_process_multi_bus(
     }
 
     // Clear input/output events and parameter changes for next call
-    plugin->input_events.clear();
-    plugin->input_param_changes.clearQueue();
-    plugin->output_events.clear();
-    plugin->output_param_changes.clearQueue();
+    plugin->proc.input_events.clear();
+    plugin->proc.input_param_changes.clearQueue();
+    plugin->proc.output_events.clear();
+    plugin->proc.output_param_changes.clearQueue();
 
     return (result == kResultOk) ? RACK_VST3_OK : RACK_VST3_ERROR_GENERIC;
 }
@@ -1537,7 +1630,7 @@ int rack_vst3_plugin_parameter_count(RackVST3Plugin* plugin) {
     if (!plugin || !plugin->controller) {
         return 0;
     }
-    return static_cast<int>(plugin->parameters.size());
+    return static_cast<int>(plugin->fixed.param_ids.size());
 }
 
 int rack_vst3_plugin_get_parameter(RackVST3Plugin* plugin, uint32_t index, float* value) {
@@ -1545,11 +1638,11 @@ int rack_vst3_plugin_get_parameter(RackVST3Plugin* plugin, uint32_t index, float
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
-    if (index >= plugin->parameters.size()) {
+    if (index >= plugin->fixed.param_ids.size()) {
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
-    ParamID param_id = plugin->parameters[index].id;
+    ParamID param_id = plugin->fixed.param_ids[index];
     ParamValue normalized = plugin->controller->getParamNormalized(param_id);
     *value = static_cast<float>(normalized);
 
@@ -1561,7 +1654,7 @@ int rack_vst3_plugin_set_parameter(RackVST3Plugin* plugin, uint32_t index, float
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
-    if (index >= plugin->parameters.size()) {
+    if (index >= plugin->fixed.param_ids.size()) {
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
@@ -1571,7 +1664,7 @@ int rack_vst3_plugin_set_parameter(RackVST3Plugin* plugin, uint32_t index, float
     if (value < 0.0f) value = 0.0f;
     if (value > 1.0f) value = 1.0f;
 
-    ParamID param_id = plugin->parameters[index].id;
+    ParamID param_id = plugin->fixed.param_ids[index];
 
     // Set parameter value on controller (for UI reflection)
     plugin->controller->setParamNormalized(param_id, value);
@@ -1579,7 +1672,7 @@ int rack_vst3_plugin_set_parameter(RackVST3Plugin* plugin, uint32_t index, float
     // Queue parameter change for component notification in next process() call
     // This ensures the component receives the parameter change properly
     int32 queue_index = 0;
-    IParamValueQueue* queue = plugin->input_param_changes.addParameterData(param_id, queue_index);
+    IParamValueQueue* queue = plugin->proc.input_param_changes.addParameterData(param_id, queue_index);
     if (queue) {
         // Add parameter change at sample offset 0 (beginning of next buffer)
         int32 point_index = 0;
@@ -1595,7 +1688,7 @@ int rack_vst3_plugin_set_parameter_by_id(RackVST3Plugin* plugin, uint32_t param_
     if (value > 1.0f) value = 1.0f;
     plugin->controller->setParamNormalized(param_id, value);
     int32 queue_index = 0;
-    IParamValueQueue* queue = plugin->input_param_changes.addParameterData(param_id, queue_index);
+    IParamValueQueue* queue = plugin->proc.input_param_changes.addParameterData(param_id, queue_index);
     if (queue) {
         int32 point_index = 0;
         queue->addPoint(0, value, point_index);
@@ -1616,17 +1709,17 @@ int rack_vst3_plugin_queue_parameter_change(RackVST3Plugin* plugin, uint32_t ind
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
-    if (index >= plugin->parameters.size()) {
+    if (index >= plugin->fixed.param_ids.size()) {
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
     if (value < 0.0f) value = 0.0f;
     if (value > 1.0f) value = 1.0f;
 
-    ParamID param_id = plugin->parameters[index].id;
+    ParamID param_id = plugin->fixed.param_ids[index];
 
     int32 queue_index = 0;
-    IParamValueQueue* queue = plugin->input_param_changes.addParameterData(param_id, queue_index);
+    IParamValueQueue* queue = plugin->proc.input_param_changes.addParameterData(param_id, queue_index);
     if (queue) {
         int32 point_index = 0;
         queue->addPoint(0, value, point_index);
@@ -1644,8 +1737,8 @@ uint32_t rack_vst3_plugin_get_midi_pc_param_id(RackVST3Plugin* plugin, int chann
     return pid;
 }
 
-// Writes directly into plugin->process_context (a plain member, pointed to
-// once by plugin->process_data.processContext during initialize -- see the
+// Writes directly into plugin->proc.process_context (a plain member, pointed to
+// once by plugin->proc.process_data.processContext during initialize -- see the
 // memset block there -- and never rebuilt), so this call is sufficient on
 // its own with no need to touch process_data again. Safe with no
 // locking/queuing only because the caller is required (see this function's
@@ -1661,15 +1754,15 @@ int rack_vst3_plugin_set_transport(
     double project_time_music,
     double bar_position_music)
 {
-    if (!plugin || !plugin->initialized) {
+    if (!plugin || !plugin->fixed.initialized) {
         return RACK_VST3_ERROR_NOT_INITIALIZED;
     }
 
-    plugin->process_context.tempo = tempo;
+    plugin->proc.process_context.tempo = tempo;
     if (playing) {
-        plugin->process_context.state |= ProcessContext::kPlaying;
+        plugin->proc.process_context.state |= ProcessContext::kPlaying;
     } else {
-        plugin->process_context.state &= ~ProcessContext::kPlaying;
+        plugin->proc.process_context.state &= ~ProcessContext::kPlaying;
     }
 
     // The host's position, taken verbatim. Nothing else in this library
@@ -1679,9 +1772,9 @@ int rack_vst3_plugin_set_transport(
     // the rest of the host is minutes in, and would count only the blocks
     // this one instance happened to process. The host knows where it is;
     // this library does not.
-    plugin->process_context.projectTimeSamples = project_time_samples;
-    plugin->process_context.projectTimeMusic = project_time_music;
-    plugin->process_context.barPositionMusic = bar_position_music;
+    plugin->proc.process_context.projectTimeSamples = project_time_samples;
+    plugin->proc.process_context.projectTimeMusic = project_time_music;
+    plugin->proc.process_context.barPositionMusic = bar_position_music;
 
     return RACK_VST3_OK;
 }
@@ -1703,11 +1796,11 @@ int rack_vst3_plugin_parameter_info(
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
-    if (index >= plugin->parameters.size()) {
+    if (index >= plugin->fixed.param_ids.size()) {
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
-    const auto& param_info = plugin->parameters[index];
+    const auto& param_info = plugin->ctrl.param_meta[index];
 
     // Name
     strncpy(name, param_info.title.c_str(), name_size - 1);
@@ -1741,15 +1834,15 @@ int rack_vst3_plugin_parameter_string_by_value(
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
-    if (index >= plugin->parameters.size()) {
+    if (index >= plugin->fixed.param_ids.size()) {
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
-    const auto& param_info = plugin->parameters[index];
+    ParamID param_id = plugin->fixed.param_ids[index];
 
     String128 display;
     tresult result = plugin->controller->getParamStringByValue(
-        param_info.id, static_cast<ParamValue>(normalized_value), display);
+        param_id, static_cast<ParamValue>(normalized_value), display);
     if (result != kResultOk) {
         return RACK_VST3_ERROR_GENERIC;
     }
@@ -1771,18 +1864,18 @@ int rack_vst3_plugin_parameter_plain_value(
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
-    if (index >= plugin->parameters.size()) {
+    if (index >= plugin->fixed.param_ids.size()) {
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
-    const auto& param_info = plugin->parameters[index];
+    ParamID param_id = plugin->fixed.param_ids[index];
 
     // normalizedParamToPlain has no documented failure return in the VST3
     // SDK (unlike getParamStringByValue); it always returns a ParamValue.
     // Some plugins return the normalized value unchanged when no real
     // plain-value mapping is implemented, which is itself informative.
     *out_plain = plugin->controller->normalizedParamToPlain(
-        param_info.id, static_cast<ParamValue>(normalized_value));
+        param_id, static_cast<ParamValue>(normalized_value));
 
     return RACK_VST3_OK;
 }
@@ -1797,18 +1890,18 @@ int rack_vst3_plugin_parameter_value_by_string(
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
-    if (index >= plugin->parameters.size()) {
+    if (index >= plugin->fixed.param_ids.size()) {
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
-    const auto& param_info = plugin->parameters[index];
+    ParamID param_id = plugin->fixed.param_ids[index];
 
     String128 utf16_string;
     utf8_to_utf16(string, utf16_string, 128);
 
     ParamValue normalized = 0.0;
     tresult result = plugin->controller->getParamValueByString(
-        param_info.id, utf16_string, normalized);
+        param_id, utf16_string, normalized);
     if (result != kResultOk) {
         return RACK_VST3_ERROR_GENERIC;
     }
@@ -1827,17 +1920,17 @@ int rack_vst3_plugin_parameter_normalized_from_plain(
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
-    if (index >= plugin->parameters.size()) {
+    if (index >= plugin->fixed.param_ids.size()) {
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
-    const auto& param_info = plugin->parameters[index];
+    ParamID param_id = plugin->fixed.param_ids[index];
 
     // plainParamToNormalized has no documented failure return in the VST3
     // SDK (same as its inverse, normalizedParamToPlain above) -- it always
     // returns a ParamValue.
     *out_normalized = static_cast<float>(plugin->controller->plainParamToNormalized(
-        param_info.id, static_cast<ParamValue>(plain_value)));
+        param_id, static_cast<ParamValue>(plain_value)));
 
     return RACK_VST3_OK;
 }
@@ -1847,10 +1940,10 @@ int rack_vst3_plugin_parameter_normalized_from_plain(
 // ============================================================================
 
 int rack_vst3_plugin_get_preset_count(RackVST3Plugin* plugin) {
-    if (!plugin || !plugin->initialized) {
+    if (!plugin || !plugin->fixed.initialized) {
         return 0;
     }
-    return static_cast<int>(plugin->presets.size());
+    return static_cast<int>(plugin->fixed.presets.size());
 }
 
 int rack_vst3_plugin_get_preset_info(
@@ -1862,16 +1955,16 @@ int rack_vst3_plugin_get_preset_info(
     size_t category_size,
     int32_t* preset_number)
 {
-    if (!plugin || !plugin->initialized || !name || name_size == 0 ||
+    if (!plugin || !plugin->fixed.initialized || !name || name_size == 0 ||
         !category || category_size == 0) {
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
-    if (index >= plugin->presets.size()) {
+    if (index >= plugin->fixed.presets.size()) {
         return RACK_VST3_ERROR_NOT_FOUND;
     }
 
-    const auto& preset = plugin->presets[index];
+    const auto& preset = plugin->fixed.presets[index];
 
     // Copy name
     strncpy(name, preset.name.c_str(), name_size - 1);
@@ -1890,15 +1983,15 @@ int rack_vst3_plugin_get_preset_info(
 }
 
 int rack_vst3_plugin_load_preset(RackVST3Plugin* plugin, int32_t preset_number) {
-    if (!plugin || !plugin->initialized || !plugin->controller) {
+    if (!plugin || !plugin->fixed.initialized || !plugin->controller) {
         return RACK_VST3_ERROR_NOT_INITIALIZED;
     }
 
-    if (preset_number < 0 || preset_number >= static_cast<int32_t>(plugin->presets.size())) {
+    if (preset_number < 0 || preset_number >= static_cast<int32_t>(plugin->fixed.presets.size())) {
         return RACK_VST3_ERROR_NOT_FOUND;
     }
 
-    const auto& preset = plugin->presets[preset_number];
+    const auto& preset = plugin->fixed.presets[preset_number];
 
     // VST3 preset loading is complex - requires IProgramListData interface
     // Get IProgramListData from IUnitInfo
@@ -2011,7 +2104,7 @@ int rack_vst3_plugin_load_preset(RackVST3Plugin* plugin, int32_t preset_number) 
             if (plugin->controller->setParamNormalized(param_id, normalized_value) == kResultOk) {
                 // Queue the parameter change for the processor
                 int32 queue_index = 0;
-                IParamValueQueue* queue = plugin->input_param_changes.addParameterData(param_id, queue_index);
+                IParamValueQueue* queue = plugin->proc.input_param_changes.addParameterData(param_id, queue_index);
                 if (queue) {
                     int32 point_index = 0;
                     queue->addPoint(0, normalized_value, point_index);
@@ -2059,7 +2152,7 @@ int rack_vst3_plugin_load_preset(RackVST3Plugin* plugin, int32_t preset_number) 
 // emits silence when the mutex is taken).  No process() calls occur between
 // suspend and resume; only the plugin's internal VST3 state machine changes.
 static void suspend_for_state(RackVST3Plugin* plugin) {
-    if (!plugin->initialized) return;
+    if (!plugin->fixed.initialized) return;
     plugin->processor->setProcessing(false);
     plugin->component->setActive(false);
 }
@@ -2081,7 +2174,7 @@ static void suspend_for_state(RackVST3Plugin* plugin) {
 // AD2's background sample loader) after setState runs.
 static void resume_after_state(RackVST3Plugin* plugin, double post_activate_pump_seconds,
                                 bool reactivate, bool resume_processing) {
-    if (!plugin->initialized && (reactivate || resume_processing)) return;
+    if (!plugin->fixed.initialized && (reactivate || resume_processing)) return;
     if (reactivate) {
         plugin->component->setActive(true);
     }
@@ -2215,7 +2308,7 @@ int rack_vst3_plugin_set_state_pumped(RackVST3Plugin* plugin, const uint8_t* dat
     // The Rust caller holds the plugin mutex throughout, so the audio callback
     // is blocked (try_lock returns Err, emits silence).
 
-    if (plugin->initialized) {
+    if (plugin->fixed.initialized) {
         plugin->processor->setProcessing(false);
     } else {
         plugin->component->setActive(true);
@@ -2231,7 +2324,7 @@ int rack_vst3_plugin_set_state_pumped(RackVST3Plugin* plugin, const uint8_t* dat
         new MemoryStream(comp_data, component_state_size), false);
     tresult result = plugin->component->setState(comp_stream);
     if (result != kResultOk) {
-        if (plugin->initialized) {
+        if (plugin->fixed.initialized) {
             plugin->processor->setProcessing(true);
         }
         return RACK_VST3_ERROR_GENERIC;
@@ -2249,7 +2342,7 @@ int rack_vst3_plugin_set_state_pumped(RackVST3Plugin* plugin, const uint8_t* dat
     // back-to-back double-activation sequence documented elsewhere in this
     // codebase to crash some JUCE plugins, AD2 included) and
     // resume_processing=false (this function already restores
-    // setProcessing itself below, only when plugin->initialized).
+    // setProcessing itself below, only when plugin->fixed.initialized).
     resume_after_state(plugin, pump_seconds, /*reactivate=*/false, /*resume_processing=*/false);
 
     // Sync controller to component state.  Only for plugins where they are
@@ -2273,7 +2366,7 @@ int rack_vst3_plugin_set_state_pumped(RackVST3Plugin* plugin, const uint8_t* dat
         }
     }
 
-    if (plugin->initialized) {
+    if (plugin->fixed.initialized) {
         plugin->processor->setProcessing(true);
     }
 
@@ -2293,7 +2386,7 @@ int rack_vst3_plugin_send_midi(
     const RackVST3MidiEvent* events,
     uint32_t event_count)
 {
-    if (!plugin || !plugin->initialized) {
+    if (!plugin || !plugin->fixed.initialized) {
         return RACK_VST3_ERROR_NOT_INITIALIZED;
     }
 
@@ -2330,7 +2423,7 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.noteOn.pitch = midi_event.data1;
                 vst3_event.noteOn.velocity = static_cast<float>(midi_event.data2) / 127.0f;
                 vst3_event.noteOn.noteId = -1;  // Not specified
-                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                if (plugin->proc.input_events.addEvent(vst3_event) != kResultTrue) {
                     ++dropped_count;
                 }
                 break;
@@ -2341,7 +2434,7 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.noteOff.pitch = midi_event.data1;
                 vst3_event.noteOff.velocity = static_cast<float>(midi_event.data2) / 127.0f;
                 vst3_event.noteOff.noteId = -1;  // Not specified
-                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                if (plugin->proc.input_events.addEvent(vst3_event) != kResultTrue) {
                     ++dropped_count;
                 }
                 break;
@@ -2351,7 +2444,7 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.polyPressure.channel = midi_event.channel;
                 vst3_event.polyPressure.pitch = midi_event.data1;
                 vst3_event.polyPressure.pressure = static_cast<float>(midi_event.data2) / 127.0f;
-                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                if (plugin->proc.input_events.addEvent(vst3_event) != kResultTrue) {
                     ++dropped_count;
                 }
                 break;
@@ -2364,7 +2457,7 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.midiCCOut.controlNumber = midi_event.data1;
                 vst3_event.midiCCOut.value = midi_event.data2;
                 vst3_event.midiCCOut.value2 = 0;
-                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                if (plugin->proc.input_events.addEvent(vst3_event) != kResultTrue) {
                     ++dropped_count;
                 }
                 break;
@@ -2378,7 +2471,7 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.midiCCOut.controlNumber = 0x80;  // >= 0x80 indicates non-CC MIDI
                 vst3_event.midiCCOut.value = midi_event.data1;
                 vst3_event.midiCCOut.value2 = 0;
-                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                if (plugin->proc.input_events.addEvent(vst3_event) != kResultTrue) {
                     ++dropped_count;
                 }
                 break;
@@ -2392,7 +2485,7 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.midiCCOut.controlNumber = 0x81;  // >= 0x80 indicates non-CC MIDI
                 vst3_event.midiCCOut.value = midi_event.data1;
                 vst3_event.midiCCOut.value2 = 0;
-                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                if (plugin->proc.input_events.addEvent(vst3_event) != kResultTrue) {
                     ++dropped_count;
                 }
                 break;
@@ -2407,7 +2500,7 @@ int rack_vst3_plugin_send_midi(
                 vst3_event.midiCCOut.controlNumber = 0x82;  // >= 0x80 indicates non-CC MIDI
                 vst3_event.midiCCOut.value = midi_event.data1;   // LSB
                 vst3_event.midiCCOut.value2 = midi_event.data2;  // MSB
-                if (plugin->input_events.addEvent(vst3_event) != kResultTrue) {
+                if (plugin->proc.input_events.addEvent(vst3_event) != kResultTrue) {
                     ++dropped_count;
                 }
                 break;

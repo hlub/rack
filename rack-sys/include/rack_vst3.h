@@ -155,6 +155,12 @@ int rack_vst3_plugin_get_output_channels(RackVST3Plugin* plugin);
 // for IAudioProcessor::getLatencySamples()).
 uint32_t rack_vst3_plugin_get_latency_samples(RackVST3Plugin* plugin);
 
+// Bus facts. Once the plugin is initialized, the bus counts, the bus info and
+// rack_vst3_plugin_emits_midi below answer from what initialize recorded and
+// make no plugin call, so either half of a split instance may ask; before
+// initialize they query the component live, which only the whole instance can
+// do.
+
 // Returns the number of audio output buses the plugin declares (>= 0), or a
 // negative RACK_VST3_ERROR_* code on failure. This is the bus COUNT, distinct
 // from rack_vst3_plugin_get_output_channels (which reports only bus 0's
@@ -325,8 +331,9 @@ int rack_vst3_plugin_process_multi_bus(
 
 // Returns whether the plugin declares any event OUTPUT bus (i.e. whether it
 // can emit its own MIDI, such as an arpeggiator or MIDI-FX plugin). Mirrors
-// rack_vst3_plugin_get_output_bus_count's style. Returns false if `plugin` or
-// its component is NULL, or if it declares no event output bus.
+// rack_vst3_plugin_get_output_bus_count's style, including answering from
+// what initialize recorded once initialized. Returns false if `plugin` or its
+// component is NULL, or if it declares no event output bus.
 bool rack_vst3_plugin_emits_midi(RackVST3Plugin* plugin);
 
 // Get parameter count
