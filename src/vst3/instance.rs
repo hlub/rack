@@ -1505,6 +1505,7 @@ impl PluginInstance for Vst3Plugin {
 mod tests {
     use super::*;
     use crate::PluginScanner;
+    use super::super::test_support::serial_plugin_test;
 
     fn get_test_plugin() -> Result<(crate::vst3::Vst3Scanner, PluginInfo)> {
         let scanner = crate::vst3::Vst3Scanner::new()?;
@@ -1600,6 +1601,7 @@ mod tests {
 
     #[test]
     fn test_plugin_creation() {
+        let _serial = serial_plugin_test();
         let (scanner, info) = match get_test_plugin() {
             Ok(result) => result,
             Err(_) => {
@@ -1614,6 +1616,7 @@ mod tests {
 
     #[test]
     fn test_plugin_initialize() {
+        let _serial = serial_plugin_test();
         let (scanner, info) = match get_test_plugin() {
             Ok(result) => result,
             Err(_) => {
@@ -1630,6 +1633,7 @@ mod tests {
 
     #[test]
     fn test_drop_behavior() {
+        let _serial = serial_plugin_test();
         let (scanner, info) = match get_test_plugin() {
             Ok(result) => result,
             Err(_) => {
@@ -1646,6 +1650,7 @@ mod tests {
 
     #[test]
     fn test_parameter_range_clamping() {
+        let _serial = serial_plugin_test();
         let (scanner, info) = match get_test_plugin() {
             Ok(result) => result,
             Err(_) => {
@@ -1689,6 +1694,7 @@ mod tests {
 
     #[test]
     fn test_parameter_extreme_values() {
+        let _serial = serial_plugin_test();
         let (scanner, info) = match get_test_plugin() {
             Ok(result) => result,
             Err(_) => {
@@ -1753,6 +1759,7 @@ mod tests {
 
     #[test]
     fn test_preset_info_reports_category() {
+        let _serial = serial_plugin_test();
         let (scanner, info) = match get_test_plugin() {
             Ok(result) => result,
             Err(_) => {
@@ -1902,6 +1909,7 @@ mod tests {
 
     #[test]
     fn process_multi_bus_resets_bus_no_longer_requested() {
+        let _serial = serial_plugin_test();
         // Addictive Drums 2 declares 14 output buses (bus 0 "Master" plus 13
         // per-instrument buses) and 0 input buses -- a real fixture for the
         // stale-extra-output-bus-pointer bug (rack_vst3_plugin_process_
@@ -1981,6 +1989,7 @@ mod tests {
 
     #[test]
     fn process_leaves_unfed_second_input_bus_silent_not_null() {
+        let _serial = serial_plugin_test();
         // TDR Nova and soothe2 both declare a real second (sidechain) input
         // bus on macOS -- a fixture for the unfed-second-input-bus bug
         // (every declared input bus is activated during initialize, but
@@ -2036,6 +2045,7 @@ mod tests {
 
     #[test]
     fn send_midi_boundary_at_documented_capacity() {
+        let _serial = serial_plugin_test();
         // Boundary-precise regression test tied to the documented 256-event
         // capacity value itself, rather than an arbitrary count that merely
         // happens to sit below it (an earlier version of this test sent 200
@@ -2099,6 +2109,7 @@ mod tests {
 
     #[test]
     fn send_midi_reports_truncation_past_documented_capacity() {
+        let _serial = serial_plugin_test();
         // 300 events exceeds the documented/configured 256-event capacity,
         // so the queue-full condition must now be surfaced as an error
         // rather than silently discarding the overflow (the pre-fix
@@ -2131,6 +2142,7 @@ mod tests {
 
     #[test]
     fn reset_leaves_plugin_ready_to_process_again() {
+        let _serial = serial_plugin_test();
         // rack_vst3_plugin_reset used to leave the plugin deactivated then
         // reactivated but never re-issued setProcessing(true), violating
         // the VST3 lifecycle order this fix restores. A process() call
@@ -2188,6 +2200,7 @@ mod tests {
 
     #[test]
     fn drop_after_process_tears_down_cleanly_from_processing_state() {
+        let _serial = serial_plugin_test();
         // rack_vst3_plugin_free used to call component->setActive(false)
         // directly, without first calling setProcessing(false) -- even
         // though initialize() (and, by the time a caller has actually
@@ -2282,6 +2295,7 @@ mod tests {
 
     #[test]
     fn get_state_set_state_round_trip() {
+        let _serial = serial_plugin_test();
         // Exercises get_state's normal (no-retry) path end to end. The
         // retry-on-overflow branch (the fix for real states larger than the
         // 4 MB initial guess) only triggers for a state larger than that
@@ -2312,6 +2326,7 @@ mod tests {
 
     #[test]
     fn queue_parameter_change_does_not_require_controller_call() {
+        let _serial = serial_plugin_test();
         // queue_parameter_change is the real-time-safe path added for the
         // audio-thread parameter delivery gap: it must succeed on a real
         // parameter index without touching the controller, and reject an
@@ -2345,6 +2360,7 @@ mod tests {
 
     #[test]
     fn queue_parameter_change_never_touches_the_controller() {
+        let _serial = serial_plugin_test();
         // The one thing that actually distinguishes queue_parameter_change
         // from an accidental alias for set_parameter is that it never calls
         // IEditController::setParamNormalized. get_parameter reads directly
@@ -2457,6 +2473,7 @@ mod tests {
 
     #[test]
     fn queue_parameter_change_performs_no_rust_side_allocation() {
+        let _serial = serial_plugin_test();
         // d284632 fixed queue_parameter_change's real allocation-free claim:
         // input_param_changes/output_param_changes were default-constructed
         // ParameterChanges with no setMaxParameters call, so the *first*

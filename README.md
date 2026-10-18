@@ -194,6 +194,27 @@ pub trait PluginInstance: Send {
 
 This allows different plugin formats to implement the same interface, making your code portable across formats.
 
+## Testing
+
+Most VST3 tests run against a fixture plugin built from the VST3 SDK this
+repository vendors (`rack-sys/test/fixture_plugin`). It records what the host
+did to it in its own state: how many times it processed, how often it left
+the Processing state, how many parameter points reached its processor, and
+which messages passed between its component and its controller. A test reads
+that back with an ordinary state read and asserts on what reached the plugin,
+not only on what rack returned. Build it once, then run the tests with the
+fixture required, so a missing fixture fails instead of skipping:
+
+```bash
+scripts/build-fixture-plugin.sh
+RACK_REQUIRE_FIXTURE=1 cargo test
+```
+
+`RACK_TEST_FIXTURE_VST3` names a fixture bundle somewhere else. The remaining
+tests load whatever real plugins are installed and skip when there are none;
+every test that loads an instance takes one lock, so they run one at a time
+even under a parallel test run.
+
 ## Roadmap
 
 ### AudioUnit (macOS) - ✅ COMPLETE
