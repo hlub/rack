@@ -464,6 +464,8 @@ static constexpr int32 kEventListCapacity = 256;
 //   queues, the transport. A function of the whole instance may write it too,
 //   because nothing processes concurrently with one.
 // - `ctrl` belongs to the controller half.
+// - `released_halves` is the hand-off between the two halves when they are
+//   dropped (see rack_vst3_plugin_release_controller).
 //
 // A function that touches a field outside its own half's part is a data race
 // the moment the instance is split; the C API's own grouping in rack_vst3.h
@@ -476,6 +478,13 @@ struct RackVST3Plugin {
     IPtr<IEditController> controller;
     std::string path;
     VST3::UID uid;
+
+    // Which halves have let go (kProcessorReleased, kControllerReleased).
+    // The one field both halves write: the processor's release store
+    // happens-after its last process() call, and the controller's acquiring
+    // read-modify-write sees it, so the controller frees the instance only
+    // once nothing can be processing in it.
+    std::atomic<uint32_t> released_halves{0};
 
     // A parameter's descriptive metadata, as the controller last reported it.
     struct ParamMeta {
@@ -668,6 +677,53 @@ static void resume_after_state(RackVST3Plugin* plugin, double post_activate_pump
 // Plugin Instance Implementation
 // ============================================================================
 
+static constexpr uint32_t kProcessorReleased = 1u << 0;
+static constexpr uint32_t kControllerReleased = 1u << 1;
+
+// Instances created and not yet freed, and instances leaked by a controller
+// half released before its processor half. Process-wide, for tests and for a
+// host that wants to report a leak.
+static std::atomic<uint64_t> g_live_instances{0};
+static std::atomic<uint64_t> g_leaked_instances{0};
+static std::atomic<bool> g_leak_reported{false};
+
+uint64_t rack_vst3_live_instance_count(void) {
+    return g_live_instances.load(std::memory_order_relaxed);
+}
+
+uint64_t rack_vst3_leaked_instance_count(void) {
+    return g_leaked_instances.load(std::memory_order_relaxed);
+}
+
+void rack_vst3_plugin_release_processor(RackVST3Plugin* plugin) {
+    if (!plugin) {
+        return;
+    }
+    plugin->released_halves.fetch_or(kProcessorReleased, std::memory_order_release);
+}
+
+int rack_vst3_plugin_release_controller(RackVST3Plugin* plugin) {
+    if (!plugin) {
+        return 0;
+    }
+    uint32_t before = plugin->released_halves.fetch_or(kControllerReleased, std::memory_order_acq_rel);
+    if (before & kProcessorReleased) {
+        rack_vst3_plugin_free(plugin);
+        return 1;
+    }
+    // The processor half may still be in use on another thread, so nothing
+    // here may be freed or called. The instance is leaked, which costs memory
+    // but never a crash.
+    g_leaked_instances.fetch_add(1, std::memory_order_relaxed);
+    if (!g_leak_reported.exchange(true, std::memory_order_relaxed)) {
+        fprintf(stderr,
+                "[rack] a VST3 controller half was released while its processor half was still "
+                "held; the instance of %s is leaked (further leaks are counted, not printed)\n",
+                plugin->path.c_str());
+    }
+    return 0;
+}
+
 RackVST3Plugin* rack_vst3_plugin_new(const char* path, const char* uid) {
     if (!path || !uid) {
         return nullptr;
@@ -768,6 +824,7 @@ RackVST3Plugin* rack_vst3_plugin_new(const char* path, const char* uid) {
         }
     }
 
+    g_live_instances.fetch_add(1, std::memory_order_relaxed);
     return plugin;
 }
 
@@ -809,6 +866,7 @@ void rack_vst3_plugin_free(RackVST3Plugin* plugin) {
     plugin->processor = nullptr;
     plugin->module = nullptr;
 
+    g_live_instances.fetch_sub(1, std::memory_order_relaxed);
     delete plugin;
 }
 
@@ -1693,6 +1751,24 @@ int rack_vst3_plugin_set_parameter_by_id(RackVST3Plugin* plugin, uint32_t param_
         int32 point_index = 0;
         queue->addPoint(0, value, point_index);
     }
+    return RACK_VST3_OK;
+}
+
+// The controller half's parameter write: setParamNormalized and nothing else.
+// The processor's input_param_changes is the audio thread's own queue, read
+// and cleared by process(); writing it from here while the instance is split
+// would race that. The processor learns the value through
+// rack_vst3_plugin_queue_parameter_change on its own thread.
+int rack_vst3_plugin_controller_set_parameter(RackVST3Plugin* plugin, uint32_t index, float value) {
+    if (!plugin || !plugin->controller) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+    if (index >= plugin->fixed.param_ids.size()) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+    if (value < 0.0f) value = 0.0f;
+    if (value > 1.0f) value = 1.0f;
+    plugin->controller->setParamNormalized(plugin->fixed.param_ids[index], value);
     return RACK_VST3_OK;
 }
 

@@ -194,6 +194,38 @@ pub trait PluginInstance: Send {
 
 This allows different plugin formats to implement the same interface, making your code portable across formats.
 
+### VST3: a processor half and a controller half
+
+A VST3 plugin is two objects with two thread contracts: its audio processor
+runs on the audio thread, and its edit controller is a UI-thread object. An
+initialized `Vst3Plugin` splits into a `Vst3Processor` and a `Vst3Controller`
+so a host can play the plugin on the audio thread while asking its controller
+questions on the main thread, with no lock between them:
+
+```rust
+let (mut processor, controller) = plugin.split().expect("initialized");
+let audio = std::thread::spawn(move || {
+    // processor.process(...), queue_parameter_change, send_midi, set_transport
+    processor
+});
+// controller.parameter_info(...), get_parameter, set_parameter, presets
+let plugin = Vst3Plugin::join(audio.join().unwrap(), controller).expect("same instance");
+```
+
+- `Vst3Processor` is `Send` and not `Sync`. It touches only the processing
+  state and the facts fixed at initialization, and dropping it makes no plugin
+  call, so it may be dropped on the audio thread.
+- `Vst3Controller` is neither `Send` nor `Sync`: it stays on the thread that
+  split the instance. Its `set_parameter` writes the controller only; the
+  processor hears a value through `queue_parameter_change` on its own thread.
+- Initialization, `reset`, state reads and writes, preset loads, the latency
+  query, and the parameter write that tells both halves exist only on the
+  whole `Vst3Plugin`, which `join` gives back.
+- Drop the processor half first, or join the two: the controller half frees
+  the instance only once the processor half has let go. Dropped the other way
+  round, the instance is leaked and counted (`leaked_instance_count`) rather
+  than freed under a processor that may still be running.
+
 ## Testing
 
 Most VST3 tests run against a fixture plugin built from the VST3 SDK this

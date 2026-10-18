@@ -24,6 +24,7 @@ pub(crate) fn serial_plugin_test() -> MutexGuard<'static, ()> {
 /// The fixture's parameter ids, which are also its parameter indices. Mirrors
 /// `rack-sys/test/fixture_plugin/src/fixture_ids.h`.
 pub(crate) mod param {
+    pub(crate) const GAIN: usize = 0;
     pub(crate) const COUNT: usize = 5;
 }
 

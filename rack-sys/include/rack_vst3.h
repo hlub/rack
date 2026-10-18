@@ -97,6 +97,57 @@ RackVST3Plugin* rack_vst3_plugin_new(const char* path, const char* uid);
 // Free plugin instance
 void rack_vst3_plugin_free(RackVST3Plugin* plugin);
 
+// ----------------------------------------------------------------------------
+// The two halves of an instance
+//
+// An initialized instance may be used as two halves at once: a processor half
+// on the audio thread and a controller half on the thread that created the
+// instance. Each function below belongs to one of three groups, and only the
+// processor group may run concurrently with the controller group:
+//
+// - Processor half: rack_vst3_plugin_process, rack_vst3_plugin_process_multi_bus,
+//   rack_vst3_plugin_send_midi, rack_vst3_plugin_queue_parameter_change,
+//   rack_vst3_plugin_set_transport, rack_vst3_plugin_release_processor. They
+//   touch only the processing state and the facts fixed at initialization.
+// - Controller half: rack_vst3_plugin_parameter_count, _parameter_info,
+//   _get_parameter, _controller_set_parameter, _parameter_string_by_value,
+//   _parameter_plain_value, _parameter_value_by_string,
+//   _parameter_normalized_from_plain, _get_preset_count, _get_preset_info,
+//   _get_midi_pc_param_id, the bus counts and bus info, _emits_midi and
+//   rack_vst3_plugin_release_controller. They call only the edit controller
+//   and read the facts fixed at initialization.
+// - The whole instance, never while it is split: _initialize, _reset,
+//   _set_parameter, _set_parameter_by_id (each writes the processor's queue
+//   from the caller's thread), _load_preset, the state reads and writes, and
+//   _get_latency_samples (an IAudioProcessor UI-thread call).
+// - Either: rack_vst3_plugin_is_initialized, _get_input_channels,
+//   _get_output_channels, which read fixed facts.
+//
+// A split instance is released half by half instead of freed. The processor
+// half is released first (one atomic store, no plugin call, so it may happen
+// on the audio thread); the controller half's release then frees the
+// instance. A controller half released while its processor half is still
+// held cannot free what the processor may still be using: the instance is
+// leaked and counted instead.
+// ----------------------------------------------------------------------------
+
+// Record that the processor half let go. One atomic release store: no plugin
+// call, no free, wait-free. NULL is a no-op.
+void rack_vst3_plugin_release_processor(RackVST3Plugin* plugin);
+
+// Record that the controller half let go, and free the instance if the
+// processor half already had (on the caller's thread, which must be the
+// controller half's). Returns 1 when the instance was freed, 0 when the
+// processor half was still held and the instance was leaked and counted
+// (rack_vst3_leaked_instance_count). NULL returns 0.
+int rack_vst3_plugin_release_controller(RackVST3Plugin* plugin);
+
+// Instances created by rack_vst3_plugin_new and not yet freed, process-wide.
+uint64_t rack_vst3_live_instance_count(void);
+
+// Instances leaked by rack_vst3_plugin_release_controller, process-wide.
+uint64_t rack_vst3_leaked_instance_count(void);
+
 // Initialize plugin
 //
 // If initial_state is non-NULL, it is applied via IComponent::setState in
@@ -367,6 +418,16 @@ int rack_vst3_plugin_get_parameter(RackVST3Plugin* plugin, uint32_t index, float
 // Note: Calling during audio processing may cause clicks/pops.
 int rack_vst3_plugin_set_parameter(RackVST3Plugin* plugin, uint32_t index, float value);
 int rack_vst3_plugin_set_parameter_by_id(RackVST3Plugin* plugin, uint32_t param_id, float value);
+
+// The controller half's parameter write: clamps to [0.0, 1.0] and calls
+// IEditController::setParamNormalized, and nothing else. Unlike
+// rack_vst3_plugin_set_parameter it does not queue the value for the
+// processor, so it may run while the processor half processes on another
+// thread; the processor learns the value through
+// rack_vst3_plugin_queue_parameter_change on its own thread.
+// Returns 0 on success, RACK_VST3_ERROR_INVALID_PARAM for an out-of-range
+// index or a plugin without a controller.
+int rack_vst3_plugin_controller_set_parameter(RackVST3Plugin* plugin, uint32_t index, float value);
 
 // Queue a normalized parameter value change ([0.0, 1.0], clamped) to be
 // delivered to the plugin's audio processor on the *next*

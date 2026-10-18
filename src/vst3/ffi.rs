@@ -199,6 +199,34 @@ extern "C" {
     /// - If `plugin` is NULL, this function does nothing (safe no-op)
     pub fn rack_vst3_plugin_free(plugin: *mut RackVST3Plugin);
 
+    /// Record that the processor half let go of the instance. One atomic
+    /// store: no plugin call, no free, safe on the audio thread.
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a live instance whose processor half was not yet
+    ///   released, and the caller must not use it as the processor afterwards.
+    pub fn rack_vst3_plugin_release_processor(plugin: *mut RackVST3Plugin);
+
+    /// Record that the controller half let go of the instance, and free it if
+    /// the processor half already had. Returns 1 when it freed the instance,
+    /// 0 when the processor half was still held and the instance was leaked
+    /// and counted instead.
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a live instance whose controller half was not yet
+    ///   released; it must not be used afterwards.
+    /// - Call it on the thread the controller half belongs to.
+    pub fn rack_vst3_plugin_release_controller(plugin: *mut RackVST3Plugin) -> c_int;
+
+    /// Instances created and not yet freed, process-wide.
+    pub fn rack_vst3_live_instance_count() -> u64;
+
+    /// Instances leaked by a controller half released before its processor
+    /// half, process-wide.
+    pub fn rack_vst3_leaked_instance_count() -> u64;
+
     /// Initialize plugin with sample rate, buffer size and process mode
     ///
     /// `process_mode` is `ProcessSetup::processMode`, as
@@ -558,6 +586,19 @@ extern "C" {
     pub fn rack_vst3_plugin_set_parameter_by_id(
         plugin: *mut RackVST3Plugin,
         param_id: u32,
+        value: f32,
+    ) -> c_int;
+
+    /// Write a normalized value (clamped) into the edit controller only
+    /// (`setParamNormalized`); the processor's queue is not touched.
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    /// - Call it on the controller half's thread.
+    pub fn rack_vst3_plugin_controller_set_parameter(
+        plugin: *mut RackVST3Plugin,
+        index: u32,
         value: f32,
     ) -> c_int;
 
