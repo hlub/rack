@@ -2236,7 +2236,7 @@ static void suspend_for_state(RackVST3Plugin* plugin) {
 }
 
 // reactivate/resume_processing let a caller opt out of the setActive(true)/
-// setProcessing(true) steps while still sharing the pump: get_state's own
+// setProcessing(true) steps while still sharing the pump: read_state's own
 // suspend_for_state fully deactivates first (setProcessing(false) then
 // setActive(false)), so its resume needs both steps to get back to
 // Active+Processing, and takes the (reactivate=true, resume_processing=true)
@@ -2265,18 +2265,6 @@ static void resume_after_state(RackVST3Plugin* plugin, double post_activate_pump
     if (resume_processing) {
         plugin->processor->setProcessing(true);
     }
-}
-
-int rack_vst3_plugin_get_state_size(RackVST3Plugin* plugin) {
-    if (!plugin || !plugin->component) {
-        return 0;
-    }
-    // Return a generous upper bound so the caller can allocate a buffer and
-    // call rack_vst3_plugin_get_state once.  Doing a real getState call here
-    // just to measure the size would mean two full suspend/resume cycles back
-    // to back, which causes crashes in some JUCE plugins (AD2 included).
-    // rack_vst3_plugin_get_state updates *size to the actual number of bytes.
-    return 4 * 1024 * 1024;  // 4 MB — well above any observed AD2 state size
 }
 
 // Writes the instance's state in rack's one state format: a 4-byte
@@ -2317,44 +2305,51 @@ static tresult write_state(RackVST3Plugin* plugin, MemoryStream* stream) {
     return kResultOk;
 }
 
-int rack_vst3_plugin_get_state(RackVST3Plugin* plugin, uint8_t* data, size_t* size) {
-    if (!plugin || !data || !size || !plugin->component) {
-        return RACK_VST3_ERROR_INVALID_PARAM;
-    }
-
-    if (*size == 0) {
-        return RACK_VST3_ERROR_INVALID_PARAM;
-    }
-
-    // Suspend processing: this read stops processing around getState, the
-    // conservative bracket for a plugin not known to synchronise its own
-    // state against process().
-    suspend_for_state(plugin);
-
-    IPtr<MemoryStream> stream(new MemoryStream(), false);
-    if (write_state(plugin, stream) != kResultOk) {
-        resume_after_state(plugin);
-        return RACK_VST3_ERROR_GENERIC;
-    }
-
-    resume_after_state(plugin);
-
-    size_t state_size = stream->getSize();
-    if (state_size > *size) {
-        *size = state_size;
-        return RACK_VST3_ERROR_INVALID_PARAM;
-    }
-
-    memcpy(data, stream->getData().data(), state_size);
-    *size = state_size;
-    return RACK_VST3_OK;
-}
 
 // A state blob rack hands to the caller: the bytes of one state read, owned
 // here until rack_vst3_state_blob_free.
 struct RackVST3StateBlob {
     std::vector<uint8_t> bytes;
 };
+
+// Wraps a written stream's bytes in a blob, or reports the failure.
+static RackVST3StateBlob* finish_state_read(tresult written, MemoryStream* stream, int& status) {
+    if (written != kResultOk) {
+        status = RACK_VST3_ERROR_GENERIC;
+        return nullptr;
+    }
+    auto blob = new (std::nothrow) RackVST3StateBlob{stream->takeData()};
+    if (!blob) {
+        status = RACK_VST3_ERROR_GENERIC;
+        return nullptr;
+    }
+    status = RACK_VST3_OK;
+    return blob;
+}
+
+RackVST3StateBlob* rack_vst3_plugin_read_state(RackVST3Plugin* plugin, int* error) {
+    int ignored = RACK_VST3_OK;
+    int& status = error ? *error : ignored;
+    if (!plugin || !plugin->component) {
+        status = RACK_VST3_ERROR_INVALID_PARAM;
+        return nullptr;
+    }
+    if (!plugin->fixed.initialized) {
+        status = RACK_VST3_ERROR_NOT_INITIALIZED;
+        return nullptr;
+    }
+
+    // Leave the Processing state around getState: the conservative bracket
+    // for a plugin not known to keep its own state consistent against
+    // process(). One bracket per read, since the stream grows to whatever the
+    // plugin writes; a second back-to-back suspend/resume cycle is a pattern
+    // that has crashed JUCE plugins (AD2 included).
+    suspend_for_state(plugin);
+    IPtr<MemoryStream> stream(new MemoryStream(), false);
+    tresult written = write_state(plugin, stream);
+    resume_after_state(plugin);
+    return finish_state_read(written, stream, status);
+}
 
 RackVST3StateBlob* rack_vst3_plugin_read_state_while_processing(RackVST3Plugin* plugin, int* error) {
     int ignored = RACK_VST3_OK;
@@ -2374,17 +2369,8 @@ RackVST3StateBlob* rack_vst3_plugin_read_state_while_processing(RackVST3Plugin* 
     // given plugin synchronises its own state against process() is the
     // plugin's, and is not knowable here.
     IPtr<MemoryStream> stream(new MemoryStream(), false);
-    if (write_state(plugin, stream) != kResultOk) {
-        status = RACK_VST3_ERROR_GENERIC;
-        return nullptr;
-    }
-    auto blob = new (std::nothrow) RackVST3StateBlob{stream->takeData()};
-    if (!blob) {
-        status = RACK_VST3_ERROR_GENERIC;
-        return nullptr;
-    }
-    status = RACK_VST3_OK;
-    return blob;
+    tresult written = write_state(plugin, stream);
+    return finish_state_read(written, stream, status);
 }
 
 const uint8_t* rack_vst3_state_blob_data(const RackVST3StateBlob* blob) {
@@ -2468,7 +2454,7 @@ int rack_vst3_plugin_set_state_pumped(RackVST3Plugin* plugin, const uint8_t* dat
     }
 
     // Wait for AD2's async sample-loading thread to finish. Routed through
-    // resume_after_state (the same helper get_state's own suspend/resume
+    // resume_after_state (the same helper read_state's own suspend/resume
     // bracket uses for its own, unrelated post-activation pump) so this
     // wait has one implementation, not two hand-copied pump_runloop(5.0)
     // calls -- but the component here was never deactivated (see this

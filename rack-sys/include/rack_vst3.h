@@ -118,7 +118,7 @@ void rack_vst3_plugin_free(RackVST3Plugin* plugin);
 //   and read the facts fixed at initialization.
 // - The whole instance, never while it is split: _initialize, _reset,
 //   _set_parameter, _set_parameter_by_id (each writes the processor's queue
-//   from the caller's thread), _load_preset, the state reads and writes, and
+//   from the caller's thread), _load_preset, _read_state, the state writes, and
 //   _get_latency_samples (an IAudioProcessor UI-thread call).
 // - Either: rack_vst3_plugin_is_initialized, _get_input_channels,
 //   _get_output_channels, which read fixed facts.
@@ -622,26 +622,8 @@ int rack_vst3_plugin_get_preset_info(
 // Thread-safety: Should be called from the same thread that owns the plugin instance.
 int rack_vst3_plugin_load_preset(RackVST3Plugin* plugin, int32_t preset_number);
 
-// Get plugin state size (for allocation)
-// Returns actual size in bytes needed to store state, or 0 if state cannot be retrieved
-//
-// NOTE: This function determines the actual state size by serializing the state.
-//       It is not a constant or estimate - it queries the plugin's current state.
-//       For large plugins (samplers, complex synths), this may take some time.
-//       The returned size is accurate for immediate use with get_state().
-//
-// Thread-safety: Should be called from the same thread that owns the plugin instance.
-int rack_vst3_plugin_get_state_size(RackVST3Plugin* plugin);
-
-// Get plugin state (full state including parameters, preset, etc.)
-// data: output buffer for state data (allocated by caller)
-// size: input/output - buffer size on input, actual size on output
-// Returns 0 on success, negative error code on failure
-// Thread-safety: Should be called from the same thread that owns the plugin instance.
-int rack_vst3_plugin_get_state(RackVST3Plugin* plugin, uint8_t* data, size_t* size);
-
 // Set plugin state (restore full state including parameters, preset, etc.)
-// data: state data (from previous get_state call)
+// data: state data (from a previous state read)
 // size: size of state data in bytes
 // Returns 0 on success, negative error code on failure
 // Thread-safety: Should be called from the same thread that owns the plugin instance.
@@ -659,11 +641,27 @@ int rack_vst3_plugin_set_state_pumped(RackVST3Plugin* plugin, const uint8_t* dat
 // The bytes of one state read, owned by rack until rack_vst3_state_blob_free.
 typedef struct RackVST3StateBlob RackVST3StateBlob;
 
+// Read the plugin's full state, leaving the Processing state around the read
+// (setProcessing(false), setActive(false), getState, then back). The
+// conservative read for a plugin not known to keep its state consistent
+// against process(); never call it on a split instance.
+//
+// Format: [uint32_t component_size | component bytes | controller bytes],
+// the controller's part present only for a separate controller object.
+// One getState call per object into a stream sized by what the plugin
+// writes, so there is no size guess and no retry.
+//
+// Returns the blob, or NULL with *error (when error is non-NULL) set to
+// RACK_VST3_ERROR_INVALID_PARAM, RACK_VST3_ERROR_NOT_INITIALIZED or
+// RACK_VST3_ERROR_GENERIC (the component's getState failed).
+// Thread-safety: the whole instance's, from the thread that owns it.
+RackVST3StateBlob* rack_vst3_plugin_read_state(RackVST3Plugin* plugin, int* error);
+
 // Read the plugin's state without leaving the Processing state: no
 // setProcessing(false), no setActive(false), so the processor half may go on
 // processing on the audio thread meanwhile. One getState call per object
 // into a stream sized by what the plugin writes: no size guess, no retry.
-// Same format as rack_vst3_plugin_get_state (the two share one writer).
+// Same format as rack_vst3_plugin_read_state (the two share one writer).
 //
 // The VST3 standard allows IComponent::getState while processing; whether a
 // given plugin synchronises its own state against process() is the plugin's

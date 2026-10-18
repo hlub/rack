@@ -833,41 +833,6 @@ extern "C" {
     /// - `preset_number` should be a valid preset number from get_preset_info
     pub fn rack_vst3_plugin_load_preset(plugin: *mut RackVST3Plugin, preset_number: i32) -> c_int;
 
-    /// Get plugin state size (for allocation)
-    ///
-    /// # Returns
-    ///
-    /// - Size in bytes needed to store state (> 0)
-    /// - 0 if state cannot be retrieved
-    ///
-    /// # Safety
-    ///
-    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
-    /// - Plugin must be initialized
-    pub fn rack_vst3_plugin_get_state_size(plugin: *mut RackVST3Plugin) -> c_int;
-
-    /// Get plugin state (full state including parameters, preset, etc.)
-    ///
-    /// # Returns
-    ///
-    /// - 0 on success (state written to data buffer, actual size written to size pointer)
-    /// - Negative error code on failure
-    ///
-    /// # Safety
-    ///
-    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
-    /// - Plugin must be initialized
-    /// - `data` must point to a buffer with at least `*size` bytes
-    /// - `size` must be a valid pointer to a size_t
-    /// - On input, `*size` is the buffer size
-    /// - On output, `*size` is the actual size written
-    /// - Typical usage: call get_state_size() first, allocate buffer, then call get_state()
-    pub fn rack_vst3_plugin_get_state(
-        plugin: *mut RackVST3Plugin,
-        data: *mut u8,
-        size: *mut usize,
-    ) -> c_int;
-
     /// Set plugin state (restore full state including parameters, preset, etc.)
     ///
     /// # Returns
@@ -879,7 +844,7 @@ extern "C" {
     ///
     /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
     /// - Plugin must be initialized
-    /// - `data` must point to valid state data (from previous get_state call)
+    /// - `data` must point to valid state data (from a previous state read)
     /// - `data` must remain valid for the duration of the call
     /// - `size` must be the size of the state data in bytes
     pub fn rack_vst3_plugin_set_state(
@@ -901,6 +866,20 @@ extern "C" {
         size: usize,
         pump_seconds: f64,
     ) -> c_int;
+
+    /// Read the state, leaving the Processing state around the read, into a
+    /// blob rack owns. Returns NULL and sets `*error` on failure.
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    /// - `error` must be NULL or point at a writable `c_int`
+    /// - Never on a split instance.
+    /// - A returned blob must be freed with `rack_vst3_state_blob_free`.
+    pub fn rack_vst3_plugin_read_state(
+        plugin: *mut RackVST3Plugin,
+        error: *mut c_int,
+    ) -> *mut RackVST3StateBlob;
 
     /// Read the state without leaving the Processing state, into a blob rack
     /// owns. Returns NULL and sets `*error` on failure.
