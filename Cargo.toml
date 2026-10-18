@@ -72,6 +72,11 @@ path = "examples/multi_bus_input_feed_smoke.rs"
 required-features = ["cpal"]
 
 [[example]]
+name = "split_probe"
+path = "examples/split_probe.rs"
+required-features = ["vst3"]
+
+[[example]]
 name = "progress_probe"
 path = "examples/progress_probe.rs"
 required-features = ["vst3"]

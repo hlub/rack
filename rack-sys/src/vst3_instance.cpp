@@ -881,14 +881,18 @@ void rack_vst3_plugin_free(RackVST3Plugin* plugin) {
     // plugin is being destroyed regardless.
     suspend_for_state(plugin);
 
-    // Disconnect as PlugProvider::disconnectComponents does, before either
-    // side is terminated.
+    // Disconnect and release the proxies as PlugProvider::disconnectComponents
+    // does, before either side is terminated: a proxy holds its side's
+    // connection point, and a plugin may check at terminate or at its own
+    // deletion that nothing still does (DPF reports one still held).
     if (plugin->ctrl.component_proxy) {
         plugin->ctrl.component_proxy->disconnect_destination();
     }
     if (plugin->ctrl.controller_proxy) {
         plugin->ctrl.controller_proxy->disconnect_destination();
     }
+    plugin->ctrl.component_proxy = nullptr;
+    plugin->ctrl.controller_proxy = nullptr;
 
     // Terminate controller
     if (plugin->controller && reinterpret_cast<void*>(plugin->controller.get()) != reinterpret_cast<void*>(plugin->component.get())) {
@@ -896,18 +900,17 @@ void rack_vst3_plugin_free(RackVST3Plugin* plugin) {
         plugin->controller = nullptr;
     }
 
-    // Terminate component
+    // Terminate component. Its IAudioProcessor reference goes first, so the
+    // component's own last reference is the one released here (DPF reports a
+    // processor reference still held when the component is deleted).
+    plugin->processor = nullptr;
     if (plugin->component) {
         plugin->component->terminate();
         plugin->component = nullptr;
     }
 
     // Every reference into the plugin's code is released before the module
-    // that holds that code: the proxies hold the component's and the
-    // controller's connection points.
-    plugin->ctrl.component_proxy = nullptr;
-    plugin->ctrl.controller_proxy = nullptr;
-    plugin->processor = nullptr;
+    // that holds that code.
     plugin->module = nullptr;
 
     g_live_instances.fetch_sub(1, std::memory_order_relaxed);
