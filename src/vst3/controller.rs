@@ -386,6 +386,30 @@ impl Vst3Controller {
         RestartFlags::from_bits(unsafe { ffi::rack_vst3_plugin_take_restart_flags(self.inner.as_ptr()) })
     }
 
+    /// How many messages between the plugin's component and its separate
+    /// controller rack discarded because the plugin sent them from a thread
+    /// other than the one that constructed the instance: the audio thread
+    /// (from inside `process`) or a background thread of the plugin's own.
+    /// The standard keeps these messages on the UI thread; delivering one
+    /// elsewhere would run controller code beside the host's own controller
+    /// calls. Both counts are 0 for a plugin whose component is its own
+    /// controller. A plugin with a non-zero count is worth recording as a
+    /// vendor fact.
+    #[must_use]
+    pub fn discarded_messages(&self) -> DiscardedMessages {
+        let mut component_to_controller = 0u64;
+        let mut controller_to_component = 0u64;
+        // SAFETY: the instance is live; the out-pointers are locals.
+        unsafe {
+            ffi::rack_vst3_plugin_discarded_messages(
+                self.inner.as_ptr(),
+                &mut component_to_controller,
+                &mut controller_to_component,
+            );
+        }
+        DiscardedMessages { component_to_controller, controller_to_component }
+    }
+
     /// Re-reads every parameter's description from the controller, as a host
     /// does after [`RestartFlags::param_titles_changed`], and says which
     /// indices changed. Parameter ids are never rewritten, because the
@@ -554,6 +578,17 @@ impl Vst3Controller {
         // SAFETY: the instance is live; the function asks the controller.
         unsafe { ffi::rack_vst3_plugin_get_midi_pc_param_id(self.inner.as_ptr(), channel) }
     }
+}
+
+/// Messages between a plugin's component and its controller that were
+/// discarded for being sent off the constructing thread, per direction. See
+/// [`Vst3Controller::discarded_messages`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiscardedMessages {
+    /// Sent by the component (its audio processor) to the controller.
+    pub component_to_controller: u64,
+    /// Sent by the controller to the component.
+    pub controller_to_component: u64,
 }
 
 /// What [`Vst3Controller::refresh_parameter_titles`] found.

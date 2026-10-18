@@ -4,7 +4,7 @@ use std::fmt;
 use std::os::raw::c_int;
 use std::ptr::NonNull;
 
-use super::controller::Vst3Controller;
+use super::controller::{DiscardedMessages, Vst3Controller};
 use super::ffi;
 use super::processor::{BusLayout, ExtraInputBus, ExtraOutputBus, Vst3Processor};
 use super::restart::RestartFlags;
@@ -220,6 +220,12 @@ impl Vst3Plugin {
     #[must_use]
     pub fn take_restart_flags(&self) -> RestartFlags {
         self.controller.take_restart_flags()
+    }
+
+    /// See [`Vst3Controller::discarded_messages`].
+    #[must_use]
+    pub fn discarded_messages(&self) -> DiscardedMessages {
+        self.controller.discarded_messages()
     }
 
     /// See [`Vst3Processor::set_transport`].

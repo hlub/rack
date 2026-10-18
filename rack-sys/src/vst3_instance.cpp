@@ -24,6 +24,7 @@
 #include <chrono>
 
 #include "vst3_lifecycle_mutex.h"
+#include "vst3_connection_proxy.h"
 
 #if defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
@@ -453,6 +454,15 @@ tresult PLUGIN_API ComponentHandler::queryInterface(const TUID _iid, void** obj)
     return kNoInterface;
 }
 
+IMPLEMENT_REFCOUNT(RackConnectionProxy)
+
+tresult PLUGIN_API RackConnectionProxy::queryInterface(const TUID _iid, void** obj) {
+    QUERY_INTERFACE(_iid, obj, FUnknown::iid, IConnectionPoint)
+    QUERY_INTERFACE(_iid, obj, IConnectionPoint::iid, IConnectionPoint)
+    *obj = nullptr;
+    return kNoInterface;
+}
+
 // Capacity of RackVST3Plugin::input_events/output_events, in events. Chosen
 // to match src/vst3/instance.rs's OUTPUT_MIDI_SCRATCH_CAPACITY (256), which
 // documents this as the real, effective cap on how many MIDI events a
@@ -601,10 +611,12 @@ struct RackVST3Plugin {
         // atomic any thread may raise and the controller half takes.
         IPtr<ComponentHandler> component_handler;
 
-        // The component's and the controller's connection points, when they
-        // are separate objects.
-        IPtr<IConnectionPoint> component_cp;
-        IPtr<IConnectionPoint> controller_cp;
+        // The proxies the component and a separate controller are connected
+        // through (see vst3_connection_proxy.h): component_proxy carries what
+        // the component sends, controller_proxy what the controller sends.
+        // Null when the component is its own controller.
+        IPtr<RackConnectionProxy> component_proxy;
+        IPtr<RackConnectionProxy> controller_proxy;
     } ctrl;
 };
 
@@ -830,14 +842,21 @@ RackVST3Plugin* rack_vst3_plugin_new(const char* path, const char* uid) {
         plugin->controller->setComponentHandler(plugin->ctrl.component_handler);
     }
 
-    // Set up connection points if controller is separate
+    // Connect a separate controller to the component through one proxy per
+    // direction, as the SDK's PlugProvider::connectComponents does, so a
+    // message either side sends off this thread is discarded rather than
+    // delivered on the audio thread (see vst3_connection_proxy.h). Messages
+    // sent while connecting arrive here, on the constructing thread, and are
+    // delivered.
     if (plugin->controller && reinterpret_cast<void*>(plugin->controller.get()) != reinterpret_cast<void*>(plugin->component.get())) {
-        plugin->ctrl.component_cp = U::cast<IConnectionPoint>(plugin->component);
-        plugin->ctrl.controller_cp = U::cast<IConnectionPoint>(plugin->controller);
+        IPtr<IConnectionPoint> component_cp = U::cast<IConnectionPoint>(plugin->component);
+        IPtr<IConnectionPoint> controller_cp = U::cast<IConnectionPoint>(plugin->controller);
 
-        if (plugin->ctrl.component_cp && plugin->ctrl.controller_cp) {
-            plugin->ctrl.component_cp->connect(plugin->ctrl.controller_cp);
-            plugin->ctrl.controller_cp->connect(plugin->ctrl.component_cp);
+        if (component_cp && controller_cp) {
+            plugin->ctrl.component_proxy = owned(new RackConnectionProxy(component_cp));
+            plugin->ctrl.controller_proxy = owned(new RackConnectionProxy(controller_cp));
+            plugin->ctrl.component_proxy->connect(controller_cp);
+            plugin->ctrl.controller_proxy->connect(component_cp);
         }
     }
 
@@ -862,10 +881,13 @@ void rack_vst3_plugin_free(RackVST3Plugin* plugin) {
     // plugin is being destroyed regardless.
     suspend_for_state(plugin);
 
-    // Disconnect connection points
-    if (plugin->ctrl.component_cp && plugin->ctrl.controller_cp) {
-        plugin->ctrl.component_cp->disconnect(plugin->ctrl.controller_cp);
-        plugin->ctrl.controller_cp->disconnect(plugin->ctrl.component_cp);
+    // Disconnect as PlugProvider::disconnectComponents does, before either
+    // side is terminated.
+    if (plugin->ctrl.component_proxy) {
+        plugin->ctrl.component_proxy->disconnect_destination();
+    }
+    if (plugin->ctrl.controller_proxy) {
+        plugin->ctrl.controller_proxy->disconnect_destination();
     }
 
     // Terminate controller
@@ -880,6 +902,11 @@ void rack_vst3_plugin_free(RackVST3Plugin* plugin) {
         plugin->component = nullptr;
     }
 
+    // Every reference into the plugin's code is released before the module
+    // that holds that code: the proxies hold the component's and the
+    // controller's connection points.
+    plugin->ctrl.component_proxy = nullptr;
+    plugin->ctrl.controller_proxy = nullptr;
     plugin->processor = nullptr;
     plugin->module = nullptr;
 
@@ -1828,6 +1855,24 @@ uint32_t rack_vst3_plugin_get_midi_pc_param_id(RackVST3Plugin* plugin, int chann
     ParamID pid = kNoParamId;
     midiMapping->getMidiControllerAssignment(0, channel, kCtrlProgramChange, pid);
     return pid;
+}
+
+void rack_vst3_plugin_discarded_messages(RackVST3Plugin* plugin, uint64_t* component_to_controller,
+                                         uint64_t* controller_to_component) {
+    uint64_t from_component = 0;
+    uint64_t from_controller = 0;
+    if (plugin && plugin->ctrl.component_proxy) {
+        from_component = plugin->ctrl.component_proxy->discarded();
+    }
+    if (plugin && plugin->ctrl.controller_proxy) {
+        from_controller = plugin->ctrl.controller_proxy->discarded();
+    }
+    if (component_to_controller) {
+        *component_to_controller = from_component;
+    }
+    if (controller_to_component) {
+        *controller_to_component = from_controller;
+    }
 }
 
 uint32_t rack_vst3_plugin_take_restart_flags(RackVST3Plugin* plugin) {

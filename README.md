@@ -228,6 +228,11 @@ let plugin = Vst3Plugin::join(audio.join().unwrap(), controller).expect("same in
 - Initialization, `reset`, state reads and writes, preset loads, the latency
   query, and the parameter write that tells both halves exist only on the
   whole `Vst3Plugin`, which `join` gives back.
+- A component and a separate controller are connected through a proxy, as
+  the SDK's own host helper does: a message either sends on the thread that
+  created the instance is delivered, and one sent from any other thread (from
+  inside `process`, say) is discarded and counted (`discarded_messages`), so
+  no controller code runs on the audio thread.
 - Drop the processor half first, or join the two: the controller half frees
   the instance only once the processor half has let go. Dropped the other way
   round, the instance is leaked and counted (`leaked_instance_count`) rather

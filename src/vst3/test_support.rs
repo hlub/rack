@@ -28,6 +28,7 @@ pub(crate) mod param {
     pub(crate) const REQUEST_RESTART: usize = 1;
     pub(crate) const RENAME_TITLES: usize = 2;
     pub(crate) const CHANGE_IDS: usize = 3;
+    pub(crate) const SEND_FROM_PROCESS: usize = 4;
     pub(crate) const COUNT: usize = 5;
     /// `REQUEST_RESTART`'s step count: its value times this, rounded, is the
     /// flag word the fixture passes to `restartComponent`.

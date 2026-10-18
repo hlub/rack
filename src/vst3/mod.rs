@@ -20,5 +20,5 @@ mod controller_tests;
 pub use scanner::Vst3Scanner;
 pub use instance::{leaked_instance_count, live_instance_count, JoinMismatch, Vst3Plugin};
 pub use processor::{ExtraInputBus, ExtraOutputBus, Vst3Processor};
-pub use controller::{TitleRefresh, Vst3Controller};
+pub use controller::{DiscardedMessages, TitleRefresh, Vst3Controller};
 pub use restart::RestartFlags;

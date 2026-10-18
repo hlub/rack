@@ -119,7 +119,8 @@ void rack_vst3_plugin_free(RackVST3Plugin* plugin);
 //   _parameter_normalized_from_plain, _get_preset_count, _get_preset_info,
 //   _get_midi_pc_param_id, the bus counts and bus info, _emits_midi,
 //   _read_state_while_processing, _take_restart_flags,
-//   _refresh_parameter_titles and rack_vst3_plugin_release_controller. They call only the edit controller
+//   _refresh_parameter_titles, _discarded_messages and
+//   rack_vst3_plugin_release_controller. They call only the edit controller
 //   and read the facts fixed at initialization.
 // - The whole instance, never while it is split: _initialize, _reset,
 //   _set_parameter, _set_parameter_by_id (each writes the processor's queue
@@ -477,6 +478,17 @@ uint32_t rack_vst3_plugin_get_midi_pc_param_id(RackVST3Plugin* plugin, int chann
 // raise them from any thread; rack does nothing else with them.
 // Thread-safety: any thread; a host takes them on its controller thread.
 uint32_t rack_vst3_plugin_take_restart_flags(RackVST3Plugin* plugin);
+
+// How many messages between the component and a separate controller were
+// discarded because they were sent from a thread other than the one that
+// constructed the instance (the audio thread, or a plugin's own background
+// thread): the standard keeps these messages on the UI thread, and delivering
+// one elsewhere would run controller code beside the host's own controller
+// calls. Written as 0 for a plugin whose component is its own controller.
+// Either out-pointer may be NULL.
+// Thread-safety: any thread; the counts are atomics.
+void rack_vst3_plugin_discarded_messages(RackVST3Plugin* plugin, uint64_t* component_to_controller,
+                                         uint64_t* controller_to_component);
 
 // Re-read every parameter's description (title, units, default, flags, step
 // count) from the controller, after the plugin reported

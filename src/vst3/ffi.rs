@@ -597,6 +597,19 @@ extern "C" {
         value: f32,
     ) -> c_int;
 
+    /// Messages between component and controller discarded for arriving off
+    /// the constructing thread, per direction.
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    /// - Each out-pointer must be NULL or point at a writable `u64`
+    pub fn rack_vst3_plugin_discarded_messages(
+        plugin: *mut RackVST3Plugin,
+        component_to_controller: *mut u64,
+        controller_to_component: *mut u64,
+    );
+
     /// Take and clear the restart flags the plugin raised.
     ///
     /// # Safety
