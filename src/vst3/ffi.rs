@@ -23,6 +23,11 @@ pub struct RackVST3Gui {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+pub struct RackVST3StateBlob {
+    _private: [u8; 0],
+}
+
 // Plugin type enum
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -896,6 +901,29 @@ extern "C" {
         size: usize,
         pump_seconds: f64,
     ) -> c_int;
+
+    /// Read the state without leaving the Processing state, into a blob rack
+    /// owns. Returns NULL and sets `*error` on failure.
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    /// - `error` must be NULL or point at a writable `c_int`
+    /// - Call it on the controller half's thread.
+    /// - A returned blob must be freed with `rack_vst3_state_blob_free`.
+    pub fn rack_vst3_plugin_read_state_while_processing(
+        plugin: *mut RackVST3Plugin,
+        error: *mut c_int,
+    ) -> *mut RackVST3StateBlob;
+
+    /// The blob's bytes; valid until the blob is freed.
+    pub fn rack_vst3_state_blob_data(blob: *const RackVST3StateBlob) -> *const u8;
+
+    /// The blob's byte count.
+    pub fn rack_vst3_state_blob_size(blob: *const RackVST3StateBlob) -> usize;
+
+    /// Free a blob. NULL is a no-op.
+    pub fn rack_vst3_state_blob_free(blob: *mut RackVST3StateBlob);
 
     // ============================================================================
     // MIDI API

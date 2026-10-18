@@ -23,6 +23,27 @@ pub(crate) fn map_error(code: i32) -> Error {
     }
 }
 
+/// Takes the bytes out of a state blob a state read returned, freeing the
+/// blob, or maps the read's error code when it returned none.
+///
+/// # Safety
+///
+/// `blob` must be NULL or a blob a state read returned and nothing has freed.
+pub(crate) unsafe fn take_state_blob(blob: *mut ffi::RackVST3StateBlob, error: i32) -> Result<Vec<u8>> {
+    if blob.is_null() {
+        return Err(map_error(error));
+    }
+    let data = ffi::rack_vst3_state_blob_data(blob);
+    let size = ffi::rack_vst3_state_blob_size(blob);
+    let bytes = if size == 0 || data.is_null() {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(data, size).to_vec()
+    };
+    ffi::rack_vst3_state_blob_free(blob);
+    Ok(bytes)
+}
+
 /// Safely convert a fixed-size C char array to a Rust String
 ///
 /// This uses bounded string conversion to prevent UB even if the C++ code

@@ -11,6 +11,8 @@ mod test_support;
 mod fixture_tests;
 #[cfg(test)]
 mod split_tests;
+#[cfg(test)]
+mod state_tests;
 
 pub use scanner::Vst3Scanner;
 pub use instance::{leaked_instance_count, live_instance_count, JoinMismatch, Vst3Plugin};

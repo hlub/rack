@@ -327,6 +327,8 @@ public:
     // Accessors
     const std::vector<uint8_t>& getData() const { return buffer_; }
     size_t getSize() const { return buffer_.size(); }
+    // Moves the written bytes out, leaving the stream empty.
+    std::vector<uint8_t> takeData() { position_ = 0; return std::move(buffer_); }
     void clear() { buffer_.clear(); position_ = 0; }
 
 private:
@@ -2277,21 +2279,15 @@ int rack_vst3_plugin_get_state_size(RackVST3Plugin* plugin) {
     return 4 * 1024 * 1024;  // 4 MB — well above any observed AD2 state size
 }
 
-int rack_vst3_plugin_get_state(RackVST3Plugin* plugin, uint8_t* data, size_t* size) {
-    if (!plugin || !data || !size || !plugin->component) {
-        return RACK_VST3_ERROR_INVALID_PARAM;
-    }
-
-    if (*size == 0) {
-        return RACK_VST3_ERROR_INVALID_PARAM;
-    }
-
-    // Suspend processing: getState is only valid outside Processing state.
-    suspend_for_state(plugin);
-
-    IPtr<MemoryStream> stream(new MemoryStream(), false);
-
-    // 4-byte header: component state size (filled after serialization).
+// Writes the instance's state in rack's one state format: a 4-byte
+// component-state size, the component's state, then the controller's state
+// when the controller is a separate object. Both state reads call this, so
+// their formats cannot diverge. Calls only IComponent::getState and
+// IEditController::getState, on a stream of the caller's own, so it touches
+// none of the processor half's fields. Returns the component's tresult; a
+// controller that declines (common for JUCE plugins, whose controller has no
+// separate state) leaves the component state alone in the stream.
+static tresult write_state(RackVST3Plugin* plugin, MemoryStream* stream) {
     uint32_t size_marker_placeholder = 0;
     stream->write(&size_marker_placeholder, sizeof(size_marker_placeholder), nullptr);
 
@@ -2302,27 +2298,43 @@ int rack_vst3_plugin_get_state(RackVST3Plugin* plugin, uint8_t* data, size_t* si
     if (result != kResultOk) {
         fprintf(stderr, "[rack] IComponent::getState failed: tresult=0x%08x\n",
                 static_cast<unsigned>(result));
-        resume_after_state(plugin);
-        return RACK_VST3_ERROR_GENERIC;
+        return result;
     }
 
     int64 component_end_pos = 0;
     stream->tell(&component_end_pos);
     uint32_t component_state_size = static_cast<uint32_t>(component_end_pos - component_start_pos);
 
-    // Write the component state size into the 4-byte header.
     stream->seek(0, IBStream::kIBSeekSet, nullptr);
     stream->write(&component_state_size, sizeof(component_state_size), nullptr);
-
-    // Seek to end of component state to append controller state.
     stream->seek(component_end_pos, IBStream::kIBSeekSet, nullptr);
 
     if (plugin->controller &&
         reinterpret_cast<void*>(plugin->controller.get()) !=
         reinterpret_cast<void*>(plugin->component.get())) {
-        // Non-OK from getState means the controller has no separate state
-        // (common for JUCE plugins); the component state alone is used.
         plugin->controller->getState(stream);
+    }
+    return kResultOk;
+}
+
+int rack_vst3_plugin_get_state(RackVST3Plugin* plugin, uint8_t* data, size_t* size) {
+    if (!plugin || !data || !size || !plugin->component) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+
+    if (*size == 0) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+
+    // Suspend processing: this read stops processing around getState, the
+    // conservative bracket for a plugin not known to synchronise its own
+    // state against process().
+    suspend_for_state(plugin);
+
+    IPtr<MemoryStream> stream(new MemoryStream(), false);
+    if (write_state(plugin, stream) != kResultOk) {
+        resume_after_state(plugin);
+        return RACK_VST3_ERROR_GENERIC;
     }
 
     resume_after_state(plugin);
@@ -2336,6 +2348,55 @@ int rack_vst3_plugin_get_state(RackVST3Plugin* plugin, uint8_t* data, size_t* si
     memcpy(data, stream->getData().data(), state_size);
     *size = state_size;
     return RACK_VST3_OK;
+}
+
+// A state blob rack hands to the caller: the bytes of one state read, owned
+// here until rack_vst3_state_blob_free.
+struct RackVST3StateBlob {
+    std::vector<uint8_t> bytes;
+};
+
+RackVST3StateBlob* rack_vst3_plugin_read_state_while_processing(RackVST3Plugin* plugin, int* error) {
+    int ignored = RACK_VST3_OK;
+    int& status = error ? *error : ignored;
+    if (!plugin || !plugin->component) {
+        status = RACK_VST3_ERROR_INVALID_PARAM;
+        return nullptr;
+    }
+    if (!plugin->fixed.initialized) {
+        status = RACK_VST3_ERROR_NOT_INITIALIZED;
+        return nullptr;
+    }
+
+    // No suspend: IComponent::getState is "[UI-thread & (Initialized |
+    // Connected | Setup Done | Activated | Processing)]" in the VST3 headers,
+    // so the standard allows it while the processor half processes. Whether a
+    // given plugin synchronises its own state against process() is the
+    // plugin's, and is not knowable here.
+    IPtr<MemoryStream> stream(new MemoryStream(), false);
+    if (write_state(plugin, stream) != kResultOk) {
+        status = RACK_VST3_ERROR_GENERIC;
+        return nullptr;
+    }
+    auto blob = new (std::nothrow) RackVST3StateBlob{stream->takeData()};
+    if (!blob) {
+        status = RACK_VST3_ERROR_GENERIC;
+        return nullptr;
+    }
+    status = RACK_VST3_OK;
+    return blob;
+}
+
+const uint8_t* rack_vst3_state_blob_data(const RackVST3StateBlob* blob) {
+    return blob ? blob->bytes.data() : nullptr;
+}
+
+size_t rack_vst3_state_blob_size(const RackVST3StateBlob* blob) {
+    return blob ? blob->bytes.size() : 0;
+}
+
+void rack_vst3_state_blob_free(RackVST3StateBlob* blob) {
+    delete blob;
 }
 
 // Identical to rack_vst3_plugin_set_state below except the post-setState

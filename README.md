@@ -218,6 +218,10 @@ let plugin = Vst3Plugin::join(audio.join().unwrap(), controller).expect("same in
 - `Vst3Controller` is neither `Send` nor `Sync`: it stays on the thread that
   split the instance. Its `set_parameter` writes the controller only; the
   processor hears a value through `queue_parameter_change` on its own thread.
+  Its `read_state_while_processing` reads the state without stopping the
+  processor; whether a given plugin keeps its own state consistent against
+  `process` meanwhile is the plugin's, so a host checks a plugin before
+  trusting it.
 - Initialization, `reset`, state reads and writes, preset loads, the latency
   query, and the parameter write that tells both halves exist only on the
   whole `Vst3Plugin`, which `join` gives back.

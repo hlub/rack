@@ -11,7 +11,7 @@ use crate::{Error, ParameterInfo, PluginInfo, PresetInfo, Result};
 
 use super::ffi;
 use super::processor::BusLayout;
-use super::util::map_error;
+use super::util::{map_error, take_state_blob};
 
 /// The controller half of a VST3 plugin instance: parameter descriptions,
 /// values and their display text, a controller-only parameter write, presets
@@ -349,6 +349,30 @@ impl Vst3Controller {
             return Err(map_error(result));
         }
         Ok(out_normalized)
+    }
+
+    /// Read the plugin's state without stopping it from processing: the
+    /// processor half may go on processing on the audio thread meanwhile. Same
+    /// format as [`get_state`](crate::PluginInstance::get_state) on the whole,
+    /// which instead stops processing around the read.
+    ///
+    /// The VST3 standard allows `IComponent::getState` while processing.
+    /// Whether a given plugin synchronises its own state against `process` is
+    /// the plugin's, and rack does not check it: a host that has not checked
+    /// a plugin reads its state from the whole instance instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the plugin is not initialized or its component
+    /// refuses to write its state.
+    pub fn read_state_while_processing(&self) -> Result<Vec<u8>> {
+        let mut error: c_int = ffi::RACK_VST3_OK;
+        // SAFETY: the instance is live; `error` is a local out-pointer; the
+        // returned blob is freed by `take_state_blob` and nowhere else.
+        unsafe {
+            let blob = ffi::rack_vst3_plugin_read_state_while_processing(self.inner.as_ptr(), &mut error);
+            take_state_blob(blob, error)
+        }
     }
 
     /// Number of factory presets the plugin listed at initialization.

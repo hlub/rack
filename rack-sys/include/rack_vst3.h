@@ -113,8 +113,8 @@ void rack_vst3_plugin_free(RackVST3Plugin* plugin);
 //   _get_parameter, _controller_set_parameter, _parameter_string_by_value,
 //   _parameter_plain_value, _parameter_value_by_string,
 //   _parameter_normalized_from_plain, _get_preset_count, _get_preset_info,
-//   _get_midi_pc_param_id, the bus counts and bus info, _emits_midi and
-//   rack_vst3_plugin_release_controller. They call only the edit controller
+//   _get_midi_pc_param_id, the bus counts and bus info, _emits_midi,
+//   _read_state_while_processing and rack_vst3_plugin_release_controller. They call only the edit controller
 //   and read the facts fixed at initialization.
 // - The whole instance, never while it is split: _initialize, _reset,
 //   _set_parameter, _set_parameter_by_id (each writes the processor's queue
@@ -655,6 +655,33 @@ int rack_vst3_plugin_set_state(RackVST3Plugin* plugin, const uint8_t* data, size
 // Returns 0 on success, negative error code on failure
 // Thread-safety: Should be called from the same thread that owns the plugin instance.
 int rack_vst3_plugin_set_state_pumped(RackVST3Plugin* plugin, const uint8_t* data, size_t size, double pump_seconds);
+
+// The bytes of one state read, owned by rack until rack_vst3_state_blob_free.
+typedef struct RackVST3StateBlob RackVST3StateBlob;
+
+// Read the plugin's state without leaving the Processing state: no
+// setProcessing(false), no setActive(false), so the processor half may go on
+// processing on the audio thread meanwhile. One getState call per object
+// into a stream sized by what the plugin writes: no size guess, no retry.
+// Same format as rack_vst3_plugin_get_state (the two share one writer).
+//
+// The VST3 standard allows IComponent::getState while processing; whether a
+// given plugin synchronises its own state against process() is the plugin's
+// and is not checked here.
+//
+// Returns the blob, or NULL with *error (when error is non-NULL) set to
+// RACK_VST3_ERROR_INVALID_PARAM, RACK_VST3_ERROR_NOT_INITIALIZED or
+// RACK_VST3_ERROR_GENERIC (the component's getState failed).
+// Thread-safety: the controller half's; a controller-group function (see
+// "The two halves of an instance" above).
+RackVST3StateBlob* rack_vst3_plugin_read_state_while_processing(RackVST3Plugin* plugin, int* error);
+
+// The blob's bytes and their count. NULL / 0 for a NULL blob.
+const uint8_t* rack_vst3_state_blob_data(const RackVST3StateBlob* blob);
+size_t rack_vst3_state_blob_size(const RackVST3StateBlob* blob);
+
+// Free a blob. NULL is a no-op.
+void rack_vst3_state_blob_free(RackVST3StateBlob* blob);
 
 // ============================================================================
 // MIDI API
