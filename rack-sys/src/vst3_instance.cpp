@@ -367,12 +367,16 @@ static const char* progress_type_name(Vst::IProgress::ProgressType type) {
     }
 }
 
-// Minimal IComponentHandler. The VST3 spec requires the host to provide one
-// via IEditController::setComponentHandler before relying on the controller
-// -- some plugins' internal parameter-cache synchronization (e.g. inside
-// setComponentState) may depend on a handler being present, even though we
-// don't need to act on beginEdit/performEdit/endEdit/restartComponent
-// ourselves in a headless host.
+// The host's IComponentHandler. The VST3 spec requires the host to provide
+// one via IEditController::setComponentHandler before relying on the
+// controller -- some plugins' internal parameter-cache synchronization (e.g.
+// inside setComponentState) may depend on a handler being present.
+// beginEdit/performEdit/endEdit are accepted and ignored: a headless host has
+// no automation to record. restartComponent's flags are recorded, ORed into
+// one atomic word the host takes with rack_vst3_plugin_take_restart_flags:
+// a plugin may call it from any thread (its own background loader, or even
+// process()), so recording is one lock-free fetch_or and acting on the flags
+// is the host's, on its own thread.
 //
 // Also implements Vst::IProgress, purely for observation. A plugin whose
 // setState triggers async background loading (e.g. sample streaming) may,
@@ -395,7 +399,15 @@ public:
     tresult PLUGIN_API beginEdit(ParamID) override { return kResultOk; }
     tresult PLUGIN_API performEdit(ParamID, ParamValue) override { return kResultOk; }
     tresult PLUGIN_API endEdit(ParamID) override { return kResultOk; }
-    tresult PLUGIN_API restartComponent(int32) override { return kResultOk; }
+    tresult PLUGIN_API restartComponent(int32 flags) override {
+        pending_restart_flags_.fetch_or(static_cast<uint32_t>(flags), std::memory_order_release);
+        return kResultOk;
+    }
+
+    // The flags raised since the last take, cleared by taking them.
+    uint32_t take_restart_flags() {
+        return pending_restart_flags_.exchange(0, std::memory_order_acquire);
+    }
 
     tresult PLUGIN_API start(Vst::IProgress::ProgressType type,
                               const tchar* optionalDescription,
@@ -427,6 +439,8 @@ private:
     // observational-only implementation has no real progress list to look
     // an ID up in, but start() must still hand back a unique one per call.
     std::atomic<uint64_t> next_progress_id_{1};
+
+    std::atomic<uint32_t> pending_restart_flags_{0};
 };
 
 IMPLEMENT_REFCOUNT(ComponentHandler)
@@ -583,8 +597,9 @@ struct RackVST3Plugin {
         // Host-provided IComponentHandler, required by the VST3 spec. Kept
         // alive for the plugin's lifetime; the controller only holds a raw
         // pointer to it (set via setComponentHandler), not a counted
-        // reference.
-        IPtr<IComponentHandler> component_handler;
+        // reference. It also records the plugin's restart requests, in an
+        // atomic any thread may raise and the controller half takes.
+        IPtr<ComponentHandler> component_handler;
 
         // The component's and the controller's connection points, when they
         // are separate objects.
@@ -811,7 +826,7 @@ RackVST3Plugin* rack_vst3_plugin_new(const char* path, const char* uid) {
     // being present even for a headless host that never acts on its
     // beginEdit/performEdit/endEdit/restartComponent callbacks.
     if (plugin->controller) {
-        plugin->ctrl.component_handler = IPtr<IComponentHandler>(new ComponentHandler(), false);
+        plugin->ctrl.component_handler = IPtr<ComponentHandler>(new ComponentHandler(), false);
         plugin->controller->setComponentHandler(plugin->ctrl.component_handler);
     }
 
@@ -1813,6 +1828,34 @@ uint32_t rack_vst3_plugin_get_midi_pc_param_id(RackVST3Plugin* plugin, int chann
     ParamID pid = kNoParamId;
     midiMapping->getMidiControllerAssignment(0, channel, kCtrlProgramChange, pid);
     return pid;
+}
+
+uint32_t rack_vst3_plugin_take_restart_flags(RackVST3Plugin* plugin) {
+    if (!plugin || !plugin->ctrl.component_handler) {
+        return 0;
+    }
+    return plugin->ctrl.component_handler->take_restart_flags();
+}
+
+// Re-reads the controller's parameter list into a temporary and compares ids:
+// fixed.param_ids is what the processor half resolves indices against on the
+// audio thread, so it is never rewritten here. Changed ids mean the plugin
+// wants a new instance, and nothing changes.
+int rack_vst3_plugin_refresh_parameter_titles(RackVST3Plugin* plugin) {
+    if (!plugin || !plugin->controller) {
+        return RACK_VST3_ERROR_INVALID_PARAM;
+    }
+    if (!plugin->fixed.initialized) {
+        return RACK_VST3_ERROR_NOT_INITIALIZED;
+    }
+    std::vector<ParamID> ids;
+    std::vector<RackVST3Plugin::ParamMeta> meta;
+    read_parameter_list(plugin->controller, ids, meta);
+    if (ids != plugin->fixed.param_ids) {
+        return RACK_VST3_PARAMETER_IDS_CHANGED;
+    }
+    plugin->ctrl.param_meta = std::move(meta);
+    return RACK_VST3_OK;
 }
 
 // Writes directly into plugin->proc.process_context (a plain member, pointed to

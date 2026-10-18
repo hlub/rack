@@ -7,6 +7,7 @@ use std::ptr::NonNull;
 use super::controller::Vst3Controller;
 use super::ffi;
 use super::processor::{BusLayout, ExtraInputBus, ExtraOutputBus, Vst3Processor};
+use super::restart::RestartFlags;
 use super::util::{map_error, take_state_blob};
 
 #[cfg(test)]
@@ -210,6 +211,15 @@ impl Vst3Plugin {
     #[must_use]
     pub fn midi_pc_param_id(&self, channel: i32) -> u32 {
         self.controller.midi_pc_param_id(channel)
+    }
+
+    /// See [`Vst3Controller::take_restart_flags`]. A host takes them here at
+    /// the end of configuring an instance, before splitting it, so requests a
+    /// plugin raised while it was configured (a state restore commonly raises
+    /// some) are not mistaken for changes it made while playing.
+    #[must_use]
+    pub fn take_restart_flags(&self) -> RestartFlags {
+        self.controller.take_restart_flags()
     }
 
     /// See [`Vst3Processor::set_transport`].

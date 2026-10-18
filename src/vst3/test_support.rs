@@ -25,7 +25,13 @@ pub(crate) fn serial_plugin_test() -> MutexGuard<'static, ()> {
 /// `rack-sys/test/fixture_plugin/src/fixture_ids.h`.
 pub(crate) mod param {
     pub(crate) const GAIN: usize = 0;
+    pub(crate) const REQUEST_RESTART: usize = 1;
+    pub(crate) const RENAME_TITLES: usize = 2;
+    pub(crate) const CHANGE_IDS: usize = 3;
     pub(crate) const COUNT: usize = 5;
+    /// `REQUEST_RESTART`'s step count: its value times this, rounded, is the
+    /// flag word the fixture passes to `restartComponent`.
+    pub(crate) const RESTART_FLAG_STEPS: f32 = 4095.0;
 }
 
 const COMPONENT_STATE_MAGIC: u32 = 0x5246_5843;

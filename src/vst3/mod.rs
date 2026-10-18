@@ -4,6 +4,7 @@ mod scanner;
 mod instance;
 mod processor;
 mod controller;
+mod restart;
 
 #[cfg(test)]
 mod test_support;
@@ -13,8 +14,11 @@ mod fixture_tests;
 mod split_tests;
 #[cfg(test)]
 mod state_tests;
+#[cfg(test)]
+mod controller_tests;
 
 pub use scanner::Vst3Scanner;
 pub use instance::{leaked_instance_count, live_instance_count, JoinMismatch, Vst3Plugin};
 pub use processor::{ExtraInputBus, ExtraOutputBus, Vst3Processor};
-pub use controller::Vst3Controller;
+pub use controller::{TitleRefresh, Vst3Controller};
+pub use restart::RestartFlags;

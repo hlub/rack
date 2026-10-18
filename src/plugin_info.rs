@@ -90,7 +90,7 @@ impl std::fmt::Display for PluginInfo {
 }
 
 /// Information about a plugin parameter
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ParameterInfo {
     /// Parameter index
     pub index: usize,

@@ -94,6 +94,9 @@ pub const RACK_VST3_ERROR_NOT_SUPPORTED: c_int = -6;
 /// One or more MIDI events passed to `rack_vst3_plugin_send_midi` were
 /// dropped because the plugin's input event queue was already full.
 pub const RACK_VST3_ERROR_EVENT_QUEUE_FULL: c_int = -7;
+/// `rack_vst3_plugin_refresh_parameter_titles`'s answer when the parameter
+/// ids changed: not an error, and nothing was refreshed.
+pub const RACK_VST3_PARAMETER_IDS_CHANGED: c_int = 1;
 
 extern "C" {
     // ============================================================================
@@ -593,6 +596,22 @@ extern "C" {
         param_id: u32,
         value: f32,
     ) -> c_int;
+
+    /// Take and clear the restart flags the plugin raised.
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    pub fn rack_vst3_plugin_take_restart_flags(plugin: *mut RackVST3Plugin) -> u32;
+
+    /// Re-read the parameter descriptions; `RACK_VST3_PARAMETER_IDS_CHANGED`
+    /// when the ids changed and nothing was refreshed.
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    /// - Call it on the controller half's thread.
+    pub fn rack_vst3_plugin_refresh_parameter_titles(plugin: *mut RackVST3Plugin) -> c_int;
 
     /// Write a normalized value (clamped) into the edit controller only
     /// (`setParamNormalized`); the processor's queue is not touched.

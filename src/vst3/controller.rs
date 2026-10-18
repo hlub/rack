@@ -11,6 +11,7 @@ use crate::{Error, ParameterInfo, PluginInfo, PresetInfo, Result};
 
 use super::ffi;
 use super::processor::BusLayout;
+use super::restart::RestartFlags;
 use super::util::{map_error, take_state_blob};
 
 /// The controller half of a VST3 plugin instance: parameter descriptions,
@@ -375,6 +376,47 @@ impl Vst3Controller {
         }
     }
 
+    /// Takes the restart flags the plugin has raised through
+    /// `IComponentHandler::restartComponent` since the last take, clearing
+    /// them. The plugin may raise them from any thread; acting on them is the
+    /// caller's.
+    #[must_use]
+    pub fn take_restart_flags(&self) -> RestartFlags {
+        // SAFETY: the instance is live; the function exchanges one atomic.
+        RestartFlags::from_bits(unsafe { ffi::rack_vst3_plugin_take_restart_flags(self.inner.as_ptr()) })
+    }
+
+    /// Re-reads every parameter's description from the controller, as a host
+    /// does after [`RestartFlags::param_titles_changed`], and says which
+    /// indices changed. Parameter ids are never rewritten, because the
+    /// processor half resolves indices to ids on the audio thread: when the
+    /// count or any id changed, nothing is refreshed and the answer is
+    /// [`TitleRefresh::IdsChanged`], which means the plugin needs a new
+    /// instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the plugin is not initialized, or a description
+    /// cannot be read back.
+    pub fn refresh_parameter_titles(&mut self) -> Result<TitleRefresh> {
+        let before = self.parameter_infos()?;
+        // SAFETY: the instance is live; the function calls the controller and
+        // writes only the controller half's descriptions.
+        let result = unsafe { ffi::rack_vst3_plugin_refresh_parameter_titles(self.inner.as_ptr()) };
+        match result {
+            ffi::RACK_VST3_OK => {}
+            ffi::RACK_VST3_PARAMETER_IDS_CHANGED => return Ok(TitleRefresh::IdsChanged),
+            error => return Err(map_error(error)),
+        }
+        let changed = changed_parameters(&before, &self.parameter_infos()?);
+        Ok(if changed.is_empty() { TitleRefresh::Unchanged } else { TitleRefresh::Changed(changed) })
+    }
+
+    /// Every parameter's description, in index order.
+    fn parameter_infos(&self) -> Result<Vec<ParameterInfo>> {
+        (0..self.parameter_count()).map(|index| self.parameter_info(index)).collect()
+    }
+
     /// Number of factory presets the plugin listed at initialization.
     ///
     /// # Errors
@@ -512,6 +554,31 @@ impl Vst3Controller {
         // SAFETY: the instance is live; the function asks the controller.
         unsafe { ffi::rack_vst3_plugin_get_midi_pc_param_id(self.inner.as_ptr(), channel) }
     }
+}
+
+/// What [`Vst3Controller::refresh_parameter_titles`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TitleRefresh {
+    /// Every description is as it was.
+    Unchanged,
+    /// The descriptions at these indices changed (title, unit, default,
+    /// flags or step count), and now read as the plugin reports them.
+    Changed(Vec<usize>),
+    /// The parameter count or ids changed, so nothing was refreshed: the
+    /// instance keeps the list it had, and the plugin needs a new instance.
+    IdsChanged,
+}
+
+/// The indices whose description differs between two lists of one length.
+/// Pure, so the comparison is tested without a plugin.
+pub(super) fn changed_parameters(before: &[ParameterInfo], after: &[ParameterInfo]) -> Vec<usize> {
+    before
+        .iter()
+        .zip(after)
+        .enumerate()
+        .filter(|(_, (old, new))| old != new)
+        .map(|(index, _)| index)
+        .collect()
 }
 
 impl Drop for Vst3Controller {

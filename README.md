@@ -221,7 +221,10 @@ let plugin = Vst3Plugin::join(audio.join().unwrap(), controller).expect("same in
   Its `read_state_while_processing` reads the state without stopping the
   processor; whether a given plugin keeps its own state consistent against
   `process` meanwhile is the plugin's, so a host checks a plugin before
-  trusting it.
+  trusting it. Its `take_restart_flags` reports what the plugin asked for
+  through `restartComponent` (titles, latency, buses, a reload), and
+  `refresh_parameter_titles` re-reads the parameter descriptions after a
+  titles change without touching the parameter ids the processor reads.
 - Initialization, `reset`, state reads and writes, preset loads, the latency
   query, and the parameter write that tells both halves exist only on the
   whole `Vst3Plugin`, which `join` gives back.

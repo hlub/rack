@@ -48,6 +48,10 @@ typedef struct {
 // actually delivered before the drop).
 #define RACK_VST3_ERROR_EVENT_QUEUE_FULL -7
 
+// A non-error outcome of rack_vst3_plugin_refresh_parameter_titles: the
+// plugin's parameter ids changed, so nothing was refreshed.
+#define RACK_VST3_PARAMETER_IDS_CHANGED 1
+
 // ============================================================================
 // Scanner API
 // ============================================================================
@@ -114,7 +118,8 @@ void rack_vst3_plugin_free(RackVST3Plugin* plugin);
 //   _parameter_plain_value, _parameter_value_by_string,
 //   _parameter_normalized_from_plain, _get_preset_count, _get_preset_info,
 //   _get_midi_pc_param_id, the bus counts and bus info, _emits_midi,
-//   _read_state_while_processing and rack_vst3_plugin_release_controller. They call only the edit controller
+//   _read_state_while_processing, _take_restart_flags,
+//   _refresh_parameter_titles and rack_vst3_plugin_release_controller. They call only the edit controller
 //   and read the facts fixed at initialization.
 // - The whole instance, never while it is split: _initialize, _reset,
 //   _set_parameter, _set_parameter_by_id (each writes the processor's queue
@@ -464,6 +469,25 @@ int rack_vst3_plugin_controller_set_parameter(RackVST3Plugin* plugin, uint32_t i
 int rack_vst3_plugin_queue_parameter_change(RackVST3Plugin* plugin, uint32_t index, float value);
 
 uint32_t rack_vst3_plugin_get_midi_pc_param_id(RackVST3Plugin* plugin, int channel);
+
+// Take the restart flags the plugin has passed to
+// IComponentHandler::restartComponent since the last take (the VST3
+// RestartFlags of ivsteditcontroller.h, ORed together), clearing them. 0 when
+// none were raised. Recording is one atomic per instance, so the plugin may
+// raise them from any thread; rack does nothing else with them.
+// Thread-safety: any thread; a host takes them on its controller thread.
+uint32_t rack_vst3_plugin_take_restart_flags(RackVST3Plugin* plugin);
+
+// Re-read every parameter's description (title, units, default, flags, step
+// count) from the controller, after the plugin reported
+// kParamTitlesChanged. Parameter ids are never rewritten, because the
+// processor half reads them on the audio thread: if the count or any id
+// differs from what initialize recorded, this returns
+// RACK_VST3_PARAMETER_IDS_CHANGED and changes nothing (the plugin needs a new
+// instance). Returns RACK_VST3_OK once the descriptions are replaced,
+// RACK_VST3_ERROR_NOT_INITIALIZED before initialize.
+// Thread-safety: the controller half's.
+int rack_vst3_plugin_refresh_parameter_titles(RackVST3Plugin* plugin);
 
 // Update the plugin's live process context: tempo (BPM), playback state
 // (nonzero = playing, zero = stopped) and the host's current position.
