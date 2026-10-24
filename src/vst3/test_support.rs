@@ -35,6 +35,23 @@ pub(crate) mod param {
     pub(crate) const RESTART_FLAG_STEPS: f32 = 4095.0;
 }
 
+/// The VST3 `Event::type` of a legacy MIDI controller event
+/// (`Event::kLegacyMIDICCOutEvent`).
+pub(crate) const LEGACY_MIDI_CC_EVENT: u16 = 65535;
+
+/// The VST3 SDK's `ControllerNumbers` (`ivstmidicontrollers.h`) for the
+/// messages that have no event of their own, written out here as the SDK
+/// fixes them so a test pins rack's encoding to the SDK and not to rack.
+pub(crate) mod control_number {
+    pub(crate) const AFTER_TOUCH: u8 = 128;
+    pub(crate) const PITCH_BEND: u8 = 129;
+    pub(crate) const PROGRAM_CHANGE: u8 = 130;
+}
+
+/// How many of the most recent input events the fixture keeps; mirrors
+/// `kEventLogSize` in `fixture_ids.h`.
+const EVENT_LOG_SIZE: usize = 8;
+
 const COMPONENT_STATE_MAGIC: u32 = 0x5246_5843;
 const CONTROLLER_STATE_MAGIC: u32 = 0x5246_5852;
 
@@ -94,6 +111,38 @@ pub(crate) struct FixtureCounters {
     pub(crate) component_messages: u64,
     pub(crate) points: [u64; param::COUNT],
     pub(crate) controller_messages: u64,
+    /// Input events received since the fixture was created.
+    pub(crate) events_received: u64,
+    /// The last (at most eight) input events, oldest first.
+    pub(crate) events: Vec<ReceivedEvent>,
+}
+
+/// One input event as the fixture saw it. The legacy fields are zero for an
+/// event of any other type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReceivedEvent {
+    pub(crate) event_type: u16,
+    pub(crate) control_number: u8,
+    pub(crate) channel: u8,
+    pub(crate) value: u8,
+    pub(crate) value2: u8,
+}
+
+impl ReceivedEvent {
+    /// A legacy MIDI controller event with these fields.
+    pub(crate) fn legacy(control_number: u8, channel: u8, value: u8, value2: u8) -> Self {
+        Self { event_type: LEGACY_MIDI_CC_EVENT, control_number, channel, value, value2 }
+    }
+
+    fn unpack(word: u64) -> Self {
+        Self {
+            event_type: (word & 0xFFFF) as u16,
+            control_number: ((word >> 16) & 0xFF) as u8,
+            channel: ((word >> 24) & 0xFF) as u8,
+            value: ((word >> 32) & 0xFF) as u8,
+            value2: ((word >> 40) & 0xFF) as u8,
+        }
+    }
 }
 
 fn read_u32(bytes: &[u8], at: usize) -> u32 {
@@ -113,13 +162,24 @@ pub(crate) fn parse_fixture_state(state: &[u8]) -> FixtureCounters {
     let component = &state[4..4 + component_size];
     let controller = &state[4 + component_size..];
     assert_eq!(read_u32(component, 0), COMPONENT_STATE_MAGIC, "component state magic");
-    assert_eq!(component.len(), 4 + 8 * (3 + param::COUNT), "component state size");
+    assert_eq!(component.len(), 4 + 8 * (3 + param::COUNT + 1 + EVENT_LOG_SIZE), "component state size");
     assert_eq!(read_u32(controller, 0), CONTROLLER_STATE_MAGIC, "controller state magic");
     let mut points = [0u64; param::COUNT];
     for (index, slot) in points.iter_mut().enumerate() {
         *slot = read_u64(component, 4 + 8 * (3 + index));
     }
+    let events_received = read_u64(component, 4 + 8 * (3 + param::COUNT));
+    let kept = (events_received as usize).min(EVENT_LOG_SIZE);
+    let first = events_received as usize - kept;
+    let events = (first..first + kept)
+        .map(|number| {
+            let slot = number % EVENT_LOG_SIZE;
+            ReceivedEvent::unpack(read_u64(component, 4 + 8 * (3 + param::COUNT + 1 + slot)))
+        })
+        .collect();
     FixtureCounters {
+        events_received,
+        events,
         process_calls: read_u64(component, 4),
         set_processing_false_calls: read_u64(component, 12),
         component_messages: read_u64(component, 20),

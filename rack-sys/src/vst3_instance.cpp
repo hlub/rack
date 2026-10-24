@@ -1441,7 +1441,7 @@ int rack_vst3_plugin_process(
 }
 
 // Scale a VST3 normalized [0.0, 1.0] value to a MIDI 1.0 data byte [0, 127],
-// the exact inverse of send_midi's `data2 / 127.0f` encode. Rounds to nearest
+// the exact inverse of rack_midi_to_vst3_event's `data2 / 127.0f` encode. Rounds to nearest
 // and clamps, so a normalized 1.0 velocity maps back to 127.
 static uint8_t normalized_to_midi_data(float normalized) {
     float scaled = std::round(normalized * 127.0f);
@@ -1454,7 +1454,7 @@ static uint8_t normalized_to_midi_data(float normalized) {
 }
 
 // Decode a single VST3 output Event into a RackVST3MidiEvent, the exact
-// inverse of the encode in rack_vst3_plugin_send_midi. Pure: it reads only the
+// inverse of rack_midi_to_vst3_event. Pure: it reads only the
 // given event and touches no plugin state, so it can be unit-tested against a
 // hand-built synthetic Event without a real loaded plugin. Returns true and
 // fills `out` for a MIDI-representable event; returns false (leaving `out`
@@ -1495,37 +1495,39 @@ bool vst3_event_to_rack_midi(const Event& event, RackVST3MidiEvent* out) {
             return true;
 
         case Event::kLegacyMIDICCOutEvent: {
-            // Inverse of send_midi's controlNumber convention: control numbers
-            // below 0x80 are real CC; 0x80/0x81/0x82 encode Program Change /
-            // Channel Pressure / Pitch Bend respectively.
+            // Inverse of rack_midi_to_vst3_event's controlNumber convention,
+            // which is the SDK's own ControllerNumbers (ivstmidicontrollers.h):
+            // numbers below kAfterTouch are real MIDI controllers, and
+            // kAfterTouch, kPitchBend and kCtrlProgramChange stand for
+            // Channel Pressure, Pitch Bend and Program Change.
             const LegacyMIDICCOutEvent& cc = event.midiCCOut;
             out->channel = static_cast<uint8_t>(cc.channel);
             const uint8_t value = static_cast<uint8_t>(cc.value);
             const uint8_t value2 = static_cast<uint8_t>(cc.value2);
-            if (cc.controlNumber < 0x80) {
+            if (cc.controlNumber < kAfterTouch) {
                 out->status = 0xB0;               // Control Change
                 out->data1 = cc.controlNumber;
                 out->data2 = value;
                 return true;
             }
             switch (cc.controlNumber) {
-                case 0x80:                        // Program Change
+                case kCtrlProgramChange:          // Program Change
                     out->status = 0xC0;
                     out->data1 = value;
                     out->data2 = 0;
                     return true;
-                case 0x81:                        // Channel Pressure
+                case kAfterTouch:                 // Channel Pressure
                     out->status = 0xD0;
                     out->data1 = value;
                     out->data2 = 0;
                     return true;
-                case 0x82:                        // Pitch Bend (LSB, MSB)
+                case kPitchBend:                  // Pitch Bend (LSB, MSB)
                     out->status = 0xE0;
                     out->data1 = value;           // LSB
                     out->data2 = value2;          // MSB
                     return true;
                 default:
-                    return false;                 // unknown non-CC encoding
+                    return false;                 // no MIDI 1.0 message of this number
             }
         }
 
@@ -2595,6 +2597,86 @@ int rack_vst3_plugin_set_state(RackVST3Plugin* plugin, const uint8_t* data, size
 // MIDI API
 // ============================================================================
 
+// Encodes one MIDI 1.0 event as a VST3 Event, the exact inverse of
+// vst3_event_to_rack_midi. Pure: it reads only `midi_event` and touches no
+// plugin state, so it is unit-tested against hand-built events with no plugin
+// loaded. Returns true and fills `out` for a status rack knows how to
+// deliver; returns false for any other status, which the caller skips.
+//
+// VST3 has dedicated events for notes and polyphonic pressure. Everything
+// else rack delivers as a kLegacyMIDICCOutEvent whose controlNumber is the
+// SDK's own ControllerNumbers entry (ivstmidicontrollers.h): the MIDI
+// controller number itself below kAfterTouch, kAfterTouch for Channel
+// Pressure, kPitchBend for Pitch Bend (value is the LSB, value2 the MSB) and
+// kCtrlProgramChange for Program Change. These numbers are not an arbitrary
+// private scheme: JUCE, which both hosts and implements most plugins, reads
+// and writes the same numbers, so a plugin built on it gets the message the
+// sender meant. The SDK documents this event as one a plugin emits, and a host
+// that wants a plugin's mapped controllers (CC, pitch bend, channel pressure)
+// to act as parameters goes through IMidiMapping instead; rack does not.
+//
+// Deliberately NOT static: rack-sys's C++ unit test links against this symbol.
+bool rack_midi_to_vst3_event(const RackVST3MidiEvent& midi_event, Event* out) {
+    if (!out) {
+        return false;
+    }
+    memset(out, 0, sizeof(Event));
+    out->sampleOffset = midi_event.sample_offset;
+    out->busIndex = 0;
+
+    const auto legacy = [out, &midi_event](uint8_t control_number, uint8_t value, uint8_t value2) {
+        out->type = Event::kLegacyMIDICCOutEvent;
+        out->midiCCOut.channel = midi_event.channel;
+        out->midiCCOut.controlNumber = control_number;
+        out->midiCCOut.value = value;
+        out->midiCCOut.value2 = value2;
+    };
+
+    switch (midi_event.status & 0xF0) {
+        case 0x90:  // Note On
+            out->type = Event::kNoteOnEvent;
+            out->noteOn.channel = midi_event.channel;
+            out->noteOn.pitch = midi_event.data1;
+            out->noteOn.velocity = static_cast<float>(midi_event.data2) / 127.0f;
+            out->noteOn.noteId = -1;  // Not specified
+            return true;
+
+        case 0x80:  // Note Off
+            out->type = Event::kNoteOffEvent;
+            out->noteOff.channel = midi_event.channel;
+            out->noteOff.pitch = midi_event.data1;
+            out->noteOff.velocity = static_cast<float>(midi_event.data2) / 127.0f;
+            out->noteOff.noteId = -1;  // Not specified
+            return true;
+
+        case 0xA0:  // Polyphonic Key Pressure
+            out->type = Event::kPolyPressureEvent;
+            out->polyPressure.channel = midi_event.channel;
+            out->polyPressure.pitch = midi_event.data1;
+            out->polyPressure.pressure = static_cast<float>(midi_event.data2) / 127.0f;
+            return true;
+
+        case 0xB0:  // Control Change: the controller number is the control number
+            legacy(midi_event.data1, midi_event.data2, 0);
+            return true;
+
+        case 0xC0:  // Program Change
+            legacy(kCtrlProgramChange, midi_event.data1, 0);
+            return true;
+
+        case 0xD0:  // Channel Pressure
+            legacy(kAfterTouch, midi_event.data1, 0);
+            return true;
+
+        case 0xE0:  // Pitch Bend: data1 is the LSB, data2 the MSB
+            legacy(kPitchBend, midi_event.data1, midi_event.data2);
+            return true;
+
+        default:
+            return false;
+    }
+}
+
 int rack_vst3_plugin_send_midi(
     RackVST3Plugin* plugin,
     const RackVST3MidiEvent* events,
@@ -2621,108 +2703,12 @@ int rack_vst3_plugin_send_midi(
     uint32_t dropped_count = 0;
 
     for (uint32_t i = 0; i < event_count; ++i) {
-        const auto& midi_event = events[i];
-
         Event vst3_event;
-        memset(&vst3_event, 0, sizeof(Event));
-        vst3_event.sampleOffset = midi_event.sample_offset;
-        vst3_event.busIndex = 0;
-
-        uint8_t status = midi_event.status & 0xF0;
-
-        switch (status) {
-            case 0x90:  // Note On
-                vst3_event.type = Event::kNoteOnEvent;
-                vst3_event.noteOn.channel = midi_event.channel;
-                vst3_event.noteOn.pitch = midi_event.data1;
-                vst3_event.noteOn.velocity = static_cast<float>(midi_event.data2) / 127.0f;
-                vst3_event.noteOn.noteId = -1;  // Not specified
-                if (plugin->proc.input_events.addEvent(vst3_event) != kResultTrue) {
-                    ++dropped_count;
-                }
-                break;
-
-            case 0x80:  // Note Off
-                vst3_event.type = Event::kNoteOffEvent;
-                vst3_event.noteOff.channel = midi_event.channel;
-                vst3_event.noteOff.pitch = midi_event.data1;
-                vst3_event.noteOff.velocity = static_cast<float>(midi_event.data2) / 127.0f;
-                vst3_event.noteOff.noteId = -1;  // Not specified
-                if (plugin->proc.input_events.addEvent(vst3_event) != kResultTrue) {
-                    ++dropped_count;
-                }
-                break;
-
-            case 0xA0:  // Polyphonic Key Pressure (Aftertouch)
-                vst3_event.type = Event::kPolyPressureEvent;
-                vst3_event.polyPressure.channel = midi_event.channel;
-                vst3_event.polyPressure.pitch = midi_event.data1;
-                vst3_event.polyPressure.pressure = static_cast<float>(midi_event.data2) / 127.0f;
-                if (plugin->proc.input_events.addEvent(vst3_event) != kResultTrue) {
-                    ++dropped_count;
-                }
-                break;
-
-            case 0xB0:  // Control Change
-                // Use LegacyMIDICCOutEvent for CC messages
-                // This is the standard VST3 approach for MIDI CC data
-                vst3_event.type = Event::kLegacyMIDICCOutEvent;
-                vst3_event.midiCCOut.channel = midi_event.channel;
-                vst3_event.midiCCOut.controlNumber = midi_event.data1;
-                vst3_event.midiCCOut.value = midi_event.data2;
-                vst3_event.midiCCOut.value2 = 0;
-                if (plugin->proc.input_events.addEvent(vst3_event) != kResultTrue) {
-                    ++dropped_count;
-                }
-                break;
-
-            case 0xC0:  // Program Change
-                // VST3 doesn't have a dedicated program change event type
-                // Use LegacyMIDICCOutEvent with controlNumber >= 0x80 for non-CC MIDI
-                // Note: Not all plugins may support this encoding
-                vst3_event.type = Event::kLegacyMIDICCOutEvent;
-                vst3_event.midiCCOut.channel = midi_event.channel;
-                vst3_event.midiCCOut.controlNumber = 0x80;  // >= 0x80 indicates non-CC MIDI
-                vst3_event.midiCCOut.value = midi_event.data1;
-                vst3_event.midiCCOut.value2 = 0;
-                if (plugin->proc.input_events.addEvent(vst3_event) != kResultTrue) {
-                    ++dropped_count;
-                }
-                break;
-
-            case 0xD0:  // Channel Pressure (Aftertouch)
-                // VST3 doesn't have a dedicated channel pressure event type
-                // Use LegacyMIDICCOutEvent with controlNumber >= 0x80 for non-CC MIDI
-                // Note: Not all plugins may support this encoding
-                vst3_event.type = Event::kLegacyMIDICCOutEvent;
-                vst3_event.midiCCOut.channel = midi_event.channel;
-                vst3_event.midiCCOut.controlNumber = 0x81;  // >= 0x80 indicates non-CC MIDI
-                vst3_event.midiCCOut.value = midi_event.data1;
-                vst3_event.midiCCOut.value2 = 0;
-                if (plugin->proc.input_events.addEvent(vst3_event) != kResultTrue) {
-                    ++dropped_count;
-                }
-                break;
-
-            case 0xE0: {  // Pitch Bend
-                // VST3 doesn't have a dedicated pitch bend event type
-                // Use LegacyMIDICCOutEvent with controlNumber >= 0x80 for non-CC MIDI
-                // Note: Not all plugins may support this encoding
-                // The plugin should interpret value (LSB) and value2 (MSB) as 14-bit pitch bend
-                vst3_event.type = Event::kLegacyMIDICCOutEvent;
-                vst3_event.midiCCOut.channel = midi_event.channel;
-                vst3_event.midiCCOut.controlNumber = 0x82;  // >= 0x80 indicates non-CC MIDI
-                vst3_event.midiCCOut.value = midi_event.data1;   // LSB
-                vst3_event.midiCCOut.value2 = midi_event.data2;  // MSB
-                if (plugin->proc.input_events.addEvent(vst3_event) != kResultTrue) {
-                    ++dropped_count;
-                }
-                break;
-            }
-
-            default:
-                // Unknown MIDI event - skip it
-                continue;
+        if (!rack_midi_to_vst3_event(events[i], &vst3_event)) {
+            continue;  // Unknown MIDI event - skip it
+        }
+        if (plugin->proc.input_events.addEvent(vst3_event) != kResultTrue) {
+            ++dropped_count;
         }
     }
 

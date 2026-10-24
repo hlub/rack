@@ -58,8 +58,10 @@ cargo build --examples --features vst3
 
 The fixture plugin (`rack-sys/test/fixture_plugin`) records in its own state
 what reached it: process calls, setProcessing(false) calls, parameter points
-per parameter, and messages each side received. Tests that need to know what
-reached the plugin read that back; `src/vst3/test_support.rs` parses it. A
+per parameter, the last eight input events (a legacy MIDI controller event
+with its control number, channel and values), and messages each side received;
+it also hands every legacy MIDI controller event back on its MIDI output bus.
+Tests that need to know what reached the plugin read that back; `src/vst3/test_support.rs` parses it. A
 missing fixture skips its tests unless `RACK_REQUIRE_FIXTURE=1`, so always set
 it. The other tests load whatever real plugins are installed and skip when
 there are none. Every test that loads an instance takes

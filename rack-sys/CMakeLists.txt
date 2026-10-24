@@ -216,6 +216,14 @@ if(BUILD_TESTS)
     )
     target_link_libraries(rack_sys_test_instance PRIVATE rack_sys)
 
+    # MIDI mapping test (VST3 only: it needs the SDK headers rack_sys links)
+    if(TARGET rack_sys AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/external/vst3sdk/pluginterfaces/vst/ivstevents.h")
+        add_executable(rack_sys_test_midi_mapping
+            test/test_midi_mapping.cpp
+        )
+        target_link_libraries(rack_sys_test_midi_mapping PRIVATE rack_sys)
+    endif()
+
     # GUI test
     add_executable(rack_sys_test_gui
         test/test_gui.cpp

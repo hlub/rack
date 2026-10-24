@@ -5,6 +5,7 @@
 
 #include "public.sdk/source/vst/vstaudioeffect.h"
 #include "pluginterfaces/base/ibstream.h"
+#include "pluginterfaces/vst/ivstevents.h"
 #include "pluginterfaces/vst/ivstparameterchanges.h"
 
 #include <array>
@@ -49,6 +50,22 @@ public:
 	{
 		process_calls.fetch_add (1, std::memory_order_relaxed);
 		bool send_message = false;
+		if (IEventList* events = data.inputEvents)
+		{
+			int32 event_count = events->getEventCount ();
+			for (int32 event_index = 0; event_index < event_count; ++event_index)
+			{
+				Event event {};
+				if (events->getEvent (event_index, event) != kResultOk)
+					continue;
+				record_event (event);
+				// A legacy MIDI controller event is handed back on the output bus
+				// unchanged, so a test can check the host's decode of what the
+				// host itself encoded.
+				if (event.type == Event::kLegacyMIDICCOutEvent && data.outputEvents)
+					data.outputEvents->addEvent (event);
+			}
+		}
 		if (IParameterChanges* changes = data.inputParameterChanges)
 		{
 			int32 queue_count = changes->getParameterCount ();
@@ -118,12 +135,15 @@ public:
 		uint32 magic = kComponentStateMagic;
 		if (state->write (&magic, sizeof (magic), nullptr) != kResultOk)
 			return kResultFalse;
-		std::array<uint64, 3 + kParamCount> words {};
+		std::array<uint64, kComponentStateWords> words {};
 		words[0] = process_calls.load (std::memory_order_relaxed);
 		words[1] = set_processing_false_calls.load (std::memory_order_relaxed);
 		words[2] = messages_received.load (std::memory_order_relaxed);
 		for (int32 id = 0; id < kParamCount; ++id)
 			words[3 + id] = points_received[id].load (std::memory_order_relaxed);
+		words[3 + kParamCount] = events_received.load (std::memory_order_relaxed);
+		for (int32 slot = 0; slot < kEventLogSize; ++slot)
+			words[4 + kParamCount + slot] = event_log[slot].load (std::memory_order_relaxed);
 		return state->write (words.data (), static_cast<int32> (sizeof (words)), nullptr);
 	}
 
@@ -140,11 +160,31 @@ public:
 	}
 
 private:
+	// Appends an input event to the log: its type in the low 16 bits and, for a
+	// legacy MIDI controller event, its control number, channel, value and
+	// value2 in the next four bytes (see fixture_ids.h).
+	void record_event (const Event& event)
+	{
+		uint64 word = event.type;
+		if (event.type == Event::kLegacyMIDICCOutEvent)
+		{
+			word |= static_cast<uint64> (event.midiCCOut.controlNumber) << 16;
+			word |= static_cast<uint64> (static_cast<uint8> (event.midiCCOut.channel)) << 24;
+			word |= static_cast<uint64> (static_cast<uint8> (event.midiCCOut.value)) << 32;
+			word |= static_cast<uint64> (static_cast<uint8> (event.midiCCOut.value2)) << 40;
+		}
+		uint64 count = events_received.load (std::memory_order_relaxed);
+		event_log[count % kEventLogSize].store (word, std::memory_order_relaxed);
+		events_received.store (count + 1, std::memory_order_relaxed);
+	}
+
 	ParamValue gain {1.0};
 	std::atomic<uint64> process_calls {0};
 	std::atomic<uint64> set_processing_false_calls {0};
 	std::atomic<uint64> messages_received {0};
 	std::array<std::atomic<uint64>, kParamCount> points_received {};
+	std::atomic<uint64> events_received {0};
+	std::array<std::atomic<uint64>, kEventLogSize> event_log {};
 };
 
 FUnknown* createFixtureComponent (void* context)

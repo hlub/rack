@@ -2,10 +2,11 @@
 //! records what the host did to it in its own state, so these tests can
 //! assert on what reached the plugin rather than only on what rack returned.
 
-use crate::{PluginInstance, PluginScanner, ProcessMode};
+use crate::{MidiEvent, MidiEventKind, PluginInstance, PluginScanner, ProcessMode};
 
 use super::test_support::{
-    fixture_info, load_fixture, parse_fixture_state, serial_plugin_test, Buffers, FIXTURE_BLOCK,
+    control_number, fixture_info, load_fixture, parse_fixture_state, serial_plugin_test, Buffers,
+    ReceivedEvent, FIXTURE_BLOCK,
 };
 
 /// Every bus fact the controller half answers without a plugin call.
@@ -53,4 +54,64 @@ fn fixture_loads_processes_and_reports_its_counters() {
     let counters = parse_fixture_state(&plugin.get_state().expect("the fixture's state should read"));
     assert_eq!(counters.process_calls, 3, "every process call should reach the fixture");
     assert_eq!(counters.points, [0; super::test_support::param::COUNT]);
+}
+
+/// One message of each kind that has no VST3 event of its own, on distinct
+/// channels, with a pitch bend whose LSB (0x34) and MSB (0x24) differ.
+fn controller_messages() -> [MidiEventKind; 4] {
+    [
+        MidiEventKind::ControlChange { controller: 7, value: 99, channel: 2 },
+        MidiEventKind::ProgramChange { program: 42, channel: 3 },
+        MidiEventKind::ChannelAftertouch { pressure: 77, channel: 4 },
+        MidiEventKind::PitchBend { value: 0x1234, channel: 5 },
+    ]
+}
+
+fn at_block_start(kind: MidiEventKind) -> MidiEvent {
+    MidiEvent { sample_offset: 0, kind }
+}
+
+#[test]
+fn control_change_program_change_channel_pressure_and_pitch_bend_reach_the_plugin_under_the_sdks_numbers() {
+    let _serial = serial_plugin_test();
+    let Some(mut plugin) = load_fixture() else { return };
+
+    let events: Vec<MidiEvent> = controller_messages().into_iter().map(at_block_start).collect();
+    plugin.processor_mut().send_midi(&events).expect("the fixture should accept the events");
+    let mut buffers = Buffers::new(plugin.input_channels(), plugin.output_channels());
+    buffers
+        .with(|inputs, outputs| plugin.process(inputs, outputs, FIXTURE_BLOCK))
+        .expect("the fixture should process");
+
+    let counters = parse_fixture_state(&plugin.get_state().expect("the fixture's state should read"));
+    assert_eq!(
+        counters.events,
+        vec![
+            ReceivedEvent::legacy(7, 2, 99, 0),
+            ReceivedEvent::legacy(control_number::PROGRAM_CHANGE, 3, 42, 0),
+            ReceivedEvent::legacy(control_number::AFTER_TOUCH, 4, 77, 0),
+            ReceivedEvent::legacy(control_number::PITCH_BEND, 5, 0x34, 0x24),
+        ],
+        "a control change keeps its controller number, and the other three use the SDK's \
+         kCtrlProgramChange, kAfterTouch and kPitchBend with the value (and for a pitch bend \
+         the LSB then the MSB) in the event's value fields"
+    );
+}
+
+#[test]
+fn a_controller_event_the_plugin_emits_decodes_to_the_message_that_was_sent() {
+    let _serial = serial_plugin_test();
+    let Some(mut plugin) = load_fixture() else { return };
+
+    let sent: Vec<MidiEvent> = controller_messages().into_iter().map(at_block_start).collect();
+    plugin.processor_mut().send_midi(&sent).expect("the fixture should accept the events");
+    let mut buffers = Buffers::new(plugin.input_channels(), plugin.output_channels());
+    let mut emitted = Vec::new();
+    buffers
+        .with(|inputs, outputs| {
+            plugin.process_multi_bus(inputs, &[], outputs, &mut [], FIXTURE_BLOCK, Some(&mut emitted))
+        })
+        .expect("the fixture should process");
+
+    assert_eq!(emitted, sent, "the fixture hands each controller event back, and rack decodes it");
 }

@@ -46,9 +46,19 @@ enum ParamIds : Steinberg::Vst::ParamID {
 // kRequestRestart's step count: every flag of RestartFlags fits in 12 bits.
 static constexpr Steinberg::int32 kRestartFlagSteps = 4095;
 
+// How many of the most recent input events the component keeps.
+static constexpr int kEventLogSize = 8;
+// How many uint64 words follow the component state's magic.
+static constexpr int kComponentStateWords = 3 + kParamCount + 1 + kEventLogSize;
+
 // First word of the component's state, then (each a little-endian uint64):
 // process calls, setProcessing(false) calls, messages the component received,
-// and one count of parameter points received per id in 0..kParamCount.
+// one count of parameter points received per id in 0..kParamCount, the number
+// of input events received, and the last kEventLogSize of them, the event
+// number n in slot n modulo kEventLogSize. An event is its type in bits 0-15
+// and, when it is a legacy MIDI controller event, its controlNumber in bits
+// 16-23, channel in 24-31, value in 32-39 and value2 in 40-47. The component
+// also hands every legacy MIDI controller event back on its MIDI output bus.
 static constexpr Steinberg::uint32 kComponentStateMagic = 0x52465843; // "RFXC"
 // First word of the controller's state, then one uint64: messages the
 // controller received.

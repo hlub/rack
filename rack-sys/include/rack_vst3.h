@@ -746,11 +746,13 @@ typedef struct RackVST3MidiEvent {
 // events: array of MIDI events
 // event_count: number of events in array
 //
-// NOTE: VST3 has native support for Note On/Off, Polyphonic Aftertouch, and Control Change.
-//       Program Change, Channel Aftertouch, and Pitch Bend use custom encoding via
-//       LegacyMIDICCOutEvent with controlNumber >= 0x80. Not all VST3 plugins support
-//       these non-native event types. If a plugin doesn't respond to Program Change,
-//       Channel Aftertouch, or Pitch Bend, it's a limitation of the plugin itself.
+// NOTE: VST3 has native events for Note On/Off and Polyphonic Aftertouch. Control Change,
+//       Program Change, Channel Aftertouch and Pitch Bend are delivered as a
+//       LegacyMIDICCOutEvent whose controlNumber is the VST3 SDK's own ControllerNumbers
+//       entry (ivstmidicontrollers.h): the controller number for a Control Change,
+//       kCtrlProgramChange (130) for Program Change (value = program), kAfterTouch (128) for
+//       Channel Aftertouch (value = pressure) and kPitchBend (129) for Pitch Bend (value = LSB,
+//       value2 = MSB). A plugin that does not read this event type ignores these messages.
 //
 // Returns 0 on success, negative error code on failure
 // Thread-safety: Should be called from the same thread that owns the plugin instance.
