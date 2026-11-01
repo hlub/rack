@@ -1,6 +1,7 @@
 use std::env;
 use std::path::PathBuf;
-use std::process::Command;
+
+mod build_git;
 
 fn main() {
     // Declare custom cfg for VST3 SDK availability
@@ -209,7 +210,7 @@ fn ensure_vst3_sdk() -> Option<PathBuf> {
 
     // Try to initialize git submodule first (for developers who cloned with submodules)
     if !in_cargo_registry {
-        let submodule_init = Command::new("git")
+        let submodule_init = build_git::git()
             .args(&["submodule", "update", "--init", "--recursive", "rack-sys/external/vst3sdk"])
             .current_dir(&current_dir)
             .output();
@@ -234,7 +235,7 @@ fn ensure_vst3_sdk() -> Option<PathBuf> {
         std::fs::create_dir_all(parent).ok();
     }
 
-    let clone_result = Command::new("git")
+    let clone_result = build_git::git()
         .args(&[
             "clone",
             "--recursive",
