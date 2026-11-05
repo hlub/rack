@@ -917,25 +917,29 @@ void rack_vst3_plugin_free(RackVST3Plugin* plugin) {
     delete plugin;
 }
 
+// Whether the plugin has an edit controller that is a different object from
+// its component. A controller that is the component itself (JUCE) reads the
+// component's own values already, and calling setComponentState on it would
+// call setState again and start a second, conflicting load; one that does not
+// exist has nothing to tell. Neither is ever touched by the helpers below.
+static bool has_separate_controller(const RackVST3Plugin* plugin) {
+    return plugin->controller &&
+           reinterpret_cast<const void*>(plugin->controller.get()) !=
+               reinterpret_cast<const void*>(plugin->component.get());
+}
+
 // Tells a separate edit controller what the component's state is, so the values
 // the controller reports (getParamNormalized) are the values the component
 // uses. The VST3 contract makes this the host's job: a controller only learns
 // the component's state through IEditController::setComponentState, and a
 // component that starts in anything but the controller's declared defaults
 // (a saved last session, a default program) is otherwise shown to the user as
-// its defaults while it sounds as its own state. A controller that is the
-// component itself (JUCE) reads the component's own values already, and
-// calling setComponentState there would call setState again and start a
-// second, conflicting load, so it is left alone. `data` is the component's
-// state alone, without rack's size marker. Calls only IEditController::
-// setComponentState, on a stream of this function's own.
+// its defaults while it sounds as its own state. `data` is the component's
+// state alone, without rack's size marker; an empty one tells nothing. Calls
+// only IEditController::setComponentState, on a stream of this function's own.
 static void sync_controller_with_component_state(RackVST3Plugin* plugin, const uint8_t* data,
                                                  size_t size) {
-    if (!plugin->controller) {
-        return;
-    }
-    if (reinterpret_cast<void*>(plugin->controller.get()) ==
-        reinterpret_cast<void*>(plugin->component.get())) {
+    if (!has_separate_controller(plugin) || size == 0) {
         return;
     }
     IPtr<MemoryStream> sync_stream(new MemoryStream(data, size), false);
@@ -945,8 +949,14 @@ static void sync_controller_with_component_state(RackVST3Plugin* plugin, const u
 // The same, for the component's state as it is right now: read from the
 // component and handed to the controller. initialize runs it once the plugin
 // is active and any initial state has settled, so a plugin loaded with no
-// state at all, or with one, is shown to the controller as it really is.
+// state at all, or with one, is shown to the controller as it really is. The
+// component is not asked for its state at all when there is no separate
+// controller to tell: a state read right after activation is a state cycle,
+// and back-to-back state cycles have crashed JUCE plugins.
 static void sync_controller_with_component(RackVST3Plugin* plugin) {
+    if (!has_separate_controller(plugin)) {
+        return;
+    }
     IPtr<MemoryStream> state(new MemoryStream(), false);
     if (plugin->component->getState(state) != kResultOk) {
         return;
@@ -959,9 +969,7 @@ static void sync_controller_with_component(RackVST3Plugin* plugin) {
 // bytes after the component's), once the controller has been told the
 // component's state: the VST3 order is setComponentState, then setState.
 static void apply_controller_part(RackVST3Plugin* plugin, const uint8_t* data, size_t size) {
-    if (!plugin->controller || size < sizeof(uint32_t) ||
-        reinterpret_cast<void*>(plugin->controller.get()) ==
-            reinterpret_cast<void*>(plugin->component.get())) {
+    if (!has_separate_controller(plugin) || size < sizeof(uint32_t)) {
         return;
     }
     uint32_t component_state_size = 0;
