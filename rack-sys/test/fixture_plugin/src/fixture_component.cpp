@@ -86,6 +86,8 @@ public:
 					continue;
 				if (id == kGain)
 					gain = value;
+				else if (id == kMode)
+					mode = value;
 				else if (id == kSendFromProcess && value > 0.5)
 					send_message = true;
 			}
@@ -144,6 +146,8 @@ public:
 		words[3 + kParamCount] = events_received.load (std::memory_order_relaxed);
 		for (int32 slot = 0; slot < kEventLogSize; ++slot)
 			words[4 + kParamCount + slot] = event_log[slot].load (std::memory_order_relaxed);
+		static_assert (sizeof (double) == sizeof (uint64), "a double fills one state word");
+		std::memcpy (&words[kComponentStateWords - 1], &mode, sizeof (mode));
 		return state->write (words.data (), static_cast<int32> (sizeof (words)), nullptr);
 	}
 
@@ -156,6 +160,11 @@ public:
 		if (state->read (&magic, sizeof (magic), &read) != kResultOk || read != sizeof (magic) ||
 		    magic != kComponentStateMagic)
 			return kResultFalse;
+		std::array<uint64, kComponentStateWords> words {};
+		if (state->read (words.data (), static_cast<int32> (sizeof (words)), &read) != kResultOk ||
+		    read != static_cast<int32> (sizeof (words)))
+			return kResultFalse;
+		std::memcpy (&mode, &words[kComponentStateWords - 1], sizeof (mode));
 		return kResultOk;
 	}
 
@@ -179,6 +188,7 @@ private:
 	}
 
 	ParamValue gain {1.0};
+	ParamValue mode {kModeStart};
 	std::atomic<uint64> process_calls {0};
 	std::atomic<uint64> set_processing_false_calls {0};
 	std::atomic<uint64> messages_received {0};

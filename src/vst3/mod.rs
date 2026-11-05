@@ -16,6 +16,8 @@ mod split_tests;
 mod state_tests;
 #[cfg(test)]
 mod controller_tests;
+#[cfg(test)]
+mod controller_sync_tests;
 
 pub use scanner::Vst3Scanner;
 pub use instance::{leaked_instance_count, live_instance_count, JoinMismatch, Vst3Plugin};

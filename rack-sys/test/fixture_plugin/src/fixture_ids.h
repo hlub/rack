@@ -38,7 +38,13 @@ enum ParamIds : Steinberg::Vst::ParamID {
 	// Delivered above one half to the processor, makes the component send one
 	// message to the controller from inside process().
 	kSendFromProcess = 4,
-	kParamCount = 5,
+	// A value the component starts with that is not the controller's declared
+	// default: the component is in kModeStart, the controller declares 0. Only
+	// a host that tells the controller the component's state (setComponentState)
+	// sees the controller report the value the component uses. Writes to it
+	// reach the component as parameter points and set the value there.
+	kMode = 5,
+	kParamCount = 6,
 	// Added by kChangeIds; never counted by the component.
 	kExtra = 100,
 };
@@ -46,10 +52,13 @@ enum ParamIds : Steinberg::Vst::ParamID {
 // kRequestRestart's step count: every flag of RestartFlags fits in 12 bits.
 static constexpr Steinberg::int32 kRestartFlagSteps = 4095;
 
+// The value the component's kMode starts with.
+static constexpr double kModeStart = 0.5;
+
 // How many of the most recent input events the component keeps.
 static constexpr int kEventLogSize = 8;
 // How many uint64 words follow the component state's magic.
-static constexpr int kComponentStateWords = 3 + kParamCount + 1 + kEventLogSize;
+static constexpr int kComponentStateWords = 3 + kParamCount + 1 + kEventLogSize + 1;
 
 // First word of the component's state, then (each a little-endian uint64):
 // process calls, setProcessing(false) calls, messages the component received,
@@ -59,6 +68,7 @@ static constexpr int kComponentStateWords = 3 + kParamCount + 1 + kEventLogSize;
 // and, when it is a legacy MIDI controller event, its controlNumber in bits
 // 16-23, channel in 24-31, value in 32-39 and value2 in 40-47. The component
 // also hands every legacy MIDI controller event back on its MIDI output bus.
+// The last word is the component's kMode value as the bits of a double.
 static constexpr Steinberg::uint32 kComponentStateMagic = 0x52465843; // "RFXC"
 // First word of the controller's state, then one uint64: messages the
 // controller received.

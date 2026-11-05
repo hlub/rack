@@ -7,8 +7,10 @@
 #include "pluginterfaces/base/ibstream.h"
 #include "pluginterfaces/base/ustring.h"
 
+#include <array>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 
 using namespace Steinberg;
 using namespace Steinberg::Vst;
@@ -37,6 +39,8 @@ public:
 		                         ParameterInfo::kNoFlags, kChangeIds);
 		parameters.addParameter (STR16 ("Send From Process"), nullptr, 1, 0.0,
 		                         ParameterInfo::kCanAutomate, kSendFromProcess);
+		parameters.addParameter (STR16 ("Mode"), nullptr, 0, 0.0, ParameterInfo::kCanAutomate,
+		                         kMode);
 		return kResultOk;
 	}
 
@@ -94,7 +98,25 @@ public:
 		return kResultOk;
 	}
 
-	tresult PLUGIN_API setComponentState (IBStream*) SMTG_OVERRIDE { return kResultOk; }
+	// Reads the component's kMode out of its state, the one value of the
+	// component's that the controller reports.
+	tresult PLUGIN_API setComponentState (IBStream* state) SMTG_OVERRIDE
+	{
+		if (!state)
+			return kInvalidArgument;
+		uint32 magic = 0;
+		int32 read = 0;
+		if (state->read (&magic, sizeof (magic), &read) != kResultOk || read != sizeof (magic) ||
+		    magic != kComponentStateMagic)
+			return kResultFalse;
+		std::array<uint64, kComponentStateWords> words {};
+		if (state->read (words.data (), static_cast<int32> (sizeof (words)), &read) != kResultOk ||
+		    read != static_cast<int32> (sizeof (words)))
+			return kResultFalse;
+		double mode = 0.0;
+		std::memcpy (&mode, &words[kComponentStateWords - 1], sizeof (mode));
+		return setParamNormalized (kMode, mode);
+	}
 
 	tresult PLUGIN_API getState (IBStream* state) SMTG_OVERRIDE
 	{

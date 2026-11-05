@@ -29,7 +29,11 @@ pub(crate) mod param {
     pub(crate) const RENAME_TITLES: usize = 2;
     pub(crate) const CHANGE_IDS: usize = 3;
     pub(crate) const SEND_FROM_PROCESS: usize = 4;
-    pub(crate) const COUNT: usize = 5;
+    pub(crate) const MODE: usize = 5;
+    pub(crate) const COUNT: usize = 6;
+    /// The value the fixture's component starts `MODE` with, which is not the
+    /// controller's declared default of 0 (`kModeStart`).
+    pub(crate) const MODE_START: f32 = 0.5;
     /// `REQUEST_RESTART`'s step count: its value times this, rounded, is the
     /// flag word the fixture passes to `restartComponent`.
     pub(crate) const RESTART_FLAG_STEPS: f32 = 4095.0;
@@ -162,7 +166,7 @@ pub(crate) fn parse_fixture_state(state: &[u8]) -> FixtureCounters {
     let component = &state[4..4 + component_size];
     let controller = &state[4 + component_size..];
     assert_eq!(read_u32(component, 0), COMPONENT_STATE_MAGIC, "component state magic");
-    assert_eq!(component.len(), 4 + 8 * (3 + param::COUNT + 1 + EVENT_LOG_SIZE), "component state size");
+    assert_eq!(component.len(), 4 + 8 * (3 + param::COUNT + 1 + EVENT_LOG_SIZE + 1), "component state size");
     assert_eq!(read_u32(controller, 0), CONTROLLER_STATE_MAGIC, "controller state magic");
     let mut points = [0u64; param::COUNT];
     for (index, slot) in points.iter_mut().enumerate() {
@@ -186,6 +190,16 @@ pub(crate) fn parse_fixture_state(state: &[u8]) -> FixtureCounters {
         points,
         controller_messages: read_u64(controller, 4),
     }
+}
+
+/// `state`, a blob the fixture wrote, with the component's `MODE` value
+/// replaced by `mode`: the state of a fixture that was left in that mode.
+pub(crate) fn fixture_state_with_mode(state: &[u8], mode: f64) -> Vec<u8> {
+    let component_size = read_u32(state, 0) as usize;
+    let word_at = 4 + component_size - 8;
+    let mut patched = state.to_vec();
+    patched[word_at..word_at + 8].copy_from_slice(&mode.to_bits().to_le_bytes());
+    patched
 }
 
 /// Planar silent input and zeroed output buffers sized for one fixture block.

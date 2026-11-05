@@ -917,6 +917,63 @@ void rack_vst3_plugin_free(RackVST3Plugin* plugin) {
     delete plugin;
 }
 
+// Tells a separate edit controller what the component's state is, so the values
+// the controller reports (getParamNormalized) are the values the component
+// uses. The VST3 contract makes this the host's job: a controller only learns
+// the component's state through IEditController::setComponentState, and a
+// component that starts in anything but the controller's declared defaults
+// (a saved last session, a default program) is otherwise shown to the user as
+// its defaults while it sounds as its own state. A controller that is the
+// component itself (JUCE) reads the component's own values already, and
+// calling setComponentState there would call setState again and start a
+// second, conflicting load, so it is left alone. `data` is the component's
+// state alone, without rack's size marker. Calls only IEditController::
+// setComponentState, on a stream of this function's own.
+static void sync_controller_with_component_state(RackVST3Plugin* plugin, const uint8_t* data,
+                                                 size_t size) {
+    if (!plugin->controller) {
+        return;
+    }
+    if (reinterpret_cast<void*>(plugin->controller.get()) ==
+        reinterpret_cast<void*>(plugin->component.get())) {
+        return;
+    }
+    IPtr<MemoryStream> sync_stream(new MemoryStream(data, size), false);
+    plugin->controller->setComponentState(sync_stream);
+}
+
+// The same, for the component's state as it is right now: read from the
+// component and handed to the controller. initialize runs it once the plugin
+// is active and any initial state has settled, so a plugin loaded with no
+// state at all, or with one, is shown to the controller as it really is.
+static void sync_controller_with_component(RackVST3Plugin* plugin) {
+    IPtr<MemoryStream> state(new MemoryStream(), false);
+    if (plugin->component->getState(state) != kResultOk) {
+        return;
+    }
+    std::vector<uint8_t> bytes = state->takeData();
+    sync_controller_with_component_state(plugin, bytes.data(), bytes.size());
+}
+
+// Hands a separate controller its own part of a state in rack's format (the
+// bytes after the component's), once the controller has been told the
+// component's state: the VST3 order is setComponentState, then setState.
+static void apply_controller_part(RackVST3Plugin* plugin, const uint8_t* data, size_t size) {
+    if (!plugin->controller || size < sizeof(uint32_t) ||
+        reinterpret_cast<void*>(plugin->controller.get()) ==
+            reinterpret_cast<void*>(plugin->component.get())) {
+        return;
+    }
+    uint32_t component_state_size = 0;
+    memcpy(&component_state_size, data, sizeof(component_state_size));
+    size_t ctrl_offset = sizeof(component_state_size) + component_state_size;
+    if (ctrl_offset >= size) {
+        return;
+    }
+    IPtr<MemoryStream> ctrl_stream(new MemoryStream(data + ctrl_offset, size - ctrl_offset), false);
+    plugin->controller->setState(ctrl_stream);
+}
+
 int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint32_t max_block_size,
                                 int32_t process_mode,
                                 const uint8_t* initial_state, size_t initial_state_size) {
@@ -1053,23 +1110,17 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
             const uint8_t* comp_data = initial_state + sizeof(component_state_size);
             IPtr<MemoryStream> comp_stream(new MemoryStream(comp_data, component_state_size), false);
             plugin->component->setState(comp_stream);
-
-            if (plugin->controller) {
-                void* comp_ptr = reinterpret_cast<void*>(plugin->component.get());
-                void* ctrl_ptr = reinterpret_cast<void*>(plugin->controller.get());
-                if (comp_ptr != ctrl_ptr) {
-                    size_t ctrl_offset = sizeof(component_state_size) + component_state_size;
-                    if (ctrl_offset < initial_state_size) {
-                        const uint8_t* ctrl_data = initial_state + ctrl_offset;
-                        size_t ctrl_size = initial_state_size - ctrl_offset;
-                        IPtr<MemoryStream> ctrl_stream(new MemoryStream(ctrl_data, ctrl_size), false);
-                        plugin->controller->setState(ctrl_stream);
-                    }
-                }
-            }
         }
 
         pump_runloop(5.0);
+    }
+
+    // The controller is told the component's state whether or not an initial
+    // state was applied: a plugin with none starts in a state of its own that
+    // the controller has not been shown either.
+    sync_controller_with_component(plugin);
+    if (initial_state && initial_state_size > sizeof(uint32_t)) {
+        apply_controller_part(plugin, initial_state, initial_state_size);
     }
 
     // Start processing
@@ -2561,26 +2612,10 @@ int rack_vst3_plugin_set_state_pumped(RackVST3Plugin* plugin, const uint8_t* dat
     // setProcessing itself below, only when plugin->fixed.initialized).
     resume_after_state(plugin, pump_seconds, /*reactivate=*/false, /*resume_processing=*/false);
 
-    // Sync controller to component state.  Only for plugins where they are
-    // separate objects; for same-object plugins (JUCE), setComponentState
-    // would call setState again and start a second conflicting load.
-    if (plugin->controller) {
-        void* comp_ptr = reinterpret_cast<void*>(plugin->component.get());
-        void* ctrl_ptr = reinterpret_cast<void*>(plugin->controller.get());
-        if (comp_ptr != ctrl_ptr) {
-            IPtr<MemoryStream> sync_stream(
-                new MemoryStream(comp_data, component_state_size), false);
-            plugin->controller->setComponentState(sync_stream);
-
-            size_t ctrl_offset = sizeof(component_state_size) + component_state_size;
-            if (ctrl_offset < size) {
-                const uint8_t* ctrl_data = data + ctrl_offset;
-                size_t ctrl_size = size - ctrl_offset;
-                IPtr<MemoryStream> ctrl_stream(new MemoryStream(ctrl_data, ctrl_size), false);
-                plugin->controller->setState(ctrl_stream);
-            }
-        }
-    }
+    // Sync controller to component state (separate controller objects only;
+    // see sync_controller_with_component_state).
+    sync_controller_with_component_state(plugin, comp_data, component_state_size);
+    apply_controller_part(plugin, data, size);
 
     if (plugin->fixed.initialized) {
         plugin->processor->setProcessing(true);
