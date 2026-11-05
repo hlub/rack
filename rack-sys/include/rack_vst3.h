@@ -161,6 +161,11 @@ uint64_t rack_vst3_leaked_instance_count(void);
 // correct VST3 lifecycle window for state restoration.  Pass NULL / 0 for
 // a normal initialization with the plugin's default state.
 //
+// Either way, a separate edit controller is then told the component's state as
+// it is (IEditController::setComponentState, then its own part of the blob),
+// so rack_vst3_plugin_get_parameter reports what the component uses and not
+// the controller's declared defaults.
+//
 // State blob format: [uint32_t component_size | component bytes | controller bytes]
 //
 // process_mode selects ProcessSetup::processMode, which the VST3
