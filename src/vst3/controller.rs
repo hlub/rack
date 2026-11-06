@@ -433,9 +433,22 @@ impl Vst3Controller {
     /// Takes the controller thread's calls, so it is the main thread's.
     #[must_use]
     pub fn take_value_changes(&self) -> super::ValueChanges {
+        let capacity = self.parameter_count();
+        let mut indices = vec![0_u32; capacity];
+        let mut count = 0_usize;
         // SAFETY: the instance is live; the function reads atomics and calls the controller,
-        // which the caller's thread owns.
-        super::ValueChanges::from_bits(unsafe { ffi::rack_vst3_plugin_take_value_changes(self.inner.as_ptr()) })
+        // which the caller's thread owns; `indices` holds `capacity` elements, which the function
+        // does not exceed, and `count` is a writable local.
+        let bits = unsafe {
+            ffi::rack_vst3_plugin_take_value_changes(
+                self.inner.as_ptr(),
+                indices.as_mut_ptr(),
+                capacity,
+                &mut count,
+            )
+        };
+        indices.truncate(count);
+        super::ValueChanges::from_parts(bits, indices.into_iter().map(|index| index as usize).collect())
     }
 
     /// How many messages between the plugin's component and its separate

@@ -167,43 +167,54 @@ mod tests {
 /// What a plugin did to its own parameter values since they were last taken: the controller
 /// already holds each new value, so a host that reads the controller again reads what the plugin
 /// is using.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ValueChanges(u32);
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ValueChanges {
+    bits: u32,
+    reported: Vec<usize>,
+}
 
 const REPORTED: u32 = 1;
 const EDITED: u32 = 2;
 const REQUESTED: u32 = 4;
 
 impl ValueChanges {
-    /// The changes as the library reported them.
+    /// The changes as the library reported them, with the indices of the parameters whose reported
+    /// value was applied to the controller.
     #[must_use]
-    pub fn from_bits(bits: u32) -> Self {
-        Self(bits)
+    pub fn from_parts(bits: u32, reported: Vec<usize>) -> Self {
+        Self { bits, reported }
     }
 
     /// Whether the plugin changed nothing.
     #[must_use]
-    pub fn is_empty(self) -> bool {
-        self.0 == 0
+    pub fn is_empty(&self) -> bool {
+        self.bits == 0
     }
 
     /// The processor reported values through its output parameter changes while processing, and
     /// the controller was told them.
     #[must_use]
-    pub fn reported_by_processor(self) -> bool {
-        self.0 & REPORTED != 0
+    pub fn reported_by_processor(&self) -> bool {
+        self.bits & REPORTED != 0
     }
 
     /// The plugin passed `IComponentHandler::performEdit`: its own interface or an internal
     /// change moved a value.
     #[must_use]
-    pub fn edited_by_plugin(self) -> bool {
-        self.0 & EDITED != 0
+    pub fn edited_by_plugin(&self) -> bool {
+        self.bits & EDITED != 0
     }
 
     /// The plugin asked, with `kParamValuesChanged`, for its values to be read again.
     #[must_use]
-    pub fn reread_requested(self) -> bool {
-        self.0 & REQUESTED != 0
+    pub fn reread_requested(&self) -> bool {
+        self.bits & REQUESTED != 0
+    }
+
+    /// The indices of the parameters whose reported value was applied to the controller, so a host
+    /// can read just those entries again.
+    #[must_use]
+    pub fn reported_indices(&self) -> &[usize] {
+        &self.reported
     }
 }

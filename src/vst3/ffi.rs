@@ -623,8 +623,14 @@ extern "C" {
     /// # Safety
     ///
     /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    /// - `reported_indices` must be NULL or point at `capacity` writable elements; `reported_count` NULL or a writable `usize`
     /// - Called on the controller thread only
-    pub fn rack_vst3_plugin_take_value_changes(plugin: *mut RackVST3Plugin) -> u32;
+    pub fn rack_vst3_plugin_take_value_changes(
+        plugin: *mut RackVST3Plugin,
+        reported_indices: *mut u32,
+        capacity: usize,
+        reported_count: *mut usize,
+    ) -> u32;
 
     /// Whether `rack_vst3_plugin_take_value_changes` would report anything now; atomic loads
     /// only, no plugin code.

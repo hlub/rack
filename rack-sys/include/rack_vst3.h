@@ -111,18 +111,22 @@ void rack_vst3_plugin_free(RackVST3Plugin* plugin);
 //
 // - Processor half: rack_vst3_plugin_process, rack_vst3_plugin_process_multi_bus,
 //   rack_vst3_plugin_send_midi, rack_vst3_plugin_queue_parameter_change,
+//   rack_vst3_plugin_queue_parameter_change_stamped,
 //   rack_vst3_plugin_set_transport, rack_vst3_plugin_release_processor. They
-//   touch only the processing state and the facts fixed at initialization.
+//   touch only the processing state, the facts fixed at initialization and, for
+//   process and the stamped queue, the hand-off part (below).
 // - Controller half: rack_vst3_plugin_parameter_count, _parameter_info,
 //   _get_parameter, _controller_set_parameter, _parameter_string_by_value,
 //   _parameter_plain_value, _parameter_value_by_string,
 //   _parameter_normalized_from_plain, _get_preset_count, _get_preset_info,
 //   _get_midi_pc_param_id, the bus counts and bus info, _emits_midi,
 //   _read_state_while_processing, _take_restart_flags, _take_value_changes,
-//   _refresh_parameter_titles, _discarded_messages and
-//   rack_vst3_plugin_release_controller. They call only the edit controller
-//   and read the facts fixed at initialization; _controller_set_parameter and
-//   _take_value_changes also touch the hand-off part (below).
+//   _take_edits, _begin_host_write, _refresh_parameter_titles,
+//   _discarded_messages and rack_vst3_plugin_release_controller. They call only
+//   the edit controller and read the facts fixed at initialization;
+//   _begin_host_write, _take_value_changes and _take_edits also touch the
+//   hand-off part (below). _controller_set_parameter does not: only
+//   _begin_host_write notes a host write.
 // - The whole instance, never while it is split: _initialize, _reset,
 //   _set_parameter, _set_parameter_by_id (each writes the processor's queue
 //   from the caller's thread), _load_preset, _read_state, the state writes, and
@@ -180,6 +184,8 @@ uint64_t rack_vst3_leaked_instance_count(void);
 // will render in and is never switched.
 //
 // Returns 0 on success, negative error code on failure
+// A second initialize of an instance leaves the hand-off part, the id map and the binding of
+// performEdit forwarding as the first set them up: a plugin's own thread may be calling performEdit.
 int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint32_t max_block_size,
                                 int32_t process_mode,
                                 const uint8_t* initial_state, size_t initial_state_size);
@@ -530,13 +536,16 @@ size_t rack_vst3_plugin_take_edits(RackVST3Plugin* plugin, uint32_t* indices, fl
 // RACK_VST3_VALUES_* bits; 0 when it did nothing. A value the processor reported through its
 // output parameter changes during process() is handed to the controller here, unless it is older
 // than the host's newest write of that parameter (above), and the values of read-only parameters
-// are forwarded without being counted
+// are forwarded without being counted. The indices of the parameters whose reported value was
+// applied are written to `reported_indices` (at most `capacity`) and counted in `reported_count`,
+// both of which may be NULL, so a host can read just those entries again
 // (IEditController::setParamNormalized, as the VST3 standard asks of a host), so a read of the
 // controller afterwards gives the value the plugin is using. A host that has not written the same
-// parameter since is told the reported value; a host write (rack_vst3_plugin_controller_set_parameter)
+// parameter since is told the reported value; a host write (noted by rack_vst3_plugin_begin_host_write)
 // discards a report made before it. The audio thread records with atomics alone.
 // Thread-safety: the controller thread only; it calls the controller.
-uint32_t rack_vst3_plugin_take_value_changes(RackVST3Plugin* plugin);
+uint32_t rack_vst3_plugin_take_value_changes(RackVST3Plugin* plugin, uint32_t* reported_indices,
+                                             size_t capacity, size_t* reported_count);
 
 // How many messages between the component and a separate controller were
 // discarded because they were sent from a thread other than the one that

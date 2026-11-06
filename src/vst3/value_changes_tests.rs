@@ -134,6 +134,11 @@ fn pending_is_answered_without_taking_and_clears_when_taken() {
     assert!(plugin.controller().value_changes_pending(), "an edit is pending");
     assert!(plugin.controller().value_changes_pending(), "asking does not take it");
     let _ = plugin.take_value_changes();
+    assert!(
+        plugin.controller().value_changes_pending(),
+        "the edit's value is still waiting to be handed to the processor"
+    );
+    let _ = plugin.take_edits();
     assert!(!plugin.controller().value_changes_pending());
 
     plugin.queue_parameter_change(param::REPORT_FROM_PROCESS, 1.0).expect("queue");
@@ -289,14 +294,67 @@ fn the_controller_never_holds_a_value_older_than_the_hosts_last_write_with_the_p
     assert_eq!(stale, 0, "the controller held a value older than the host's last write {stale} times");
 
     // Once the plugin has been given the last write and has processed, what it reports is it.
-    while processed.load(Ordering::Acquire) < last_generation {
+    // Bounded: a processing thread that died would otherwise leave this waiting for ever.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while processed.load(Ordering::Acquire) < last_generation && std::time::Instant::now() < deadline {
         std::hint::spin_loop();
     }
+    let given = processed.load(Ordering::Acquire) >= last_generation;
     std::thread::sleep(std::time::Duration::from_millis(20));
-    let _ = controller.take_value_changes();
-    let _ = controller.take_value_changes();
+    let reported_at_the_end = controller.take_value_changes().reported_by_processor();
     stop.store(true, Ordering::Release);
     let processor = audio.join().expect("the processing thread finishes");
+    assert!(given, "the plugin was given the last write within ten seconds");
+    assert!(
+        reported_at_the_end,
+        "the echoing plugin's report of the last write was applied by the final take, so the test exercised the path it checks"
+    );
     assert!((controller.get_parameter(param::GAIN).expect("read") - 1.0).abs() < 1e-6);
     drop(Vst3Plugin::join(processor, controller).expect("the halves join"));
+}
+
+#[test]
+fn an_interface_edit_the_host_wrote_over_afterwards_is_not_handed_to_the_processor() {
+    let _serial = serial_plugin_test();
+    let Some(mut plugin) = load_fixture() else { return };
+    // The plugin edits Gain, then the host writes Gain: the host's value is the newer.
+    plugin.halves_mut().1.set_parameter(param::SELF_EDIT, 1.0).expect("controller write");
+    let _ = plugin.begin_host_write(param::GAIN);
+    plugin.halves_mut().1.set_parameter(param::GAIN, 0.6).expect("controller write");
+    assert!(plugin.take_edits().is_empty(), "the edit is older than the host's write");
+
+    // The host writes Gain, then the plugin edits it: the edit is the newer.
+    let _ = plugin.begin_host_write(param::GAIN);
+    plugin.halves_mut().1.set_parameter(param::GAIN, 0.6).expect("controller write");
+    plugin.halves_mut().1.set_parameter(param::SELF_EDIT, 0.0).expect("controller write");
+    plugin.halves_mut().1.set_parameter(param::SELF_EDIT, 1.0).expect("controller write");
+    let edits = plugin.take_edits();
+    assert_eq!(edits.len(), 1, "{edits:?}");
+}
+
+#[test]
+fn interface_edits_made_before_a_state_write_or_a_reset_are_not_handed_on_after_it() {
+    let _serial = serial_plugin_test();
+    let Some(mut plugin) = load_fixture() else { return };
+    let state = plugin.get_state().expect("state");
+
+    plugin.halves_mut().1.set_parameter(param::SELF_EDIT, 1.0).expect("controller write");
+    plugin.set_state(&state).expect("state write");
+    assert!(plugin.take_edits().is_empty(), "a state write drops earlier edits");
+    assert!(!plugin.controller().value_changes_pending(), "and the flag that says there are some");
+
+    plugin.halves_mut().1.set_parameter(param::SELF_EDIT, 0.0).expect("controller write");
+    plugin.halves_mut().1.set_parameter(param::SELF_EDIT, 1.0).expect("controller write");
+    plugin.reset().expect("reset");
+    assert!(plugin.take_edits().is_empty(), "a reset drops earlier edits");
+}
+
+#[test]
+fn the_values_a_take_applied_are_listed_so_a_host_can_read_just_those_entries() {
+    let _serial = serial_plugin_test();
+    let Some(mut plugin) = load_fixture() else { return };
+    plugin.queue_parameter_change(param::REPORT_FROM_PROCESS, 1.0).expect("queue");
+    process_block(&mut plugin);
+    let changes = plugin.take_value_changes();
+    assert_eq!(changes.reported_indices(), &[param::MODE]);
 }
