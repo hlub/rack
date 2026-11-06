@@ -222,6 +222,12 @@ impl Vst3Plugin {
         self.controller.take_restart_flags()
     }
 
+    /// See [`Vst3Controller::take_value_changes`].
+    #[must_use]
+    pub fn take_value_changes(&self) -> super::ValueChanges {
+        self.controller.take_value_changes()
+    }
+
     /// See [`Vst3Controller::discarded_messages`].
     #[must_use]
     pub fn discarded_messages(&self) -> DiscardedMessages {

@@ -617,6 +617,15 @@ extern "C" {
     /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
     pub fn rack_vst3_plugin_take_restart_flags(plugin: *mut RackVST3Plugin) -> u32;
 
+    /// Take what the plugin did to its own parameter values since the last take, telling the
+    /// controller each value the processor reported.
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    /// - Called on the controller thread only
+    pub fn rack_vst3_plugin_take_value_changes(plugin: *mut RackVST3Plugin) -> u32;
+
     /// Re-read the parameter descriptions; `RACK_VST3_PARAMETER_IDS_CHANGED`
     /// when the ids changed and nothing was refreshed.
     ///

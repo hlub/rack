@@ -44,7 +44,15 @@ enum ParamIds : Steinberg::Vst::ParamID {
 	// sees the controller report the value the component uses. Writes to it
 	// reach the component as parameter points and set the value there.
 	kMode = 5,
-	kParamCount = 6,
+	// Written above one half on the controller, the controller changes kGain to
+	// kSelfEditGain by itself and tells the host with performEdit, as a plugin's
+	// own interface does.
+	kSelfEdit = 6,
+	// Delivered above one half to the processor, makes the component change kMode
+	// to kReportedMode and report it to the host in the block's output parameter
+	// changes, which the controller was never told.
+	kReportFromProcess = 7,
+	kParamCount = 8,
 	// Added by kChangeIds; never counted by the component.
 	kExtra = 100,
 };
@@ -54,6 +62,10 @@ static constexpr Steinberg::int32 kRestartFlagSteps = 4095;
 
 // The value the component's kMode starts with.
 static constexpr double kModeStart = 0.5;
+
+// What kSelfEdit makes the controller's kGain, and what kReportFromProcess makes kMode.
+static constexpr double kSelfEditGain = 0.25;
+static constexpr double kReportedMode = 0.9;
 
 // How many of the most recent input events the component keeps.
 static constexpr int kEventLogSize = 8;

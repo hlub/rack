@@ -386,6 +386,19 @@ impl Vst3Controller {
         RestartFlags::from_bits(unsafe { ffi::rack_vst3_plugin_take_restart_flags(self.inner.as_ptr()) })
     }
 
+    /// Takes what the plugin did to its own parameter values since the last
+    /// take: values its processor reported while processing (handed to the
+    /// controller here, as the standard asks of a host), edits it made itself
+    /// through `performEdit`, and a request to read its values again. After
+    /// this a read of the controller gives the value the plugin is using.
+    /// Takes the controller thread's calls, so it is the main thread's.
+    #[must_use]
+    pub fn take_value_changes(&self) -> super::ValueChanges {
+        // SAFETY: the instance is live; the function reads atomics and calls the controller,
+        // which the caller's thread owns.
+        super::ValueChanges::from_bits(unsafe { ffi::rack_vst3_plugin_take_value_changes(self.inner.as_ptr()) })
+    }
+
     /// How many messages between the plugin's component and its separate
     /// controller rack discarded because the plugin sent them from a thread
     /// other than the one that constructed the instance: the audio thread

@@ -18,9 +18,11 @@ mod state_tests;
 mod controller_tests;
 #[cfg(test)]
 mod controller_sync_tests;
+#[cfg(test)]
+mod value_changes_tests;
 
 pub use scanner::Vst3Scanner;
 pub use instance::{leaked_instance_count, live_instance_count, JoinMismatch, Vst3Plugin};
 pub use processor::{ExtraInputBus, ExtraOutputBus, Vst3Processor};
 pub use controller::{DiscardedMessages, TitleRefresh, Vst3Controller};
-pub use restart::RestartFlags;
+pub use restart::{RestartFlags, ValueChanges};

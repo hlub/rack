@@ -30,7 +30,13 @@ pub(crate) mod param {
     pub(crate) const CHANGE_IDS: usize = 3;
     pub(crate) const SEND_FROM_PROCESS: usize = 4;
     pub(crate) const MODE: usize = 5;
-    pub(crate) const COUNT: usize = 6;
+    pub(crate) const SELF_EDIT: usize = 6;
+    pub(crate) const REPORT_FROM_PROCESS: usize = 7;
+    pub(crate) const COUNT: usize = 8;
+    /// What `SELF_EDIT` makes the controller's `GAIN` (`kSelfEditGain`).
+    pub(crate) const SELF_EDIT_GAIN: f32 = 0.25;
+    /// What `REPORT_FROM_PROCESS` makes the component's `MODE` (`kReportedMode`).
+    pub(crate) const REPORTED_MODE: f32 = 0.9;
     /// The value the fixture's component starts `MODE` with, which is not the
     /// controller's declared default of 0 (`kModeStart`).
     pub(crate) const MODE_START: f32 = 0.5;

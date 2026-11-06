@@ -484,6 +484,21 @@ uint32_t rack_vst3_plugin_get_midi_pc_param_id(RackVST3Plugin* plugin, int chann
 // Thread-safety: any thread; a host takes them on its controller thread.
 uint32_t rack_vst3_plugin_take_restart_flags(RackVST3Plugin* plugin);
 
+// What rack_vst3_plugin_take_value_changes reports, ORed together.
+#define RACK_VST3_VALUES_REPORTED  1u  // the processor reported values; the controller was told them
+#define RACK_VST3_VALUES_EDITED    2u  // the plugin passed performEdit (its GUI or an internal edit)
+#define RACK_VST3_VALUES_REQUESTED 4u  // the plugin asked, by restartComponent, for a re-read of values
+
+// Take what the plugin did to its own parameter values since the last take, ORed from the
+// RACK_VST3_VALUES_* bits; 0 when it did nothing. A value the processor reported through its
+// output parameter changes during process() is handed to the controller here
+// (IEditController::setParamNormalized, as the VST3 standard asks of a host), so a read of the
+// controller afterwards gives the value the plugin is using. A host that has not written the same
+// parameter since is told the reported value; a host write (rack_vst3_plugin_controller_set_parameter)
+// discards a report made before it. The audio thread records with atomics alone.
+// Thread-safety: the controller thread only; it calls the controller.
+uint32_t rack_vst3_plugin_take_value_changes(RackVST3Plugin* plugin);
+
 // How many messages between the component and a separate controller were
 // discarded because they were sent from a thread other than the one that
 // constructed the instance (the audio thread, or a plugin's own background

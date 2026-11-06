@@ -50,6 +50,7 @@ public:
 	{
 		process_calls.fetch_add (1, std::memory_order_relaxed);
 		bool send_message = false;
+		bool report_mode = false;
 		if (IEventList* events = data.inputEvents)
 		{
 			int32 event_count = events->getEventCount ();
@@ -90,6 +91,23 @@ public:
 					mode = value;
 				else if (id == kSendFromProcess && value > 0.5)
 					send_message = true;
+				else if (id == kReportFromProcess && value > 0.5)
+					report_mode = true;
+			}
+		}
+
+		if (report_mode)
+		{
+			mode = kReportedMode;
+			if (data.outputParameterChanges)
+			{
+				int32 queue_index = 0;
+				if (IParamValueQueue* queue =
+				        data.outputParameterChanges->addParameterData (kMode, queue_index))
+				{
+					int32 point_index = 0;
+					queue->addPoint (0, kReportedMode, point_index);
+				}
 			}
 		}
 

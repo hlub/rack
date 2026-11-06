@@ -163,3 +163,47 @@ mod tests {
         assert_eq!(unknown.bits(), 1 << 20);
     }
 }
+
+/// What a plugin did to its own parameter values since they were last taken: the controller
+/// already holds each new value, so a host that reads the controller again reads what the plugin
+/// is using.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ValueChanges(u32);
+
+const REPORTED: u32 = 1;
+const EDITED: u32 = 2;
+const REQUESTED: u32 = 4;
+
+impl ValueChanges {
+    /// The changes as the library reported them.
+    #[must_use]
+    pub fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    /// Whether the plugin changed nothing.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The processor reported values through its output parameter changes while processing, and
+    /// the controller was told them.
+    #[must_use]
+    pub fn reported_by_processor(self) -> bool {
+        self.0 & REPORTED != 0
+    }
+
+    /// The plugin passed `IComponentHandler::performEdit`: its own interface or an internal
+    /// change moved a value.
+    #[must_use]
+    pub fn edited_by_plugin(self) -> bool {
+        self.0 & EDITED != 0
+    }
+
+    /// The plugin asked, with `kParamValuesChanged`, for its values to be read again.
+    #[must_use]
+    pub fn reread_requested(self) -> bool {
+        self.0 & REQUESTED != 0
+    }
+}

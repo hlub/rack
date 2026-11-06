@@ -41,6 +41,10 @@ public:
 		                         ParameterInfo::kCanAutomate, kSendFromProcess);
 		parameters.addParameter (STR16 ("Mode"), nullptr, 0, 0.0, ParameterInfo::kCanAutomate,
 		                         kMode);
+		parameters.addParameter (STR16 ("Self Edit"), nullptr, 1, 0.0, ParameterInfo::kNoFlags,
+		                         kSelfEdit);
+		parameters.addParameter (STR16 ("Report From Process"), nullptr, 1, 0.0,
+		                         ParameterInfo::kCanAutomate, kReportFromProcess);
 		return kResultOk;
 	}
 
@@ -79,6 +83,12 @@ public:
 				if (handler)
 					handler->restartComponent (kParamTitlesChanged);
 			}
+		}
+		else if (tag == kSelfEdit && value > 0.5)
+		{
+			EditController::setParamNormalized (kGain, kSelfEditGain);
+			if (handler)
+				handler->performEdit (kGain, kSelfEditGain);
 		}
 		else if (tag == kChangeIds && value > 0.5 && !parameters.getParameter (kExtra))
 		{

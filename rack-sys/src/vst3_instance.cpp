@@ -15,6 +15,7 @@
 #include "pluginterfaces/vst/ivstmidicontrollers.h"
 
 #include <vector>
+#include <memory>
 #include <string>
 #include <cstring>
 #include <cmath>
@@ -398,7 +399,12 @@ public:
     DECLARE_FUNKNOWN_METHODS
 
     tresult PLUGIN_API beginEdit(ParamID) override { return kResultOk; }
-    tresult PLUGIN_API performEdit(ParamID, ParamValue) override { return kResultOk; }
+    // A plugin edits a value of its own (its GUI, an internal change) and says so here; the
+    // controller already holds the new value, so only the fact that something moved is kept.
+    tresult PLUGIN_API performEdit(ParamID, ParamValue) override {
+        edited_.store(true, std::memory_order_release);
+        return kResultOk;
+    }
     tresult PLUGIN_API endEdit(ParamID) override { return kResultOk; }
     tresult PLUGIN_API restartComponent(int32 flags) override {
         pending_restart_flags_.fetch_or(static_cast<uint32_t>(flags), std::memory_order_release);
@@ -408,6 +414,17 @@ public:
     // The flags raised since the last take, cleared by taking them.
     uint32_t take_restart_flags() {
         return pending_restart_flags_.exchange(0, std::memory_order_acquire);
+    }
+
+    // Whether the plugin passed performEdit since the last take, cleared by taking it.
+    bool take_edited() { return edited_.exchange(false, std::memory_order_acquire); }
+
+    // Whether the plugin asked, through restartComponent, for its parameter values to be read
+    // again since the last take. Clears only that one request: the other flags stay for
+    // take_restart_flags.
+    bool take_values_changed_request() {
+        uint32_t mask = static_cast<uint32_t>(Vst::RestartFlags::kParamValuesChanged);
+        return (pending_restart_flags_.fetch_and(~mask, std::memory_order_acq_rel) & mask) != 0;
     }
 
     tresult PLUGIN_API start(Vst::IProgress::ProgressType type,
@@ -442,6 +459,7 @@ private:
     std::atomic<uint64_t> next_progress_id_{1};
 
     std::atomic<uint32_t> pending_restart_flags_{0};
+    std::atomic<bool> edited_{false};
 };
 
 IMPLEMENT_REFCOUNT(ComponentHandler)
@@ -564,6 +582,10 @@ struct RackVST3Plugin {
         // descriptions (ctrl.param_meta) must leave this alone.
         std::vector<ParamID> param_ids;
 
+        // The same ids, each with its index, sorted by id: how the processor half, on the audio
+        // thread, finds the index of an id a plugin reports a value for, without allocating.
+        std::vector<std::pair<ParamID, uint32_t>> ids_by_id;
+
         std::vector<PresetInfo> presets;
     } fixed;
 
@@ -572,6 +594,14 @@ struct RackVST3Plugin {
         HostProcessData process_data;
         ParameterChanges input_param_changes;
         ParameterChanges output_param_changes;
+
+        // The values the plugin reported through output_param_changes, last one per parameter,
+        // kept for the controller half to hand to the controller. Sized once in initialize and
+        // written by the audio thread with atomics alone, so recording allocates and waits for
+        // nothing. reported_dirty[index] says reported_bits[index] (a double's bits) is unread.
+        std::unique_ptr<std::atomic<uint64_t>[]> reported_bits;
+        std::unique_ptr<std::atomic<uint8_t>[]> reported_dirty;
+        std::atomic<bool> reported_any{false};
         EventList input_events{kEventListCapacity};
         EventList output_events{kEventListCapacity};
 
@@ -1208,6 +1238,18 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
         // initialize() has returned.
         plugin->proc.input_param_changes.setMaxParameters(static_cast<int32>(plugin->fixed.param_ids.size()));
         plugin->proc.output_param_changes.setMaxParameters(static_cast<int32>(plugin->fixed.param_ids.size()));
+
+        // What the audio thread records of the values the plugin reports, sized now for the
+        // same reason: recording must never allocate.
+        size_t parameter_count = plugin->fixed.param_ids.size();
+        plugin->proc.reported_bits.reset(new std::atomic<uint64_t>[parameter_count]());
+        plugin->proc.reported_dirty.reset(new std::atomic<uint8_t>[parameter_count]());
+        plugin->fixed.ids_by_id.clear();
+        for (size_t index = 0; index < parameter_count; ++index) {
+            plugin->fixed.ids_by_id.emplace_back(plugin->fixed.param_ids[index],
+                                                 static_cast<uint32_t>(index));
+        }
+        std::sort(plugin->fixed.ids_by_id.begin(), plugin->fixed.ids_by_id.end());
     }
 
     // Enumerate factory presets if available
@@ -1419,6 +1461,48 @@ int rack_vst3_plugin_get_input_bus_info(
     return get_bus_info(plugin, kInput, bus_index, channels_out, name_out, name_out_size);
 }
 
+// Keep, for the controller half, the last value the plugin reported for each parameter through
+// the output parameter changes of the block just processed. Runs on the audio thread: it reads
+// the plugin's queues and writes preallocated atomics, and allocates, locks and waits for nothing.
+// A parameter whose id is not one the controller lists is ignored.
+static void record_reported_values(RackVST3Plugin* plugin) {
+    IParameterChanges& changes = plugin->proc.output_param_changes;
+    int32 queue_count = changes.getParameterCount();
+    if (queue_count <= 0 || !plugin->proc.reported_bits) {
+        return;
+    }
+    const auto& ids = plugin->fixed.ids_by_id;
+    bool any = false;
+    for (int32 queue_index = 0; queue_index < queue_count; ++queue_index) {
+        IParamValueQueue* queue = changes.getParameterData(queue_index);
+        if (!queue) {
+            continue;
+        }
+        int32 point_count = queue->getPointCount();
+        if (point_count <= 0) {
+            continue;
+        }
+        int32 offset = 0;
+        ParamValue value = 0.0;
+        if (queue->getPoint(point_count - 1, offset, value) != kResultOk) {
+            continue;
+        }
+        auto found = std::lower_bound(ids.begin(), ids.end(),
+                                      std::make_pair(queue->getParameterId(), uint32_t{0}));
+        if (found == ids.end() || found->first != queue->getParameterId()) {
+            continue;
+        }
+        uint64_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        plugin->proc.reported_bits[found->second].store(bits, std::memory_order_relaxed);
+        plugin->proc.reported_dirty[found->second].store(1, std::memory_order_release);
+        any = true;
+    }
+    if (any) {
+        plugin->proc.reported_any.store(true, std::memory_order_release);
+    }
+}
+
 int rack_vst3_plugin_process(
     RackVST3Plugin* plugin,
     const float* const* inputs,
@@ -1494,6 +1578,7 @@ int rack_vst3_plugin_process(
     plugin->proc.input_events.clear();
     plugin->proc.input_param_changes.clearQueue();
     plugin->proc.output_events.clear();
+    record_reported_values(plugin);
     plugin->proc.output_param_changes.clearQueue();
 
     return (result == kResultOk) ? RACK_VST3_OK : RACK_VST3_ERROR_GENERIC;
@@ -1783,6 +1868,7 @@ int rack_vst3_plugin_process_multi_bus(
     plugin->proc.input_events.clear();
     plugin->proc.input_param_changes.clearQueue();
     plugin->proc.output_events.clear();
+    record_reported_values(plugin);
     plugin->proc.output_param_changes.clearQueue();
 
     return (result == kResultOk) ? RACK_VST3_OK : RACK_VST3_ERROR_GENERIC;
@@ -1832,6 +1918,11 @@ int rack_vst3_plugin_set_parameter(RackVST3Plugin* plugin, uint32_t index, float
 
     ParamID param_id = plugin->fixed.param_ids[index];
 
+    // The host's own value is newer than any report the processor made before it.
+    if (plugin->proc.reported_dirty) {
+        plugin->proc.reported_dirty[index].store(0, std::memory_order_release);
+    }
+
     // Set parameter value on controller (for UI reflection)
     plugin->controller->setParamNormalized(param_id, value);
 
@@ -1876,6 +1967,10 @@ int rack_vst3_plugin_controller_set_parameter(RackVST3Plugin* plugin, uint32_t i
     }
     if (value < 0.0f) value = 0.0f;
     if (value > 1.0f) value = 1.0f;
+    // The host's own value is newer than any report the processor made before it.
+    if (plugin->proc.reported_dirty) {
+        plugin->proc.reported_dirty[index].store(0, std::memory_order_release);
+    }
     plugin->controller->setParamNormalized(plugin->fixed.param_ids[index], value);
     return RACK_VST3_OK;
 }
@@ -1944,6 +2039,35 @@ uint32_t rack_vst3_plugin_take_restart_flags(RackVST3Plugin* plugin) {
         return 0;
     }
     return plugin->ctrl.component_handler->take_restart_flags();
+}
+
+uint32_t rack_vst3_plugin_take_value_changes(RackVST3Plugin* plugin) {
+    if (!plugin || !plugin->controller) {
+        return 0;
+    }
+    uint32_t changes = 0;
+    if (plugin->proc.reported_any.exchange(false, std::memory_order_acq_rel)) {
+        size_t parameter_count = plugin->fixed.param_ids.size();
+        for (size_t index = 0; index < parameter_count; ++index) {
+            if (plugin->proc.reported_dirty[index].exchange(0, std::memory_order_acq_rel) == 0) {
+                continue;
+            }
+            uint64_t bits = plugin->proc.reported_bits[index].load(std::memory_order_relaxed);
+            ParamValue value = 0.0;
+            std::memcpy(&value, &bits, sizeof(value));
+            plugin->controller->setParamNormalized(plugin->fixed.param_ids[index], value);
+            changes |= RACK_VST3_VALUES_REPORTED;
+        }
+    }
+    if (plugin->ctrl.component_handler) {
+        if (plugin->ctrl.component_handler->take_edited()) {
+            changes |= RACK_VST3_VALUES_EDITED;
+        }
+        if (plugin->ctrl.component_handler->take_values_changed_request()) {
+            changes |= RACK_VST3_VALUES_REQUESTED;
+        }
+    }
+    return changes;
 }
 
 // Re-reads the controller's parameter list into a temporary and compares ids:
