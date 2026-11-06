@@ -46,7 +46,12 @@ fn an_edit_the_plugin_makes_itself_is_reported_once_and_the_controller_holds_the
     assert!(changes.edited_by_plugin(), "the plugin passed performEdit");
     assert!(!changes.reported_by_processor());
     assert!((controller_value(&plugin, param::GAIN) - param::SELF_EDIT_GAIN).abs() < 1e-6);
-    assert!(plugin.take_value_changes().is_empty(), "a second take is empty");
+    assert!(
+        plugin.take_value_changes().edited_by_plugin(),
+        "while its value waits for take_edits the edit is still reported, so a host that takes whenever it is told empties it"
+    );
+    let _ = plugin.take_edits();
+    assert!(plugin.take_value_changes().is_empty(), "a take after that is empty");
 }
 
 #[test]
@@ -357,4 +362,14 @@ fn the_values_a_take_applied_are_listed_so_a_host_can_read_just_those_entries() 
     process_block(&mut plugin);
     let changes = plugin.take_value_changes();
     assert_eq!(changes.reported_indices(), &[param::MODE]);
+}
+
+#[test]
+fn an_edit_is_still_handed_on_after_a_second_initialize() {
+    let _serial = serial_plugin_test();
+    let Some(mut plugin) = load_fixture() else { return };
+    crate::PluginInstance::initialize(&mut plugin, 48000.0, FIXTURE_BLOCK, crate::ProcessMode::Realtime)
+        .expect("a second initialize with the same parameters is taken");
+    plugin.halves_mut().1.set_parameter(param::SELF_EDIT, 1.0).expect("controller write");
+    assert_eq!(plugin.take_edits().len(), 1, "the hand-off set up by the first initialize still works");
 }

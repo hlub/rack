@@ -406,9 +406,13 @@ public:
     // sound would otherwise stay as it was while the controller shows the edit). One atomic
     // store per parameter, preallocated by bind, so a plugin may call this from any thread.
     //
-    // The edit is stamped with the host's write generation at this moment, so the take can tell
-    // an edit from before a host write of the same parameter (which the host's value then
-    // supersedes) from one after it. `edited_`, the flag the pending question looks at, is set
+    // The edit is stamped with the newest host write generation of the same parameter at this
+    // moment, and the take drops it unless that is still the newest: a host write of the
+    // parameter since (any new generation) supersedes the edit. Comparing for equality rather
+    // than order keeps this right however many generations have passed. An edit made in the
+    // instant between begin_host_write and the host's own controller write is stamped with the
+    // new generation and so survives that write: a window of one controller call, in which the
+    // plugin's own interface and the host's write race and either may fairly win. `edited_`, the flag the pending question looks at, is set
     // last, with release: a take that sees it also sees the stored edit, and one that runs
     // between the stores finds `edits_any_` already set.
     tresult PLUGIN_API performEdit(ParamID id, ParamValue value) override {
@@ -418,7 +422,7 @@ public:
                 float narrowed = static_cast<float>(value);
                 uint32_t bits = 0;
                 std::memcpy(&bits, &narrowed, sizeof(bits));
-                uint64_t stamp = write_generation_->load(std::memory_order_acquire);
+                uint64_t stamp = host_write_gen_[found->second].load(std::memory_order_acquire);
                 edits_[found->second].store((stamp << 32) | bits, std::memory_order_release);
                 edits_any_.store(true, std::memory_order_release);
             }
@@ -428,18 +432,17 @@ public:
     }
 
     // Start keeping the values of performEdit, for a plugin with a separate controller. `ids` is
-    // the plugin's ids with their indices, sorted by id, `write_generation` and `host_write_gen`
-    // the hand-off part's counter and per-parameter newest host writes; all must outlive this
+    // the plugin's ids with their indices, sorted by id, and `host_write_gen` the hand-off part's
+    // per-parameter newest host writes; both must outlive this
     // handler and never move. Called once (the first initialize; a second leaves the binding as
     // it is), before the plugin can call performEdit from another thread (the release store of
     // forward_ publishes the rest).
     void bind(const std::vector<std::pair<ParamID, uint32_t>>* ids, size_t parameter_count,
-              const std::atomic<uint32_t>* write_generation, const std::atomic<uint32_t>* host_write_gen) {
+              const std::atomic<uint32_t>* host_write_gen) {
         if (forward_.load(std::memory_order_acquire)) {
             return;
         }
         ids_ = ids;
-        write_generation_ = write_generation;
         host_write_gen_ = host_write_gen;
         edits_.reset(new std::atomic<uint64_t>[parameter_count]);
         for (size_t index = 0; index < parameter_count; ++index) {
@@ -451,8 +454,8 @@ public:
 
     // The values performEdit left since the last take, as (index, value), up to `capacity`;
     // taking clears them. An edit is dropped when the host has written the same parameter since
-    // (its generation is newer than the edit's stamp): the host's value is the newer one and the
-    // controller holds it. Controller thread.
+    // (the parameter's newest host write is no longer the one the edit was stamped with): the
+    // host's value is the newer one and the controller holds it. Controller thread.
     size_t take_edits(uint32_t* indices, float* values, size_t capacity) {
         if (!edits_any_.exchange(false, std::memory_order_acq_rel)) {
             return 0;
@@ -464,8 +467,7 @@ public:
                 continue;
             }
             uint32_t stamp = static_cast<uint32_t>(edit >> 32);
-            uint32_t newest = host_write_gen_[index].load(std::memory_order_acquire);
-            if (static_cast<int32_t>(newest - stamp) > 0) {
+            if (host_write_gen_[index].load(std::memory_order_acquire) != stamp) {
                 continue;
             }
             uint32_t bits = static_cast<uint32_t>(edit);
@@ -512,6 +514,10 @@ public:
         return edited_.load(std::memory_order_acquire) || edits_any_.load(std::memory_order_acquire) ||
                (pending_restart_flags_.load(std::memory_order_acquire) & mask) != 0;
     }
+
+    // Whether performEdit values are waiting for take_edits (counted as an edit by the take, so a
+    // host that takes whenever the take says "edited" always empties them).
+    bool edits_pending() const { return edits_any_.load(std::memory_order_acquire); }
 
     // Whether the plugin passed performEdit since the last take, cleared by taking it.
     bool take_edited() { return edited_.exchange(false, std::memory_order_acquire); }
@@ -562,7 +568,6 @@ private:
     static constexpr uint64_t kNoEdit = ~uint64_t{0};
     std::atomic<bool> forward_{false};
     const std::vector<std::pair<ParamID, uint32_t>>* ids_ = nullptr;
-    const std::atomic<uint32_t>* write_generation_ = nullptr;
     const std::atomic<uint32_t>* host_write_gen_ = nullptr;
     std::unique_ptr<std::atomic<uint64_t>[]> edits_;
     size_t parameter_count_ = 0;
@@ -786,7 +791,8 @@ struct RackVST3Plugin {
     // thread already allocated. No store-then-load pair across the two threads exists, so no
     // sequentially consistent fence is needed.
     struct Handoff {
-        // The newest generation allocated. Controller thread: fetch_add in begin_host_write.
+        // The newest generation allocated. Written (fetch_add) by the controller thread in
+        // begin_host_write only.
         std::atomic<uint32_t> write_generation{0};
 
         // The generation of the newest host write of each parameter. Controller thread only.
@@ -1398,7 +1404,19 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
     // `ctrl`, so a later refresh of the descriptions never rewrites the ids
     // the audio thread reads.
     if (plugin->controller) {
-        read_parameter_list(plugin->controller, plugin->fixed.param_ids, plugin->ctrl.param_meta);
+        if (plugin->handoff.reported) {
+            // A second initialize: the hand-off arrays and the id map are sized for the ids the
+            // first one read, so a list that differs cannot be taken (see Handoff).
+            std::vector<ParamID> ids;
+            std::vector<RackVST3Plugin::ParamMeta> meta;
+            read_parameter_list(plugin->controller, ids, meta);
+            if (ids != plugin->fixed.param_ids) {
+                return RACK_VST3_ERROR_GENERIC;
+            }
+            plugin->ctrl.param_meta = std::move(meta);
+        } else {
+            read_parameter_list(plugin->controller, plugin->fixed.param_ids, plugin->ctrl.param_meta);
+        }
 
         // Pre-create one ParameterValueQueue per known parameter now, up
         // front, rather than letting ParameterChanges::addParameterData grow
@@ -1449,7 +1467,6 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
             // applies its own edits, and is left alone.
             if (plugin->ctrl.component_handler && plugin->ctrl.component_proxy) {
                 plugin->ctrl.component_handler->bind(&plugin->fixed.ids_by_id, parameter_count,
-                                                     &plugin->handoff.write_generation,
                                                      plugin->handoff.host_write_gen.get());
             }
         }
@@ -1501,7 +1518,7 @@ int rack_vst3_plugin_reset(RackVST3Plugin* plugin) {
         return RACK_VST3_ERROR_NOT_INITIALIZED;
     }
 
-    // Whatever the plugin reported before a reset describes what it was before it.
+    // Whatever the plugin reported or edited (untaken) before a reset describes what it was before it.
     discard_reported_values(plugin);
 
     // VST3 doesn't have a direct "reset" like AudioUnit; deactivating and
@@ -2347,7 +2364,8 @@ uint32_t rack_vst3_plugin_take_value_changes(RackVST3Plugin* plugin, uint32_t* r
         }
     }
     if (plugin->ctrl.component_handler) {
-        if (plugin->ctrl.component_handler->take_edited()) {
+        bool edited = plugin->ctrl.component_handler->take_edited();
+        if (plugin->ctrl.component_handler->edits_pending() || edited) {
             changes |= RACK_VST3_VALUES_EDITED;
         }
         if (plugin->ctrl.component_handler->take_values_changed_request()) {
@@ -2652,7 +2670,7 @@ int rack_vst3_plugin_load_preset(RackVST3Plugin* plugin, int32_t preset_number) 
         return RACK_VST3_ERROR_NOT_FOUND;
     }
 
-    // Reports made before the preset describe the sound it replaces.
+    // Reports and untaken edits made before the preset describe the sound it replaces.
     discard_reported_values(plugin);
 
     const auto& preset = plugin->fixed.presets[preset_number];
@@ -2986,7 +3004,7 @@ int rack_vst3_plugin_set_state_pumped(RackVST3Plugin* plugin, const uint8_t* dat
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
 
-    // Reports made before this state describe the plugin that held the one before.
+    // Reports and untaken edits made before this state describe the plugin that held the one before.
     discard_reported_values(plugin);
 
     if (size < sizeof(uint32_t)) {

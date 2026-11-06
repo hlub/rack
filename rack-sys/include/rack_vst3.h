@@ -185,7 +185,9 @@ uint64_t rack_vst3_leaked_instance_count(void);
 //
 // Returns 0 on success, negative error code on failure
 // A second initialize of an instance leaves the hand-off part, the id map and the binding of
-// performEdit forwarding as the first set them up: a plugin's own thread may be calling performEdit.
+// performEdit forwarding as the first set them up (a plugin's own thread may be calling
+// performEdit), and is refused with RACK_VST3_ERROR_GENERIC if the plugin now lists different
+// parameter ids.
 int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint32_t max_block_size,
                                 int32_t process_mode,
                                 const uint8_t* initial_state, size_t initial_state_size);
@@ -526,6 +528,11 @@ int rack_vst3_plugin_queue_parameter_change_stamped(RackVST3Plugin* plugin, uint
 
 // The values a plugin with a separate controller passed to performEdit since the last take, as
 // (index, value) pairs written to the two arrays, at most `capacity` of them; returns how many.
+// An edit is dropped when the host has written the same parameter since the plugin made it
+// (begin_host_write was called for that parameter after the edit): the host's value is the newer
+// and the controller holds it. An edit made in the instant between begin_host_write and the host's
+// own controller write survives that write, a window of one controller call. A state write, a
+// preset load and a reset discard edits nobody took, as they discard reports.
 // The VST3 standard asks the host to hand these to the processor, which the controller alone does
 // not do: the caller delivers each as it would a host write (begin_host_write, then the stamped
 // queue; the controller already holds the value). 0 for a component that is its own controller.
