@@ -222,6 +222,18 @@ impl Vst3Plugin {
         self.controller.take_restart_flags()
     }
 
+    /// See [`Vst3Controller::begin_host_write`].
+    #[must_use]
+    pub fn begin_host_write(&self, index: usize) -> u32 {
+        self.controller.begin_host_write(index)
+    }
+
+    /// See [`Vst3Controller::take_edits`].
+    #[must_use]
+    pub fn take_edits(&self) -> Vec<(usize, f32)> {
+        self.controller.take_edits()
+    }
+
     /// See [`Vst3Controller::value_changes_pending`].
     #[must_use]
     pub fn value_changes_pending(&self) -> bool {

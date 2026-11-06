@@ -634,6 +634,41 @@ extern "C" {
     /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
     pub fn rack_vst3_plugin_value_changes_pending(plugin: *mut RackVST3Plugin) -> bool;
 
+    /// Allocate the generation of a host write of parameter `index` and note it as the newest.
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    /// - Called on the controller thread only
+    pub fn rack_vst3_plugin_begin_host_write(plugin: *mut RackVST3Plugin, index: u32) -> u32;
+
+    /// `rack_vst3_plugin_queue_parameter_change`, recording `generation` as the one the plugin was
+    /// last given for the parameter.
+    ///
+    /// # Safety
+    ///
+    /// - As `rack_vst3_plugin_queue_parameter_change`
+    pub fn rack_vst3_plugin_queue_parameter_change_stamped(
+        plugin: *mut RackVST3Plugin,
+        index: u32,
+        value: f32,
+        generation: u32,
+    ) -> c_int;
+
+    /// Take the values the plugin passed to `performEdit` since the last take.
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    /// - `indices` and `values` must each point at `capacity` writable elements
+    /// - Called on the controller thread only
+    pub fn rack_vst3_plugin_take_edits(
+        plugin: *mut RackVST3Plugin,
+        indices: *mut u32,
+        values: *mut f32,
+        capacity: usize,
+    ) -> usize;
+
     /// Re-read the parameter descriptions; `RACK_VST3_PARAMETER_IDS_CHANGED`
     /// when the ids changed and nothing was refreshed.
     ///

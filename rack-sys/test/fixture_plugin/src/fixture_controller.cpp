@@ -47,6 +47,8 @@ public:
 		                         ParameterInfo::kCanAutomate, kReportFromProcess);
 		parameters.addParameter (STR16 ("Meter"), nullptr, 0, 0.0, ParameterInfo::kIsReadOnly,
 		                         kMeter);
+		parameters.addParameter (STR16 ("Echo"), nullptr, 1, 0.0, ParameterInfo::kCanAutomate,
+		                         kEcho);
 		return kResultOk;
 	}
 

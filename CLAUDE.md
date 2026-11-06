@@ -33,10 +33,15 @@ run at the same time with no lock between them, so:
   A Rust method calls only functions of its own half's group.
 - `RackVST3Plugin`'s fields are partitioned into `fixed` (written at
   construction and initialize, read by either half), `proc` (the processor
-  half's) and `ctrl` (the controller half's); the comment on the struct in
+  half's), `ctrl` (the controller half's) and `handoff` (the one part both halves
+  touch while running: atomics only, each field saying who writes it and in what
+  order the other side reads it, for the plugin's reported values and the host's
+  write generations); the comment on the struct in
   `rack-sys/src/vst3_instance.cpp` is the rule. A new field goes in one of
   them, and a function touching a field outside its half's part is a data
-  race once the instance is split.
+  race once the instance is split. The write generation protocol that `handoff`
+  carries is argued in the comment on `Handoff`; a change to either half's use
+  of it re-reads that argument first.
 - A call the standard allows only while nothing processes (initialize,
   reset, state writes, preset loads, the latency query, the suspending state
   read, a parameter write that also queues for the processor) exists only on

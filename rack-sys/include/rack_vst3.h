@@ -500,9 +500,37 @@ uint32_t rack_vst3_plugin_take_restart_flags(RackVST3Plugin* plugin);
 // Thread-safety: any thread.
 bool rack_vst3_plugin_value_changes_pending(RackVST3Plugin* plugin);
 
+// The write generation protocol (see `Handoff` in vst3_instance.cpp for the argument). A host that
+// writes a parameter while the instance is split does three things, in this order, for a parameter
+// it will also tell the audio thread of through its own slot: it asks for a generation with
+// rack_vst3_plugin_begin_host_write (any controller-thread call, no plugin code), hands the value
+// and that generation to the audio thread, which delivers them with
+// rack_vst3_plugin_queue_parameter_change_stamped, and writes the controller with
+// rack_vst3_plugin_controller_set_parameter. A report the plugin makes before it was delivered the
+// newest generation is then known to be older than the host's write and is dropped by the take.
+// begin_host_write returns 0 for an index out of range.
+// Thread-safety: the controller thread.
+uint32_t rack_vst3_plugin_begin_host_write(RackVST3Plugin* plugin, uint32_t index);
+
+// rack_vst3_plugin_queue_parameter_change that also records `generation` as the one the plugin was
+// last given for the parameter, so the reports it makes after are stamped with it.
+// Thread-safety and real-time safety: as rack_vst3_plugin_queue_parameter_change.
+int rack_vst3_plugin_queue_parameter_change_stamped(RackVST3Plugin* plugin, uint32_t index,
+                                                    float value, uint32_t generation);
+
+// The values a plugin with a separate controller passed to performEdit since the last take, as
+// (index, value) pairs written to the two arrays, at most `capacity` of them; returns how many.
+// The VST3 standard asks the host to hand these to the processor, which the controller alone does
+// not do: the caller delivers each as it would a host write (begin_host_write, then the stamped
+// queue; the controller already holds the value). 0 for a component that is its own controller.
+// Thread-safety: the controller thread.
+size_t rack_vst3_plugin_take_edits(RackVST3Plugin* plugin, uint32_t* indices, float* values, size_t capacity);
+
 // Take what the plugin did to its own parameter values since the last take, ORed from the
 // RACK_VST3_VALUES_* bits; 0 when it did nothing. A value the processor reported through its
-// output parameter changes during process() is handed to the controller here
+// output parameter changes during process() is handed to the controller here, unless it is older
+// than the host's newest write of that parameter (above), and the values of read-only parameters
+// are forwarded without being counted
 // (IEditController::setParamNormalized, as the VST3 standard asks of a host), so a read of the
 // controller afterwards gives the value the plugin is using. A host that has not written the same
 // parameter since is told the reported value; a host write (rack_vst3_plugin_controller_set_parameter)

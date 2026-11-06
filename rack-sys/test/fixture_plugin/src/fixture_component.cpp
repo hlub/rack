@@ -93,6 +93,8 @@ public:
 					send_message = true;
 				else if (id == kReportFromProcess && value > 0.5)
 					report_mode = true;
+				else if (id == kEcho)
+					echo = value > 0.5;
 			}
 		}
 
@@ -108,6 +110,17 @@ public:
 					int32 point_index = 0;
 					queue->addPoint (0, kReportedMode, point_index);
 				}
+			}
+		}
+
+		if (echo && data.outputParameterChanges)
+		{
+			// Says what it holds, whether or not it was just given.
+			int32 queue_index = 0;
+			if (IParamValueQueue* queue = data.outputParameterChanges->addParameterData (kGain, queue_index))
+			{
+				int32 point_index = 0;
+				queue->addPoint (0, gain, point_index);
 			}
 		}
 
@@ -219,6 +232,7 @@ private:
 	}
 
 	ParamValue gain {1.0};
+	bool echo {false};
 	ParamValue mode {kModeStart};
 	std::atomic<uint64> process_calls {0};
 	std::atomic<uint64> set_processing_false_calls {0};

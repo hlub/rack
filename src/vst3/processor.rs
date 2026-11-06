@@ -557,6 +557,26 @@ impl Vst3Processor {
         Ok(())
     }
 
+    /// [`queue_parameter_change`](Self::queue_parameter_change), also recording `generation` (from
+    /// [`Vst3Controller::begin_host_write`](super::Vst3Controller::begin_host_write)) as the
+    /// generation of the value the plugin is now given for the parameter. The reports it makes after
+    /// are stamped with it, and the controller thread's take drops a report stamped older than the
+    /// host's newest write. Real-time-safe, like the unstamped call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an index outside the parameter list.
+    pub fn queue_parameter_change_stamped(&mut self, index: usize, value: f32, generation: u32) -> Result<()> {
+        // SAFETY: as `queue_parameter_change`; the stamp is one store into a processor-owned array.
+        let result = unsafe {
+            ffi::rack_vst3_plugin_queue_parameter_change_stamped(self.inner.as_ptr(), index as u32, value, generation)
+        };
+        if result != ffi::RACK_VST3_OK {
+            return Err(map_error(result));
+        }
+        Ok(())
+    }
+
     /// Queue MIDI events for the next process call.
     ///
     /// # Errors

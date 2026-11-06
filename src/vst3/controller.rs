@@ -386,6 +386,35 @@ impl Vst3Controller {
         RestartFlags::from_bits(unsafe { ffi::rack_vst3_plugin_take_restart_flags(self.inner.as_ptr()) })
     }
 
+    /// Allocate the generation of a host write of the parameter at `index` and note it as the
+    /// newest: a report the plugin makes before it was delivered this generation is older than the
+    /// write and the take drops it. Hand the generation to the audio thread with the value
+    /// ([`Vst3Processor::queue_parameter_change_stamped`](super::Vst3Processor::queue_parameter_change_stamped))
+    /// and write the controller. No plugin code runs. 0 for an index outside the parameter list.
+    #[must_use]
+    pub fn begin_host_write(&self, index: usize) -> u32 {
+        // SAFETY: the instance is live; the function does atomic operations only.
+        unsafe { ffi::rack_vst3_plugin_begin_host_write(self.inner.as_ptr(), index as u32) }
+    }
+
+    /// The values a plugin with a separate controller passed to `performEdit` since the last take, as
+    /// `(index, value)`. The standard asks the host to hand these to the processor; the caller
+    /// delivers each as a host write (a generation from
+    /// [`begin_host_write`](Self::begin_host_write), the stamped queue), without writing the
+    /// controller, which already holds the value. Empty for a component that is its own controller.
+    #[must_use]
+    pub fn take_edits(&self) -> Vec<(usize, f32)> {
+        let capacity = self.parameter_count();
+        let mut indices = vec![0_u32; capacity];
+        let mut values = vec![0.0_f32; capacity];
+        // SAFETY: the instance is live; both arrays hold `capacity` elements, which the function
+        // does not exceed.
+        let count = unsafe {
+            ffi::rack_vst3_plugin_take_edits(self.inner.as_ptr(), indices.as_mut_ptr(), values.as_mut_ptr(), capacity)
+        };
+        indices.into_iter().zip(values).take(count).map(|(index, value)| (index as usize, value)).collect()
+    }
+
     /// Whether [`take_value_changes`](Self::take_value_changes) would report
     /// anything now. Answered from atomics alone: no plugin code runs and no
     /// lock is taken, so a host may ask every tick for any plugin, and call

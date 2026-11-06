@@ -55,7 +55,10 @@ enum ParamIds : Steinberg::Vst::ParamID {
 	// A read-only output the processor reports in every block's output parameter changes, as a
 	// level meter does, with a value that differs from block to block.
 	kMeter = 8,
-	kParamCount = 9,
+	// Delivered above one half to the processor, makes the component report its current kGain
+	// in every block's output parameter changes: a plugin that tells the host what it holds.
+	kEcho = 9,
+	kParamCount = 10,
 	// Added by kChangeIds; never counted by the component.
 	kExtra = 100,
 };

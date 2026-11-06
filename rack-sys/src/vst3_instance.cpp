@@ -399,11 +399,58 @@ public:
     DECLARE_FUNKNOWN_METHODS
 
     tresult PLUGIN_API beginEdit(ParamID) override { return kResultOk; }
-    // A plugin edits a value of its own (its GUI, an internal change) and says so here; the
-    // controller already holds the new value, so only the fact that something moved is kept.
-    tresult PLUGIN_API performEdit(ParamID, ParamValue) override {
+    // A plugin edits a value of its own (its GUI, an internal change) and says so here. The
+    // controller already holds the new value. That something moved is kept, and, for a plugin
+    // whose controller is a separate object from its component, so is the value: the standard
+    // asks the host to hand a performEdit value to the processor, and nothing else will (the
+    // sound would otherwise stay as it was while the controller shows the edit). One atomic
+    // store per parameter, preallocated by bind, so a plugin may call this from any thread.
+    tresult PLUGIN_API performEdit(ParamID id, ParamValue value) override {
         edited_.store(true, std::memory_order_release);
+        if (forward_.load(std::memory_order_acquire) && std::isfinite(value)) {
+            auto found = std::lower_bound(ids_->begin(), ids_->end(), std::make_pair(id, uint32_t{0}));
+            if (found != ids_->end() && found->first == id) {
+                float narrowed = static_cast<float>(value);
+                uint32_t bits = 0;
+                std::memcpy(&bits, &narrowed, sizeof(bits));
+                edits_[found->second].store((uint64_t{1} << 32) | bits, std::memory_order_release);
+                edits_any_.store(true, std::memory_order_release);
+            }
+        }
         return kResultOk;
+    }
+
+    // Start keeping the values of performEdit, for a plugin with a separate controller. `ids` is
+    // the plugin's ids with their indices, sorted by id, and must outlive this handler and never
+    // change. Called once, by initialize, before the plugin can call performEdit from another
+    // thread (the release store of forward_ publishes the rest).
+    void bind(const std::vector<std::pair<ParamID, uint32_t>>* ids, size_t parameter_count) {
+        ids_ = ids;
+        edits_.reset(new std::atomic<uint64_t>[parameter_count]());
+        parameter_count_ = parameter_count;
+        forward_.store(true, std::memory_order_release);
+    }
+
+    // The values performEdit left since the last take, as (index, value), up to `capacity`;
+    // taking clears them. Controller thread.
+    size_t take_edits(uint32_t* indices, float* values, size_t capacity) {
+        if (!edits_any_.exchange(false, std::memory_order_acq_rel)) {
+            return 0;
+        }
+        size_t count = 0;
+        for (size_t index = 0; index < parameter_count_ && count < capacity; ++index) {
+            uint64_t edit = edits_[index].exchange(0, std::memory_order_acq_rel);
+            if (edit == 0) {
+                continue;
+            }
+            uint32_t bits = static_cast<uint32_t>(edit);
+            float value = 0.0f;
+            std::memcpy(&value, &bits, sizeof(value));
+            indices[count] = static_cast<uint32_t>(index);
+            values[count] = value;
+            ++count;
+        }
+        return count;
     }
     tresult PLUGIN_API endEdit(ParamID) override { return kResultOk; }
     tresult PLUGIN_API restartComponent(int32 flags) override {
@@ -468,6 +515,13 @@ private:
 
     std::atomic<uint32_t> pending_restart_flags_{0};
     std::atomic<bool> edited_{false};
+
+    // performEdit values kept for the processor (see performEdit and bind).
+    std::atomic<bool> forward_{false};
+    const std::vector<std::pair<ParamID, uint32_t>>* ids_ = nullptr;
+    std::unique_ptr<std::atomic<uint64_t>[]> edits_;
+    size_t parameter_count_ = 0;
+    std::atomic<bool> edits_any_{false};
 };
 
 IMPLEMENT_REFCOUNT(ComponentHandler)
@@ -615,6 +669,10 @@ struct RackVST3Plugin {
         ParameterChanges input_param_changes;
         ParameterChanges output_param_changes;
 
+        // The generation of the last value handed to the plugin for each parameter, by
+        // queue_parameter_change_stamped. Audio thread only (a function of the whole instance
+        // may reset it); see Handoff.
+        std::vector<uint32_t> delivered_gen;
         EventList input_events{kEventListCapacity};
         EventList output_events{kEventListCapacity};
 
@@ -644,36 +702,64 @@ struct RackVST3Plugin {
 
     // The hand-off part: the fields both the audio thread and the controller thread touch, and
     // nothing else. Every field is an atomic and the arrays are sized once in initialize, so
-    // recording a report allocates nothing. Each says who writes it and the order that makes the
-    // other side's read sound. A function of the whole instance may reset them too, because
-    // nothing processes concurrently with one.
+    // recording a report allocates nothing. A function of the whole instance may reset them too,
+    // because nothing processes concurrently with one.
+    //
+    // THE WRITE GENERATION PROTOCOL. A plugin's report of a parameter's value is the plugin's
+    // newer say than the controller's only if the plugin had been given the host's newest value
+    // for that parameter when it made the report; otherwise it describes the plugin from before
+    // the host wrote, and applying it would put the old value back on the controller.
+    //
+    //  - Every host write of parameter i gets a generation g from `write_generation` (a counter
+    //    that only goes up) before anything else of the write happens, and the controller thread
+    //    notes it in host_write_gen[i] (begin_host_write). The generation then travels with the
+    //    value to the audio thread, through the host's slot and rack_vst3_plugin_queue_parameter_
+    //    change_stamped, which sets delivered_gen[i] = g on the audio thread at the moment the
+    //    value is handed to the plugin. A write the audio thread has not handed over yet (the host
+    //    delivers a bounded number of parameters per block, so this can last several blocks)
+    //    leaves delivered_gen[i] older than host_write_gen[i].
+    //  - After each block the audio thread publishes each reported value as ONE 64-bit atomic
+    //    holding (delivered_gen[i], the value): the pair cannot tear.
+    //  - The take (controller thread) accepts a report only when its generation is not older than
+    //    host_write_gen[i] (compared modulo 2^32).
+    //
+    // Why that is enough. host_write_gen[i] is written and read by the controller thread alone, so
+    // the take sees the newest write exactly. A report's stamp is the generation of the last
+    // value handed to the plugin before the report was made, read by the audio thread itself. If
+    // the stamp is older than the newest host write g, the plugin had not been given that write's
+    // value when it reported, so the report cannot reflect it and is dropped (this covers a write
+    // still waiting for a drain, and a write whose drain happened in the same block after the
+    // plugin reported in an earlier block). If the stamp is at least g, the value of g (or of a
+    // newer write) was handed over before the report, so the report is the plugin's say about a
+    // state that includes the host's value (a clamp, a snap, a side effect) and is applied. Both
+    // windows of the block-counting scheme this replaced are closed: neither depends on which
+    // block a drain or a note falls in. The ordering needed is only release/acquire on the one
+    // packed word per parameter: the audio thread's release store publishes (stamp, value)
+    // together, the take's acquire exchange reads exactly one such pair, and the generation
+    // reaches the audio thread through the host's own slot (stored before its changed bit with
+    // release, taken with acquire), so delivered_gen always holds a generation the controller
+    // thread already allocated. No store-then-load pair across the two threads exists, so no
+    // sequentially consistent fence is needed.
     struct Handoff {
-        // Written by process() on the audio thread: the index of the block now processing, one
-        // more than the block before it (starting at 1). Read by the controller thread to say
-        // which blocks began before a host write.
-        std::atomic<uint64_t> block{0};
+        // The newest generation allocated. Controller thread: fetch_add in begin_host_write.
+        std::atomic<uint32_t> write_generation{0};
 
-        // Values the plugin reported through output_param_changes, last one per parameter, and
-        // the block that reported each. Written by the audio thread after a block: value and
-        // block first (relaxed), then reported_dirty with release. Read by the controller
-        // thread's take, which exchanges reported_dirty with acquire, so the value and block it
-        // reads are those written before that release (a newer report may overwrite them
-        // meanwhile, which only makes the value newer).
-        std::unique_ptr<std::atomic<uint64_t>[]> reported_bits;
-        std::unique_ptr<std::atomic<uint64_t>[]> reported_block;
-        std::unique_ptr<std::atomic<uint8_t>[]> reported_dirty;
+        // The generation of the newest host write of each parameter. Controller thread only.
+        std::unique_ptr<std::atomic<uint32_t>[]> host_write_gen;
+
+        // Values the plugin reported through output_param_changes, last one per parameter, as
+        // (generation << 32 | float bits), or kNoReport. The audio thread stores with release; the
+        // take exchanges with acquire. reported_any says some entry may be set.
+        std::unique_ptr<std::atomic<uint64_t>[]> reported;
         std::atomic<bool> reported_any{false};
 
-        // Written by the controller thread when the host writes a parameter itself (and by a
-        // function of the whole instance): the value of `block` at that moment, loaded with
-        // acquire and stored with release before the controller is written. A report made by a
-        // block no later than this began before the write or while it was in flight, and may
-        // carry the value from before it, so the take discards it. A block that begins
-        // afterwards has been given the host's slot value (the slot is stored before the write,
-        // and a block takes its slots at its top), so what it reports is not older than the
-        // write.
-        std::unique_ptr<std::atomic<uint64_t>[]> host_write_block;
+        // The same for read-only parameters (meters), which are forwarded to the controller by
+        // the take and never counted as a change of the plugin's values.
+        std::unique_ptr<std::atomic<uint64_t>[]> meters;
+        std::atomic<bool> meters_any{false};
     } handoff;
+
+    static constexpr uint64_t kNoReport = ~uint64_t{0};
 
     // The controller half's state.
     struct Control {
@@ -1290,10 +1376,14 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
         // What the audio thread records of the values the plugin reports, sized now for the
         // same reason: recording must never allocate.
         size_t parameter_count = plugin->fixed.param_ids.size();
-        plugin->handoff.reported_bits.reset(new std::atomic<uint64_t>[parameter_count]());
-        plugin->handoff.reported_block.reset(new std::atomic<uint64_t>[parameter_count]());
-        plugin->handoff.reported_dirty.reset(new std::atomic<uint8_t>[parameter_count]());
-        plugin->handoff.host_write_block.reset(new std::atomic<uint64_t>[parameter_count]());
+        plugin->handoff.host_write_gen.reset(new std::atomic<uint32_t>[parameter_count]());
+        plugin->handoff.reported.reset(new std::atomic<uint64_t>[parameter_count]);
+        plugin->handoff.meters.reset(new std::atomic<uint64_t>[parameter_count]);
+        for (size_t index = 0; index < parameter_count; ++index) {
+            plugin->handoff.reported[index].store(RackVST3Plugin::kNoReport, std::memory_order_relaxed);
+            plugin->handoff.meters[index].store(RackVST3Plugin::kNoReport, std::memory_order_relaxed);
+        }
+        plugin->proc.delivered_gen.assign(parameter_count, 0);
         plugin->fixed.read_only.assign(parameter_count, 0);
         for (size_t index = 0; index < parameter_count && index < plugin->ctrl.param_meta.size(); ++index) {
             plugin->fixed.read_only[index] =
@@ -1305,6 +1395,12 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
                                                  static_cast<uint32_t>(index));
         }
         std::sort(plugin->fixed.ids_by_id.begin(), plugin->fixed.ids_by_id.end());
+        // A separate controller is told of a plugin's own edits by performEdit alone, and the
+        // processor must hear them from the host; a component that is its own controller
+        // applies its own edits, and is left alone.
+        if (plugin->ctrl.component_handler && plugin->ctrl.component_proxy) {
+            plugin->ctrl.component_handler->bind(&plugin->fixed.ids_by_id, parameter_count);
+        }
     }
 
     // Enumerate factory presets if available
@@ -1520,18 +1616,21 @@ int rack_vst3_plugin_get_input_bus_info(
 }
 
 // Keep, for the controller half, the last value the plugin reported for each parameter through
-// the output parameter changes of the block just processed, with the block that reported it.
-// Runs on the audio thread: it reads the plugin's queues and writes preallocated atomics, and
-// allocates, locks and waits for nothing. A parameter whose id the controller does not list, and
-// a read-only one (a meter that reports every block), is ignored.
-static void record_reported_values(RackVST3Plugin* plugin, uint64_t block) {
+// the output parameter changes of the block just processed, stamped with the generation of the
+// value the plugin was last given for it (see Handoff). Runs on the audio thread: it reads the
+// plugin's queues and writes preallocated atomics, and allocates, locks and waits for nothing. A
+// parameter whose id the controller does not list is ignored; a read-only one (a meter that
+// reports every block) is kept apart, to be forwarded to the controller and never counted as a
+// change; a value that is not finite is ignored.
+static void record_reported_values(RackVST3Plugin* plugin) {
     IParameterChanges& changes = plugin->proc.output_param_changes;
     int32 queue_count = changes.getParameterCount();
-    if (queue_count <= 0 || !plugin->handoff.reported_bits) {
+    if (queue_count <= 0 || !plugin->handoff.reported) {
         return;
     }
     const auto& ids = plugin->fixed.ids_by_id;
     bool any = false;
+    bool any_meter = false;
     for (int32 queue_index = 0; queue_index < queue_count; ++queue_index) {
         IParamValueQueue* queue = changes.getParameterData(queue_index);
         if (!queue) {
@@ -1543,7 +1642,7 @@ static void record_reported_values(RackVST3Plugin* plugin, uint64_t block) {
         }
         int32 offset = 0;
         ParamValue value = 0.0;
-        if (queue->getPoint(point_count - 1, offset, value) != kResultOk) {
+        if (queue->getPoint(point_count - 1, offset, value) != kResultOk || !std::isfinite(value)) {
             continue;
         }
         auto found = std::lower_bound(ids.begin(), ids.end(),
@@ -1552,18 +1651,23 @@ static void record_reported_values(RackVST3Plugin* plugin, uint64_t block) {
             continue;
         }
         uint32_t index = found->second;
+        float narrowed = static_cast<float>(value);
+        uint32_t bits = 0;
+        std::memcpy(&bits, &narrowed, sizeof(bits));
         if (plugin->fixed.read_only[index]) {
+            plugin->handoff.meters[index].store(bits, std::memory_order_release);
+            any_meter = true;
             continue;
         }
-        uint64_t bits = 0;
-        std::memcpy(&bits, &value, sizeof(bits));
-        plugin->handoff.reported_bits[index].store(bits, std::memory_order_relaxed);
-        plugin->handoff.reported_block[index].store(block, std::memory_order_relaxed);
-        plugin->handoff.reported_dirty[index].store(1, std::memory_order_release);
+        uint64_t stamped = (uint64_t{plugin->proc.delivered_gen[index]} << 32) | bits;
+        plugin->handoff.reported[index].store(stamped, std::memory_order_release);
         any = true;
     }
     if (any) {
         plugin->handoff.reported_any.store(true, std::memory_order_release);
+    }
+    if (any_meter) {
+        plugin->handoff.meters_any.store(true, std::memory_order_release);
     }
 }
 
@@ -1572,23 +1676,19 @@ static void record_reported_values(RackVST3Plugin* plugin, uint64_t block) {
 // before one describe a plugin that no longer exists, and taking them afterwards would put the
 // old values back on the controller. Nothing processes while the instance is whole.
 static void discard_reported_values(RackVST3Plugin* plugin) {
-    if (!plugin->handoff.reported_dirty) {
+    if (!plugin->handoff.reported) {
         return;
     }
     size_t parameter_count = plugin->fixed.param_ids.size();
     for (size_t index = 0; index < parameter_count; ++index) {
-        plugin->handoff.reported_dirty[index].store(0, std::memory_order_relaxed);
+        plugin->handoff.reported[index].store(RackVST3Plugin::kNoReport, std::memory_order_relaxed);
+        plugin->handoff.meters[index].store(RackVST3Plugin::kNoReport, std::memory_order_relaxed);
+        // The plugin is a new one: no host write is outstanding for it and it has been given none.
+        plugin->handoff.host_write_gen[index].store(0, std::memory_order_relaxed);
+        plugin->proc.delivered_gen[index] = 0;
     }
     plugin->handoff.reported_any.store(false, std::memory_order_release);
-}
-
-// Note the block at which the host wrote parameter `index` itself, so a report made by an earlier
-// block is not mistaken for the plugin's newer say. See Handoff::host_write_block.
-static void note_host_write(RackVST3Plugin* plugin, uint32_t index) {
-    if (plugin->handoff.host_write_block) {
-        plugin->handoff.host_write_block[index].store(
-            plugin->handoff.block.load(std::memory_order_acquire), std::memory_order_release);
-    }
+    plugin->handoff.meters_any.store(false, std::memory_order_release);
 }
 
 int rack_vst3_plugin_process(
@@ -1653,9 +1753,6 @@ int rack_vst3_plugin_process(
         }
     }
 
-    // Count this block before the plugin sees it, for the reports it makes (Handoff::block).
-    uint64_t block = plugin->handoff.block.fetch_add(1, std::memory_order_acq_rel) + 1;
-
     // Set parameter and event interfaces
     plugin->proc.process_data.inputParameterChanges = &plugin->proc.input_param_changes;
     plugin->proc.process_data.outputParameterChanges = &plugin->proc.output_param_changes;
@@ -1669,7 +1766,7 @@ int rack_vst3_plugin_process(
     plugin->proc.input_events.clear();
     plugin->proc.input_param_changes.clearQueue();
     plugin->proc.output_events.clear();
-    record_reported_values(plugin, block);
+    record_reported_values(plugin);
     plugin->proc.output_param_changes.clearQueue();
 
     return (result == kResultOk) ? RACK_VST3_OK : RACK_VST3_ERROR_GENERIC;
@@ -1916,9 +2013,6 @@ int rack_vst3_plugin_process_multi_bus(
         }
     }
 
-    // Count this block before the plugin sees it, for the reports it makes (Handoff::block).
-    uint64_t block = plugin->handoff.block.fetch_add(1, std::memory_order_acq_rel) + 1;
-
     // Set parameter and event interfaces
     plugin->proc.process_data.inputParameterChanges = &plugin->proc.input_param_changes;
     plugin->proc.process_data.outputParameterChanges = &plugin->proc.output_param_changes;
@@ -1962,7 +2056,7 @@ int rack_vst3_plugin_process_multi_bus(
     plugin->proc.input_events.clear();
     plugin->proc.input_param_changes.clearQueue();
     plugin->proc.output_events.clear();
-    record_reported_values(plugin, block);
+    record_reported_values(plugin);
     plugin->proc.output_param_changes.clearQueue();
 
     return (result == kResultOk) ? RACK_VST3_OK : RACK_VST3_ERROR_GENERIC;
@@ -2012,9 +2106,6 @@ int rack_vst3_plugin_set_parameter(RackVST3Plugin* plugin, uint32_t index, float
 
     ParamID param_id = plugin->fixed.param_ids[index];
 
-    // Before the write, so a report from a block that began earlier is known to be older.
-    note_host_write(plugin, index);
-
     // Set parameter value on controller (for UI reflection)
     plugin->controller->setParamNormalized(param_id, value);
 
@@ -2059,8 +2150,6 @@ int rack_vst3_plugin_controller_set_parameter(RackVST3Plugin* plugin, uint32_t i
     }
     if (value < 0.0f) value = 0.0f;
     if (value > 1.0f) value = 1.0f;
-    // Before the write, so a report from a block that began earlier is known to be older.
-    note_host_write(plugin, index);
     plugin->controller->setParamNormalized(plugin->fixed.param_ids[index], value);
     return RACK_VST3_OK;
 }
@@ -2095,6 +2184,28 @@ int rack_vst3_plugin_queue_parameter_change(RackVST3Plugin* plugin, uint32_t ind
     }
 
     return RACK_VST3_OK;
+}
+
+int rack_vst3_plugin_queue_parameter_change_stamped(RackVST3Plugin* plugin, uint32_t index, float value,
+                                                    uint32_t generation) {
+    int result = rack_vst3_plugin_queue_parameter_change(plugin, index, value);
+    if (result == RACK_VST3_OK) {
+        plugin->proc.delivered_gen[index] = generation;
+    }
+    return result;
+}
+
+uint32_t rack_vst3_plugin_begin_host_write(RackVST3Plugin* plugin, uint32_t index) {
+    if (!plugin || !plugin->handoff.host_write_gen || index >= plugin->fixed.param_ids.size()) {
+        return 0;
+    }
+    uint32_t generation = plugin->handoff.write_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    if (generation == 0) {
+        // The counter wrapped; 0 means "none", so the wrap takes the next one.
+        generation = plugin->handoff.write_generation.fetch_add(1, std::memory_order_acq_rel) + 1;
+    }
+    plugin->handoff.host_write_gen[index].store(generation, std::memory_order_release);
+    return generation;
 }
 
 uint32_t rack_vst3_plugin_get_midi_pc_param_id(RackVST3Plugin* plugin, int channel) {
@@ -2139,20 +2250,37 @@ uint32_t rack_vst3_plugin_take_value_changes(RackVST3Plugin* plugin) {
     if (plugin->handoff.reported_any.exchange(false, std::memory_order_acq_rel)) {
         size_t parameter_count = plugin->fixed.param_ids.size();
         for (size_t index = 0; index < parameter_count; ++index) {
-            if (plugin->handoff.reported_dirty[index].exchange(0, std::memory_order_acq_rel) == 0) {
+            uint64_t report = plugin->handoff.reported[index].exchange(RackVST3Plugin::kNoReport,
+                                                                     std::memory_order_acq_rel);
+            if (report == RackVST3Plugin::kNoReport) {
                 continue;
             }
-            // A report from a block that began before the host's own write of this parameter
-            // may carry the value from before it.
-            uint64_t reported_block = plugin->handoff.reported_block[index].load(std::memory_order_relaxed);
-            if (reported_block <= plugin->handoff.host_write_block[index].load(std::memory_order_acquire)) {
+            // Older than the newest host write: made by a plugin that had not been given it.
+            uint32_t stamp = static_cast<uint32_t>(report >> 32);
+            uint32_t newest = plugin->handoff.host_write_gen[index].load(std::memory_order_acquire);
+            if (static_cast<int32_t>(stamp - newest) < 0) {
                 continue;
             }
-            uint64_t bits = plugin->handoff.reported_bits[index].load(std::memory_order_relaxed);
-            ParamValue value = 0.0;
-            std::memcpy(&value, &bits, sizeof(value));
-            plugin->controller->setParamNormalized(plugin->fixed.param_ids[index], value);
+            uint32_t bits = static_cast<uint32_t>(report);
+            float narrowed = 0.0f;
+            std::memcpy(&narrowed, &bits, sizeof(narrowed));
+            plugin->controller->setParamNormalized(plugin->fixed.param_ids[index], narrowed);
             changes |= RACK_VST3_VALUES_REPORTED;
+        }
+    }
+    if (plugin->handoff.meters_any.exchange(false, std::memory_order_acq_rel)) {
+        size_t parameter_count = plugin->fixed.param_ids.size();
+        for (size_t index = 0; index < parameter_count; ++index) {
+            uint64_t meter = plugin->handoff.meters[index].exchange(RackVST3Plugin::kNoReport,
+                                                                  std::memory_order_acq_rel);
+            if (meter == RackVST3Plugin::kNoReport) {
+                continue;
+            }
+            uint32_t bits = static_cast<uint32_t>(meter);
+            float narrowed = 0.0f;
+            std::memcpy(&narrowed, &bits, sizeof(narrowed));
+            // Forwarded so a plugin's own window moves its meters; not a change of its values.
+            plugin->controller->setParamNormalized(plugin->fixed.param_ids[index], narrowed);
         }
     }
     if (plugin->ctrl.component_handler) {
@@ -2164,6 +2292,13 @@ uint32_t rack_vst3_plugin_take_value_changes(RackVST3Plugin* plugin) {
         }
     }
     return changes;
+}
+
+size_t rack_vst3_plugin_take_edits(RackVST3Plugin* plugin, uint32_t* indices, float* values, size_t capacity) {
+    if (!plugin || !plugin->ctrl.component_handler || !indices || !values) {
+        return 0;
+    }
+    return plugin->ctrl.component_handler->take_edits(indices, values, capacity);
 }
 
 bool rack_vst3_plugin_value_changes_pending(RackVST3Plugin* plugin) {
