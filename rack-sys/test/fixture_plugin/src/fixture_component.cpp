@@ -111,6 +111,19 @@ public:
 			}
 		}
 
+		if (data.outputParameterChanges)
+		{
+			// The meter moves every block.
+			int32 queue_index = 0;
+			if (IParamValueQueue* queue = data.outputParameterChanges->addParameterData (kMeter, queue_index))
+			{
+				int32 point_index = 0;
+				ParamValue level =
+				    static_cast<double> (process_calls.load (std::memory_order_relaxed) % 100) / 100.0;
+				queue->addPoint (0, level, point_index);
+			}
+		}
+
 		if (send_message)
 		{
 			if (IMessage* message = allocateMessage ())

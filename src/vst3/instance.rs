@@ -222,6 +222,12 @@ impl Vst3Plugin {
         self.controller.take_restart_flags()
     }
 
+    /// See [`Vst3Controller::value_changes_pending`].
+    #[must_use]
+    pub fn value_changes_pending(&self) -> bool {
+        self.controller.value_changes_pending()
+    }
+
     /// See [`Vst3Controller::take_value_changes`].
     #[must_use]
     pub fn take_value_changes(&self) -> super::ValueChanges {

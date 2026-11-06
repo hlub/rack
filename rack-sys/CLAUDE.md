@@ -41,8 +41,12 @@ constructed the instance. `rack_vst3.h`'s "The two halves of an instance"
 lists which functions belong to which half, and the comment on
 `RackVST3Plugin` in `vst3_instance.cpp` says which fields each half may touch.
 Keep both true when adding a function or a field: a processor function touches
-only `proc` and `fixed`, a controller function only `ctrl`, `fixed` and the
-edit controller, and anything else is a function of the whole instance.
+only `proc`, `fixed` and `handoff`, a controller function only `ctrl`, `fixed`,
+`handoff` and the edit controller, and anything else is a function of the whole instance.
+`handoff` is the one part both halves touch while running: atomics only, each field saying who
+writes it and in what order the other side reads it (the plugin's reported values, and the
+host's own writes that make an older report stale). `rack_vst3_plugin_value_changes_pending`
+reads atomics alone and may be asked from any thread.
 
 The processor group is real-time: no allocation and no lock once
 `rack_vst3_plugin_initialize` has returned. Queues and buffers are sized there.

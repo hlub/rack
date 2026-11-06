@@ -118,16 +118,18 @@ void rack_vst3_plugin_free(RackVST3Plugin* plugin);
 //   _parameter_plain_value, _parameter_value_by_string,
 //   _parameter_normalized_from_plain, _get_preset_count, _get_preset_info,
 //   _get_midi_pc_param_id, the bus counts and bus info, _emits_midi,
-//   _read_state_while_processing, _take_restart_flags,
+//   _read_state_while_processing, _take_restart_flags, _take_value_changes,
 //   _refresh_parameter_titles, _discarded_messages and
 //   rack_vst3_plugin_release_controller. They call only the edit controller
-//   and read the facts fixed at initialization.
+//   and read the facts fixed at initialization; _controller_set_parameter and
+//   _take_value_changes also touch the hand-off part (below).
 // - The whole instance, never while it is split: _initialize, _reset,
 //   _set_parameter, _set_parameter_by_id (each writes the processor's queue
 //   from the caller's thread), _load_preset, _read_state, the state writes, and
 //   _get_latency_samples (an IAudioProcessor UI-thread call).
 // - Either: rack_vst3_plugin_is_initialized, _get_input_channels,
-//   _get_output_channels, which read fixed facts.
+//   _get_output_channels, which read fixed facts, and
+//   rack_vst3_plugin_value_changes_pending, which reads atomics alone.
 //
 // A split instance is released half by half instead of freed. The processor
 // half is released first (one atomic store, no plugin call, so it may happen
@@ -488,6 +490,15 @@ uint32_t rack_vst3_plugin_take_restart_flags(RackVST3Plugin* plugin);
 #define RACK_VST3_VALUES_REPORTED  1u  // the processor reported values; the controller was told them
 #define RACK_VST3_VALUES_EDITED    2u  // the plugin passed performEdit (its GUI or an internal edit)
 #define RACK_VST3_VALUES_REQUESTED 4u  // the plugin asked, by restartComponent, for a re-read of values
+
+// Whether rack_vst3_plugin_take_value_changes would report anything now, answered from atomics
+// alone: the plugin edited a value, asked for its values to be read again, or its processor
+// reported one. A report that take would discard (a read-only parameter is never recorded) is
+// not counted separately, so a true answer may take to nothing. Calls no plugin code and takes no
+// lock, so a host may ask every tick, even for a plugin whose controller must not be called while
+// it processes, and call take only when it is true.
+// Thread-safety: any thread.
+bool rack_vst3_plugin_value_changes_pending(RackVST3Plugin* plugin);
 
 // Take what the plugin did to its own parameter values since the last take, ORed from the
 // RACK_VST3_VALUES_* bits; 0 when it did nothing. A value the processor reported through its

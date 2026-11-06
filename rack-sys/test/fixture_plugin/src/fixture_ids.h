@@ -52,7 +52,10 @@ enum ParamIds : Steinberg::Vst::ParamID {
 	// to kReportedMode and report it to the host in the block's output parameter
 	// changes, which the controller was never told.
 	kReportFromProcess = 7,
-	kParamCount = 8,
+	// A read-only output the processor reports in every block's output parameter changes, as a
+	// level meter does, with a value that differs from block to block.
+	kMeter = 8,
+	kParamCount = 9,
 	// Added by kChangeIds; never counted by the component.
 	kExtra = 100,
 };

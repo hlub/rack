@@ -386,6 +386,16 @@ impl Vst3Controller {
         RestartFlags::from_bits(unsafe { ffi::rack_vst3_plugin_take_restart_flags(self.inner.as_ptr()) })
     }
 
+    /// Whether [`take_value_changes`](Self::take_value_changes) would report
+    /// anything now. Answered from atomics alone: no plugin code runs and no
+    /// lock is taken, so a host may ask every tick for any plugin, and call
+    /// the take only when this is true.
+    #[must_use]
+    pub fn value_changes_pending(&self) -> bool {
+        // SAFETY: the instance is live; the function loads atomics and calls no plugin code.
+        unsafe { ffi::rack_vst3_plugin_value_changes_pending(self.inner.as_ptr()) }
+    }
+
     /// Takes what the plugin did to its own parameter values since the last
     /// take: values its processor reported while processing (handed to the
     /// controller here, as the standard asks of a host), edits it made itself

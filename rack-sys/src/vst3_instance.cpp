@@ -416,6 +416,14 @@ public:
         return pending_restart_flags_.exchange(0, std::memory_order_acquire);
     }
 
+    // Whether anything take_edited or take_values_changed_request would report is waiting: two
+    // atomic loads, for a host that asks every tick without taking a lock to do it.
+    bool changes_pending() const {
+        uint32_t mask = static_cast<uint32_t>(Vst::RestartFlags::kParamValuesChanged);
+        return edited_.load(std::memory_order_acquire) ||
+               (pending_restart_flags_.load(std::memory_order_acquire) & mask) != 0;
+    }
+
     // Whether the plugin passed performEdit since the last take, cleared by taking it.
     bool take_edited() { return edited_.exchange(false, std::memory_order_acquire); }
 
@@ -508,6 +516,12 @@ static constexpr int32 kEventListCapacity = 256;
 //   queues, the transport. A function of the whole instance may write it too,
 //   because nothing processes concurrently with one.
 // - `ctrl` belongs to the controller half.
+// - `handoff` is the one part both halves touch while running: atomics only, each
+//   documented with its writer and its ordering (the plugin's reported values and the
+//   host's own writes, so a report is not mistaken for a newer say than the host's).
+//   rack_vst3_plugin_process[_multi_bus] write it; _controller_set_parameter,
+//   _take_value_changes and _value_changes_pending are the controller side's functions
+//   that touch it.
 // - `released_halves` is the hand-off between the two halves when they are
 //   dropped (see rack_vst3_plugin_release_controller).
 //
@@ -586,6 +600,12 @@ struct RackVST3Plugin {
         // thread, finds the index of an id a plugin reports a value for, without allocating.
         std::vector<std::pair<ParamID, uint32_t>> ids_by_id;
 
+        // Whether each parameter (by index) was read-only (ParameterInfo::kIsReadOnly) when the
+        // controller listed it: a meter or another output the plugin shows and nobody sets.
+        // Such a parameter is never recorded as a reported value and never written to the
+        // controller on the plugin's say-so, however often the plugin reports it.
+        std::vector<uint8_t> read_only;
+
         std::vector<PresetInfo> presets;
     } fixed;
 
@@ -595,13 +615,6 @@ struct RackVST3Plugin {
         ParameterChanges input_param_changes;
         ParameterChanges output_param_changes;
 
-        // The values the plugin reported through output_param_changes, last one per parameter,
-        // kept for the controller half to hand to the controller. Sized once in initialize and
-        // written by the audio thread with atomics alone, so recording allocates and waits for
-        // nothing. reported_dirty[index] says reported_bits[index] (a double's bits) is unread.
-        std::unique_ptr<std::atomic<uint64_t>[]> reported_bits;
-        std::unique_ptr<std::atomic<uint8_t>[]> reported_dirty;
-        std::atomic<bool> reported_any{false};
         EventList input_events{kEventListCapacity};
         EventList output_events{kEventListCapacity};
 
@@ -629,6 +642,39 @@ struct RackVST3Plugin {
         std::vector<float> input_silence_buf;
     } proc;
 
+    // The hand-off part: the fields both the audio thread and the controller thread touch, and
+    // nothing else. Every field is an atomic and the arrays are sized once in initialize, so
+    // recording a report allocates nothing. Each says who writes it and the order that makes the
+    // other side's read sound. A function of the whole instance may reset them too, because
+    // nothing processes concurrently with one.
+    struct Handoff {
+        // Written by process() on the audio thread: the index of the block now processing, one
+        // more than the block before it (starting at 1). Read by the controller thread to say
+        // which blocks began before a host write.
+        std::atomic<uint64_t> block{0};
+
+        // Values the plugin reported through output_param_changes, last one per parameter, and
+        // the block that reported each. Written by the audio thread after a block: value and
+        // block first (relaxed), then reported_dirty with release. Read by the controller
+        // thread's take, which exchanges reported_dirty with acquire, so the value and block it
+        // reads are those written before that release (a newer report may overwrite them
+        // meanwhile, which only makes the value newer).
+        std::unique_ptr<std::atomic<uint64_t>[]> reported_bits;
+        std::unique_ptr<std::atomic<uint64_t>[]> reported_block;
+        std::unique_ptr<std::atomic<uint8_t>[]> reported_dirty;
+        std::atomic<bool> reported_any{false};
+
+        // Written by the controller thread when the host writes a parameter itself (and by a
+        // function of the whole instance): the value of `block` at that moment, loaded with
+        // acquire and stored with release before the controller is written. A report made by a
+        // block no later than this began before the write or while it was in flight, and may
+        // carry the value from before it, so the take discards it. A block that begins
+        // afterwards has been given the host's slot value (the slot is stored before the write,
+        // and a block takes its slots at its top), so what it reports is not older than the
+        // write.
+        std::unique_ptr<std::atomic<uint64_t>[]> host_write_block;
+    } handoff;
+
     // The controller half's state.
     struct Control {
         // Each parameter's metadata, indexed like fixed.param_ids.
@@ -649,6 +695,8 @@ struct RackVST3Plugin {
         IPtr<RackConnectionProxy> controller_proxy;
     } ctrl;
 };
+
+static void discard_reported_values(RackVST3Plugin* plugin);
 
 // Rebinds every output bus's channel pointers back to the plugin's shared
 // dummy (silent, write-only) buffer, and every input bus's channel pointers
@@ -1242,8 +1290,15 @@ int rack_vst3_plugin_initialize(RackVST3Plugin* plugin, double sample_rate, uint
         // What the audio thread records of the values the plugin reports, sized now for the
         // same reason: recording must never allocate.
         size_t parameter_count = plugin->fixed.param_ids.size();
-        plugin->proc.reported_bits.reset(new std::atomic<uint64_t>[parameter_count]());
-        plugin->proc.reported_dirty.reset(new std::atomic<uint8_t>[parameter_count]());
+        plugin->handoff.reported_bits.reset(new std::atomic<uint64_t>[parameter_count]());
+        plugin->handoff.reported_block.reset(new std::atomic<uint64_t>[parameter_count]());
+        plugin->handoff.reported_dirty.reset(new std::atomic<uint8_t>[parameter_count]());
+        plugin->handoff.host_write_block.reset(new std::atomic<uint64_t>[parameter_count]());
+        plugin->fixed.read_only.assign(parameter_count, 0);
+        for (size_t index = 0; index < parameter_count && index < plugin->ctrl.param_meta.size(); ++index) {
+            plugin->fixed.read_only[index] =
+                (plugin->ctrl.param_meta[index].flags & ParameterInfo::kIsReadOnly) ? 1 : 0;
+        }
         plugin->fixed.ids_by_id.clear();
         for (size_t index = 0; index < parameter_count; ++index) {
             plugin->fixed.ids_by_id.emplace_back(plugin->fixed.param_ids[index],
@@ -1297,6 +1352,9 @@ int rack_vst3_plugin_reset(RackVST3Plugin* plugin) {
     if (!plugin->fixed.initialized || !plugin->component) {
         return RACK_VST3_ERROR_NOT_INITIALIZED;
     }
+
+    // Whatever the plugin reported before a reset describes what it was before it.
+    discard_reported_values(plugin);
 
     // VST3 doesn't have a direct "reset" like AudioUnit; deactivating and
     // reactivating the component clears its internal buffers/delay lines.
@@ -1462,13 +1520,14 @@ int rack_vst3_plugin_get_input_bus_info(
 }
 
 // Keep, for the controller half, the last value the plugin reported for each parameter through
-// the output parameter changes of the block just processed. Runs on the audio thread: it reads
-// the plugin's queues and writes preallocated atomics, and allocates, locks and waits for nothing.
-// A parameter whose id is not one the controller lists is ignored.
-static void record_reported_values(RackVST3Plugin* plugin) {
+// the output parameter changes of the block just processed, with the block that reported it.
+// Runs on the audio thread: it reads the plugin's queues and writes preallocated atomics, and
+// allocates, locks and waits for nothing. A parameter whose id the controller does not list, and
+// a read-only one (a meter that reports every block), is ignored.
+static void record_reported_values(RackVST3Plugin* plugin, uint64_t block) {
     IParameterChanges& changes = plugin->proc.output_param_changes;
     int32 queue_count = changes.getParameterCount();
-    if (queue_count <= 0 || !plugin->proc.reported_bits) {
+    if (queue_count <= 0 || !plugin->handoff.reported_bits) {
         return;
     }
     const auto& ids = plugin->fixed.ids_by_id;
@@ -1492,14 +1551,43 @@ static void record_reported_values(RackVST3Plugin* plugin) {
         if (found == ids.end() || found->first != queue->getParameterId()) {
             continue;
         }
+        uint32_t index = found->second;
+        if (plugin->fixed.read_only[index]) {
+            continue;
+        }
         uint64_t bits = 0;
         std::memcpy(&bits, &value, sizeof(bits));
-        plugin->proc.reported_bits[found->second].store(bits, std::memory_order_relaxed);
-        plugin->proc.reported_dirty[found->second].store(1, std::memory_order_release);
+        plugin->handoff.reported_bits[index].store(bits, std::memory_order_relaxed);
+        plugin->handoff.reported_block[index].store(block, std::memory_order_relaxed);
+        plugin->handoff.reported_dirty[index].store(1, std::memory_order_release);
         any = true;
     }
     if (any) {
-        plugin->proc.reported_any.store(true, std::memory_order_release);
+        plugin->handoff.reported_any.store(true, std::memory_order_release);
+    }
+}
+
+// Forget every value the plugin reported and nobody took. For the functions of the whole
+// instance that replace what the plugin is: a state write, a preset load, a reset. Reports made
+// before one describe a plugin that no longer exists, and taking them afterwards would put the
+// old values back on the controller. Nothing processes while the instance is whole.
+static void discard_reported_values(RackVST3Plugin* plugin) {
+    if (!plugin->handoff.reported_dirty) {
+        return;
+    }
+    size_t parameter_count = plugin->fixed.param_ids.size();
+    for (size_t index = 0; index < parameter_count; ++index) {
+        plugin->handoff.reported_dirty[index].store(0, std::memory_order_relaxed);
+    }
+    plugin->handoff.reported_any.store(false, std::memory_order_release);
+}
+
+// Note the block at which the host wrote parameter `index` itself, so a report made by an earlier
+// block is not mistaken for the plugin's newer say. See Handoff::host_write_block.
+static void note_host_write(RackVST3Plugin* plugin, uint32_t index) {
+    if (plugin->handoff.host_write_block) {
+        plugin->handoff.host_write_block[index].store(
+            plugin->handoff.block.load(std::memory_order_acquire), std::memory_order_release);
     }
 }
 
@@ -1565,6 +1653,9 @@ int rack_vst3_plugin_process(
         }
     }
 
+    // Count this block before the plugin sees it, for the reports it makes (Handoff::block).
+    uint64_t block = plugin->handoff.block.fetch_add(1, std::memory_order_acq_rel) + 1;
+
     // Set parameter and event interfaces
     plugin->proc.process_data.inputParameterChanges = &plugin->proc.input_param_changes;
     plugin->proc.process_data.outputParameterChanges = &plugin->proc.output_param_changes;
@@ -1578,7 +1669,7 @@ int rack_vst3_plugin_process(
     plugin->proc.input_events.clear();
     plugin->proc.input_param_changes.clearQueue();
     plugin->proc.output_events.clear();
-    record_reported_values(plugin);
+    record_reported_values(plugin, block);
     plugin->proc.output_param_changes.clearQueue();
 
     return (result == kResultOk) ? RACK_VST3_OK : RACK_VST3_ERROR_GENERIC;
@@ -1825,6 +1916,9 @@ int rack_vst3_plugin_process_multi_bus(
         }
     }
 
+    // Count this block before the plugin sees it, for the reports it makes (Handoff::block).
+    uint64_t block = plugin->handoff.block.fetch_add(1, std::memory_order_acq_rel) + 1;
+
     // Set parameter and event interfaces
     plugin->proc.process_data.inputParameterChanges = &plugin->proc.input_param_changes;
     plugin->proc.process_data.outputParameterChanges = &plugin->proc.output_param_changes;
@@ -1868,7 +1962,7 @@ int rack_vst3_plugin_process_multi_bus(
     plugin->proc.input_events.clear();
     plugin->proc.input_param_changes.clearQueue();
     plugin->proc.output_events.clear();
-    record_reported_values(plugin);
+    record_reported_values(plugin, block);
     plugin->proc.output_param_changes.clearQueue();
 
     return (result == kResultOk) ? RACK_VST3_OK : RACK_VST3_ERROR_GENERIC;
@@ -1918,10 +2012,8 @@ int rack_vst3_plugin_set_parameter(RackVST3Plugin* plugin, uint32_t index, float
 
     ParamID param_id = plugin->fixed.param_ids[index];
 
-    // The host's own value is newer than any report the processor made before it.
-    if (plugin->proc.reported_dirty) {
-        plugin->proc.reported_dirty[index].store(0, std::memory_order_release);
-    }
+    // Before the write, so a report from a block that began earlier is known to be older.
+    note_host_write(plugin, index);
 
     // Set parameter value on controller (for UI reflection)
     plugin->controller->setParamNormalized(param_id, value);
@@ -1967,10 +2059,8 @@ int rack_vst3_plugin_controller_set_parameter(RackVST3Plugin* plugin, uint32_t i
     }
     if (value < 0.0f) value = 0.0f;
     if (value > 1.0f) value = 1.0f;
-    // The host's own value is newer than any report the processor made before it.
-    if (plugin->proc.reported_dirty) {
-        plugin->proc.reported_dirty[index].store(0, std::memory_order_release);
-    }
+    // Before the write, so a report from a block that began earlier is known to be older.
+    note_host_write(plugin, index);
     plugin->controller->setParamNormalized(plugin->fixed.param_ids[index], value);
     return RACK_VST3_OK;
 }
@@ -2046,13 +2136,19 @@ uint32_t rack_vst3_plugin_take_value_changes(RackVST3Plugin* plugin) {
         return 0;
     }
     uint32_t changes = 0;
-    if (plugin->proc.reported_any.exchange(false, std::memory_order_acq_rel)) {
+    if (plugin->handoff.reported_any.exchange(false, std::memory_order_acq_rel)) {
         size_t parameter_count = plugin->fixed.param_ids.size();
         for (size_t index = 0; index < parameter_count; ++index) {
-            if (plugin->proc.reported_dirty[index].exchange(0, std::memory_order_acq_rel) == 0) {
+            if (plugin->handoff.reported_dirty[index].exchange(0, std::memory_order_acq_rel) == 0) {
                 continue;
             }
-            uint64_t bits = plugin->proc.reported_bits[index].load(std::memory_order_relaxed);
+            // A report from a block that began before the host's own write of this parameter
+            // may carry the value from before it.
+            uint64_t reported_block = plugin->handoff.reported_block[index].load(std::memory_order_relaxed);
+            if (reported_block <= plugin->handoff.host_write_block[index].load(std::memory_order_acquire)) {
+                continue;
+            }
+            uint64_t bits = plugin->handoff.reported_bits[index].load(std::memory_order_relaxed);
             ParamValue value = 0.0;
             std::memcpy(&value, &bits, sizeof(value));
             plugin->controller->setParamNormalized(plugin->fixed.param_ids[index], value);
@@ -2068,6 +2164,16 @@ uint32_t rack_vst3_plugin_take_value_changes(RackVST3Plugin* plugin) {
         }
     }
     return changes;
+}
+
+bool rack_vst3_plugin_value_changes_pending(RackVST3Plugin* plugin) {
+    if (!plugin) {
+        return false;
+    }
+    if (plugin->handoff.reported_any.load(std::memory_order_acquire)) {
+        return true;
+    }
+    return plugin->ctrl.component_handler && plugin->ctrl.component_handler->changes_pending();
 }
 
 // Re-reads the controller's parameter list into a temporary and compares ids:
@@ -2344,6 +2450,9 @@ int rack_vst3_plugin_load_preset(RackVST3Plugin* plugin, int32_t preset_number) 
     if (preset_number < 0 || preset_number >= static_cast<int32_t>(plugin->fixed.presets.size())) {
         return RACK_VST3_ERROR_NOT_FOUND;
     }
+
+    // Reports made before the preset describe the sound it replaces.
+    discard_reported_values(plugin);
 
     const auto& preset = plugin->fixed.presets[preset_number];
 
@@ -2675,6 +2784,9 @@ int rack_vst3_plugin_set_state_pumped(RackVST3Plugin* plugin, const uint8_t* dat
     if (!plugin || !data || size == 0 || !plugin->component) {
         return RACK_VST3_ERROR_INVALID_PARAM;
     }
+
+    // Reports made before this state describe the plugin that held the one before.
+    discard_reported_values(plugin);
 
     if (size < sizeof(uint32_t)) {
         return RACK_VST3_ERROR_INVALID_PARAM;

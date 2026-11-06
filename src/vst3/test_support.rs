@@ -32,7 +32,8 @@ pub(crate) mod param {
     pub(crate) const MODE: usize = 5;
     pub(crate) const SELF_EDIT: usize = 6;
     pub(crate) const REPORT_FROM_PROCESS: usize = 7;
-    pub(crate) const COUNT: usize = 8;
+    pub(crate) const METER: usize = 8;
+    pub(crate) const COUNT: usize = 9;
     /// What `SELF_EDIT` makes the controller's `GAIN` (`kSelfEditGain`).
     pub(crate) const SELF_EDIT_GAIN: f32 = 0.25;
     /// What `REPORT_FROM_PROCESS` makes the component's `MODE` (`kReportedMode`).

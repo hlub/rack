@@ -95,3 +95,75 @@ fn a_value_the_host_wrote_after_a_report_is_not_overwritten_by_it() {
         "the host's newer value stands"
     );
 }
+
+#[test]
+fn a_meter_that_reports_every_block_is_never_a_change_and_never_reaches_the_controller() {
+    let _serial = serial_plugin_test();
+    let Some(mut plugin) = load_fixture() else { return };
+    let before = controller_value(&plugin, param::METER);
+    for _ in 0..50 {
+        process_block(&mut plugin);
+    }
+    assert!(!plugin.controller().value_changes_pending(), "a read-only parameter raises nothing");
+    assert!(plugin.take_value_changes().is_empty());
+    assert!(
+        (controller_value(&plugin, param::METER) - before).abs() < 1e-6,
+        "the controller is not written for a read-only parameter"
+    );
+}
+
+#[test]
+fn pending_is_answered_without_taking_and_clears_when_taken() {
+    let _serial = serial_plugin_test();
+    let Some(mut plugin) = load_fixture() else { return };
+    assert!(!plugin.controller().value_changes_pending());
+
+    plugin.halves_mut().1.set_parameter(param::SELF_EDIT, 1.0).expect("controller write");
+    assert!(plugin.controller().value_changes_pending(), "an edit is pending");
+    assert!(plugin.controller().value_changes_pending(), "asking does not take it");
+    let _ = plugin.take_value_changes();
+    assert!(!plugin.controller().value_changes_pending());
+
+    plugin.queue_parameter_change(param::REPORT_FROM_PROCESS, 1.0).expect("queue");
+    process_block(&mut plugin);
+    assert!(plugin.controller().value_changes_pending(), "a report is pending");
+    let _ = plugin.take_value_changes();
+    assert!(!plugin.controller().value_changes_pending());
+}
+
+#[test]
+fn reports_made_before_a_state_write_or_a_reset_are_not_taken_after_it() {
+    let _serial = serial_plugin_test();
+    let Some(mut plugin) = load_fixture() else { return };
+    let state = plugin.get_state().expect("state");
+
+    plugin.queue_parameter_change(param::REPORT_FROM_PROCESS, 1.0).expect("queue");
+    process_block(&mut plugin);
+    plugin.set_state(&state).expect("state write");
+    assert!(plugin.take_value_changes().is_empty(), "a state write drops earlier reports");
+
+    plugin.queue_parameter_change(param::REPORT_FROM_PROCESS, 1.0).expect("queue");
+    process_block(&mut plugin);
+    plugin.reset().expect("reset");
+    assert!(plugin.take_value_changes().is_empty(), "a reset drops earlier reports");
+}
+
+#[test]
+fn a_report_from_a_block_after_the_hosts_write_is_taken_and_one_before_it_is_not() {
+    let _serial = serial_plugin_test();
+    let Some(mut plugin) = load_fixture() else { return };
+    plugin.queue_parameter_change(param::REPORT_FROM_PROCESS, 1.0).expect("queue");
+    process_block(&mut plugin);
+    plugin.halves_mut().1.set_parameter(param::MODE, 0.1).expect("controller write");
+    let _ = plugin.take_value_changes();
+    assert!((controller_value(&plugin, param::MODE) - 0.1).abs() < 1e-6, "the older report is dropped");
+
+    plugin.queue_parameter_change(param::REPORT_FROM_PROCESS, 1.0).expect("queue");
+    process_block(&mut plugin);
+    let changes = plugin.take_value_changes();
+    assert!(changes.reported_by_processor());
+    assert!(
+        (controller_value(&plugin, param::MODE) - param::REPORTED_MODE).abs() < 1e-6,
+        "a report from a block that began after the write is the plugin's newer say"
+    );
+}

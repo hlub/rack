@@ -45,6 +45,8 @@ public:
 		                         kSelfEdit);
 		parameters.addParameter (STR16 ("Report From Process"), nullptr, 1, 0.0,
 		                         ParameterInfo::kCanAutomate, kReportFromProcess);
+		parameters.addParameter (STR16 ("Meter"), nullptr, 0, 0.0, ParameterInfo::kIsReadOnly,
+		                         kMeter);
 		return kResultOk;
 	}
 

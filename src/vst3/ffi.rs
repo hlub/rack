@@ -626,6 +626,14 @@ extern "C" {
     /// - Called on the controller thread only
     pub fn rack_vst3_plugin_take_value_changes(plugin: *mut RackVST3Plugin) -> u32;
 
+    /// Whether `rack_vst3_plugin_take_value_changes` would report anything now; atomic loads
+    /// only, no plugin code.
+    ///
+    /// # Safety
+    ///
+    /// - `plugin` must be a valid pointer returned by `rack_vst3_plugin_new`
+    pub fn rack_vst3_plugin_value_changes_pending(plugin: *mut RackVST3Plugin) -> bool;
+
     /// Re-read the parameter descriptions; `RACK_VST3_PARAMETER_IDS_CHANGED`
     /// when the ids changed and nothing was refreshed.
     ///
